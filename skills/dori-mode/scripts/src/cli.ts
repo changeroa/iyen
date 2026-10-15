@@ -22,6 +22,8 @@ import { Telegram } from "./messenger/telegram.ts";
 import { Discord, discordPresence } from "./messenger/discord.ts";
 import { realTimers } from "./messenger/typing.ts";
 import { transcribe, TranscriptionError } from "./messenger/voice.ts";
+import { credentialsPath, readCredential, saveCredential } from "./credentials.ts";
+import { readSetupRecord, saveSetupRecord } from "./setup-record.ts";
 
 const USAGE = `dori <command> [options]
 
@@ -40,7 +42,10 @@ const USAGE = `dori <command> [options]
   heavy <label> -- <command ...>       run a heavy command when a slot is free and load is low
   can-launch                           exit 0 if the host has room for a new lane, else print why and exit 4
   send <slack|telegram|discord> --to TARGET --text TEXT [--thread ID] [--edit ID]
-                                       post or edit a message (tokens from DORI_SLACK_TOKEN, DORI_TELEGRAM_TOKEN, DORI_DISCORD_TOKEN)
+                                       post or edit a message (tokens: the environment, else ~/.dori/credentials.json)
+  credentials set <NAME>               save a token for every shell and directory (value read from stdin, never argv)
+  status                               print SETUP_DONE <name> <platform> <date> or SETUP_MISSING (exit 5)
+  setup-done --name NAME --platform P  record that setup and onboarding are finished
   presence <slack|discord>             keep the account shown as online until stopped
   transcribe <audio-file>              run hooks.transcribe and print the text
   inbound slack [--loop MIN]           print INBOUND lines: unread thread replies (threads view), replies in threads
@@ -63,7 +68,7 @@ const flags = parseArgs({
     title: { type: "string" }, brief: { type: "string" }, done: { type: "string" }, thread: { type: "string" },
     model: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, evidence: { type: "string" },
     reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, loop: { type: "string" },
-    to: { type: "string" }, text: { type: "string" }, edit: { type: "string" },
+    to: { type: "string" }, text: { type: "string" }, edit: { type: "string" }, name: { type: "string" }, platform: { type: "string" },
   },
 });
 const opt = (name: string): string | undefined => {
@@ -184,18 +189,18 @@ try {
       const text = need("text");
       const thread = opt("thread");
       const edit = opt("edit");
-      const token = (name: string) => process.env[name] ?? die(`${name} is not set`);
+      const token = async (name: string) => (await readCredential(name)) ?? die(`${name} is not set; save it with: dori credentials set ${name}`);
       if (platform === "slack") {
-        const slack = new Slack(fetchHttp, realClock, { token: token("DORI_SLACK_TOKEN"), cookie: process.env.DORI_SLACK_COOKIE }, undefined, new ThreadLedger(`${config.stateDir}/slack-threads.json`));
+        const slack = new Slack(fetchHttp, realClock, { token: await token("DORI_SLACK_TOKEN"), cookie: await readCredential("DORI_SLACK_COOKIE") }, undefined, new ThreadLedger(`${config.stateDir}/slack-threads.json`));
         if (edit) await slack.edit(to, edit, text);
         else console.log(`SENT ${(await slack.post(to, text, thread)).ts}`);
       } else if (platform === "telegram") {
-        const tg = new Telegram(fetchHttp, realClock, token("DORI_TELEGRAM_TOKEN"));
+        const tg = new Telegram(fetchHttp, realClock, await token("DORI_TELEGRAM_TOKEN"));
         const target = { chatId: to, ...(thread ? { threadId: Number(thread) } : {}) };
         if (edit) await tg.edit(target, Number(edit), text);
         else console.log(`SENT ${await tg.send(target, text)}`);
       } else if (platform === "discord") {
-        const dc = new Discord(fetchHttp, realClock, token("DORI_DISCORD_TOKEN"));
+        const dc = new Discord(fetchHttp, realClock, await token("DORI_DISCORD_TOKEN"));
         if (edit) await dc.edit(to, edit, text);
         else console.log(`SENT ${await dc.send(thread ?? to, text)}`);
       } else die(`unknown platform ${platform}`);
@@ -203,7 +208,7 @@ try {
     }
     case "presence": {
       if (key === "slack") {
-        const auth = { token: process.env.DORI_SLACK_TOKEN ?? die("DORI_SLACK_TOKEN is not set"), cookie: process.env.DORI_SLACK_COOKIE ?? die("DORI_SLACK_COOKIE is not set (user-token presence needs the d cookie)") };
+        const auth = { token: (await readCredential("DORI_SLACK_TOKEN")) ?? die("DORI_SLACK_TOKEN is not set; save it with: dori credentials set DORI_SLACK_TOKEN"), cookie: (await readCredential("DORI_SLACK_COOKIE")) ?? die("DORI_SLACK_COOKIE is not set (user-token presence needs the d cookie); save it with: dori credentials set DORI_SLACK_COOKIE") };
         const p = slackPresence(new Slack(fetchHttp, realClock, auth), (url, headers) => {
           const options: Bun.WebSocketOptions = { headers: { ...headers } };
           const ws = new WebSocket(url, options);
@@ -212,7 +217,7 @@ try {
         console.log("PRESENCE_READY slack");
         await every(1, async () => console.log(`PRESENCE slack ${await p.hold()}`));
       } else if (key === "discord") {
-        const token = process.env.DORI_DISCORD_TOKEN ?? die("DORI_DISCORD_TOKEN is not set");
+        const token = (await readCredential("DORI_DISCORD_TOKEN")) ?? die("DORI_DISCORD_TOKEN is not set; save it with: dori credentials set DORI_DISCORD_TOKEN");
         discordPresence(() => {
           const ws = new WebSocket("wss://gateway.discord.gg/?v=10&encoding=json");
           let handler: (d: string) => void = () => {};
@@ -226,7 +231,7 @@ try {
     }
     case "inbound": {
       if (key !== "slack") die("inbound supports slack");
-      const auth = { token: process.env.DORI_SLACK_TOKEN ?? die("DORI_SLACK_TOKEN is not set"), cookie: process.env.DORI_SLACK_COOKIE };
+      const auth = { token: (await readCredential("DORI_SLACK_TOKEN")) ?? die("DORI_SLACK_TOKEN is not set; save it with: dori credentials set DORI_SLACK_TOKEN"), cookie: await readCredential("DORI_SLACK_COOKIE") };
       const ledger = new ThreadLedger(`${config.stateDir}/slack-threads.json`);
       const slack = new Slack(fetchHttp, realClock, auth, undefined, ledger);
       const me = String((await slack.call("auth.test", {})).user_id ?? die("auth.test returned no user_id"));
@@ -234,6 +239,26 @@ try {
       await every(loopMin, async () => {
         for (const i of await pollSlackInbound(slack, ledger, { selfUserId: me })) console.log(`INBOUND ${i.source} ${i.channel} ${i.threadTs ?? "-"} ${i.ts || "-"} ${i.user ?? "-"} ${JSON.stringify((i.text ?? "").slice(0, 200))}`);
       });
+      break;
+    }
+    case "credentials": {
+      if (key !== "set") die("usage: dori credentials set <NAME>  (the value is read from stdin)");
+      const name = rest[1] ?? die("credentials set needs a name, e.g. DORI_SLACK_TOKEN");
+      const value = (await Bun.stdin.text()).trim();
+      if (!value) die("no value on stdin");
+      await saveCredential(name, value);
+      console.log(`SAVED ${name} -> ${credentialsPath()}`);
+      break;
+    }
+    case "status": {
+      const record = await readSetupRecord();
+      if (!record) die("SETUP_MISSING", 5);
+      else console.log(`SETUP_DONE ${record.name} ${record.platform} ${record.onboardedAt}`);
+      break;
+    }
+    case "setup-done": {
+      await saveSetupRecord({ name: need("name"), platform: need("platform"), onboardedAt: new Date().toISOString() });
+      console.log("SETUP_RECORDED");
       break;
     }
     case "transcribe":

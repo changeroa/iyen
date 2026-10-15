@@ -34,7 +34,14 @@ Ask which mode, give the trade-off as a short list, and wait for the choice:
   - It only sees channels it is invited to, within the scopes the app was granted.
   - It shows as an app, not a person.
 
-Record the choice. With a user token, set `DORI_SLACK_TOKEN` and `DORI_SLACK_COOKIE` (the `d` cookie from that member's browser session). With a bot token, set `DORI_SLACK_TOKEN` to the `xoxb-` token.
+Record the choice. Save each token with the CLI so every shell and directory finds it (it lands in `~/.dori/credentials.json`, mode 0600; a variable set in the environment still wins):
+
+```sh
+printf %s "$TOKEN" | dori credentials set DORI_SLACK_TOKEN     # user token, or the xoxb- bot token
+printf %s "$COOKIE" | dori credentials set DORI_SLACK_COOKIE   # user token only: the d cookie from that member's browser session
+```
+
+The same goes for `DORI_TELEGRAM_TOKEN` and `DORI_DISCORD_TOKEN`. A token kept only in the current shell is lost on the next restart, and Dori would ask for it again.
 
 ## 3. Bot
 

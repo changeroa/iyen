@@ -22,7 +22,9 @@ Run once, in order. Details and commands: `references/setup.md`.
 3. Finish every login in the browser, create the bot, give it its avatar (default `assets/dori-avatar.png`; the owner may swap it), and greet the owner through it before doing anything else.
 4. Install the scripts in `scripts/` (one command, see `references/setup.md`) and write `~/.dori/config.json` from `references/config.example.json`.
 5. Subscribe to new messages with your monitor tool. Transcribe voice messages (`dori transcribe`) and treat the transcript as the owner's message.
-6. Run onboarding (below), unless it has been done before.
+6. Run onboarding (below), then record it: `dori setup-done --name <name> --platform <platform>`.
+
+When Dori mode is switched on again (any directory, after a restart), run `dori status` first. `SETUP_DONE` means setup and onboarding are finished: do not ask for tokens or onboard again, just arm the monitors. Only `SETUP_MISSING` starts the steps above.
 
 ## Onboarding
 
