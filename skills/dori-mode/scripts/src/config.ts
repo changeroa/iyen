@@ -31,6 +31,7 @@ export type DoriConfig = {
   readonly nudgeAfterMin: number;
   readonly postAfterMin: number;
   readonly closeAfterMin: number;
+  readonly workThresholdSec: number;
   readonly heavySlots: number;
   readonly heavyMaxLoad: number;
   readonly deadPanePatterns: readonly string[];
@@ -52,6 +53,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   nudgeAfterMin: 15,
   postAfterMin: 20,
   closeAfterMin: 5,
+  workThresholdSec: 120,
   heavySlots: 1,
   heavyMaxLoad: 80,
   deadPanePatterns: ["has stopped", "no suitable jobs"],
@@ -68,6 +70,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   const file = Bun.file(path);
   const raw = (await file.exists()) ? ((await file.json()) as Partial<DoriConfig>) : {};
   const merged: DoriConfig = { ...base, ...raw, guard: { ...base.guard, ...raw.guard }, hooks: { ...base.hooks, ...raw.hooks } };
+  if (!Number.isFinite(merged.workThresholdSec) || merged.workThresholdSec <= 0) throw new TypeError("workThresholdSec must be a positive number");
   return {
     ...merged,
     stateDir: expandHome(process.env.DORI_STATE_DIR ?? merged.stateDir, home),

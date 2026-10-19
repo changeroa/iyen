@@ -20,7 +20,8 @@ Needs: bun 1.3+, herdr, git, and the GitHub CLI (`gh`) for `merged`/`closed` sig
 
 | Field | Default | Used by |
 |---|---|---|
-| `stateDir` | `~/.dori/state` | registry, heavy slots |
+| `stateDir` | `~/.dori/state` | registry, heavy slots, work timer records |
+| `workThresholdSec` | 120 | `work stop`, `work similar`; elapsed seconds at or above this threshold mean a lane next time |
 | `laneWorkspace` | current workspace | `launch` |
 | `workspaces` | all | `sync`, `dead-panes` |
 | `ignorePanes`, `leadPane` | none | panes the sweeps skip; `leadPane` is also where lanes report |
@@ -52,10 +53,36 @@ The CLI is a thin layer over typed modules you can import in your own scripts:
 | `src/messenger/slack-inbound.ts` | `pollSlackInbound`: threads view, the ledger's threads and unread counts, deduplicated, own messages filtered |
 | `src/messenger/slack-presence.ts` | `slackPresence`: hold a user account active |
 | `src/routing.ts` | `canLaunch`, `idleLaneFor`: the routing checks |
+| `src/work.ts` | direct-work timers, readable JSON records, similarity lookup across completed direct work and closed lanes |
 
 Every module takes its HTTP, clock and timers as arguments. That is how the tests run without the network.
 
 ## Commands
+
+| Command | What it does |
+|---|---|
+| `dori work start --title T [--tag TAG ...] [--thread REF]` | start a direct-work timer and return its UUID id |
+| `dori work stop <id>` | stop the timer and print timestamps, elapsed seconds and threshold |
+| `dori work similar [--title T] [--tag TAG ...]` | require title or tag; print matching completed direct work and closed-lane durations with threshold, no routing verdict |
+
+### `dori work start --title T [--tag TAG ...] [--thread REF]`
+Starts a timer for work handled directly, without a lane, and returns a UUID id. `--title` is required; repeat `--tag` for multiple tags and use `--thread` to associate the messenger thread. Keep the id for `work stop`.
+
+Each record is readable JSON at `<stateDir>/work/<id>.json` (by default `~/.dori/state/work/<id>.json`).
+The timer survives process restarts; different tasks keep separate ids.
+
+### `dori work stop <id>`
+Stops the timer identified by the UUID returned by `work start`. Prints the start and stop timestamps, elapsed seconds, and the configured `workThresholdSec` (default 120 seconds).
+An unknown id or an already stopped timer fails with exit 1 and leaves existing records unchanged.
+
+### `dori work similar [--title T] [--tag TAG ...]`
+Requires at least a title or a tag; repeat `--tag` for multiple tags. Prints matching completed direct-work records and closed-lane durations, together with the threshold. Running direct work is not included. Closed lanes are read without modifying their records.
+
+Similarity uses normalized title words, character bigrams for Korean titles, and tag overlap. The command provides duration evidence, not a routing verdict.
+
+At request intake, look up the title and/or tags before choosing direct handling or a lane. If previous same or similar work took at least `workThresholdSec`, use a lane next time. Otherwise apply the existing judgment rules for questions, small edits, PR work, multi-step work and long or parallel work. Reuse an appropriate idle lane; `dori can-launch` HOLD still means queue the work rather than open a new lane.
+
+For direct handling, start the timer after the intake lookup and before the first work tool call, then stop it when the answer is delivered.
 
 ### `dori launch <key> --title T --brief FILE --done "..." [--thread REF] [--model M] [--cwd DIR]`
 Opens a lane: appends the footer to the brief, opens a tab, starts the agent, and after 20 seconds checks it: `STARTUP_ERROR` on a known failure in the pane, `STARTUP_OK` only when herdr reports the agent idle or working, and `STARTUP_UNCONFIRMED` (with the last lines) otherwise. Exit 3 on anything but `STARTUP_OK`.

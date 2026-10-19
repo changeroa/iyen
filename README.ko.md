@@ -55,6 +55,7 @@ Dori는 사용자의 말투를 따라갑니다. 짧고 편하게, 소문자로 �
 | `laneWorkspace` | 새 레인 탭이 열릴 herdr workspace |
 | `defaultCwd` | 레인이 시작하는 디렉터리이자, 레인이 worktree를 만드는 저장소 |
 | `agentCommand` | 에이전트 실행 명령. `{model}`, `{prompt}`가 들어간 argv 목록 |
+| `workThresholdSec` | 다음에는 레인으로 맡길 작업 시간 임계값(초). 기본값 120 |
 | `hooks.threadReply`, `hooks.threadDone` | 메신저 CLI를 `{thread}`, `{text}`가 들어간 argv 목록으로. 레인 진행 상황을 올리고 완료 표시를 할 때 씁니다. |
 
 나머지(시간, 임계값, heavy 슬롯 수)는 기본값으로 충분합니다. 전체 표는 [`references/scripts.md`](skills/dori-mode/references/scripts.md)에 있습니다. `DORI_CONFIG`, `DORI_STATE_DIR`, `DORI_LEAD_PANE` 환경변수를 주면 파일 값 대신 그 값을 씁니다.
@@ -69,10 +70,14 @@ Dori는 사용자의 말투를 따라갑니다. 짧고 편하게, 소문자로 �
 
 메시지마다 어떻게 처리할지는 Dori가 스스로 정합니다.
 
+요청을 받으면 먼저 `dori work similar [--title T] [--tag TAG ...]`로 제목이나 태그를 하나 이상 넣어 조회합니다. 완료된 직접 작업과 닫힌 레인의 소요 시간, 임계값을 보여 주며 라우팅 판정은 내리지 않습니다. 유사도는 정규화한 제목 단어, 한국어용 문자 바이그램, 태그 겹침으로 구합니다. 이전의 같거나 비슷한 작업이 `workThresholdSec`(기본 120초) 이상 걸렸다면 다음에는 레인에 맡깁니다. 그 외에는 기존 판단 기준을 따릅니다.
+
 - 질문, 상태 확인, 조회, 몇 번의 도구 호출로 끝나는 작은 수정은 새 세션 없이 바로 처리합니다.
 - PR로 끝나는 코드 작업, 여러 단계짜리 일, 오래 걸리거나 나눠서 돌릴 수 있는 일은 레인을 엽니다. 그 저장소를 맡고 있는 쉬는 레인이 있으면 새로 열지 않고 거기에 맡깁니다.
 - 메모리, 디스크, pane 수에 여유가 없으면(`dori can-launch`가 HOLD) 새 레인을 열지 않습니다. 일을 대기열에 넣고 이유를 알려 줍니다.
 - 새 일은 새 스레드에서 시작합니다. 이어지는 일은 원래 스레드로 돌아가고, 레인이 닫혔으면 예전 세션을 다시 엽니다. 짧은 질문은 물어본 자리에서 답합니다.
+
+직접 처리할 때는 접수 시 조회를 마친 뒤 첫 작업 도구 호출 전에 `dori work start --title T [--tag TAG ...] [--thread REF]`를 실행합니다. 반환된 UUID id를 보관하고 답변이 전달되면 `dori work stop <id>`로 멈춥니다. 기록은 `<stateDir>/work/<id>.json`의 읽을 수 있는 JSON으로 저장하며, 닫힌 레인 기록은 수정하지 않고 읽기만 합니다.
 
 ## 세션 레지스트리
 
@@ -114,6 +119,9 @@ watcher는 레인을 닫을 때 셸 없이 이 확인을 직접 다시 돌리고
 
 | 명령 | 하는 일 |
 |---|---|
+| `dori work start --title T [--tag TAG ...] [--thread REF]` | 직접 작업 타이머를 시작하고 UUID id 반환 |
+| `dori work stop <id>` | 타이머를 멈추고 시작·종료 시각, 경과 초, 임계값 출력 |
+| `dori work similar [--title T] [--tag TAG ...]` | 제목이나 태그 필수. 유사한 완료 직접 작업과 닫힌 레인의 소요 시간, 임계값 출력. 라우팅 판정 없음 |
 | `dori launch <key> ...` | brief에 레인 footer를 쓰고, 탭을 열고, 에이전트를 시작하고, 시작 오류를 확인 |
 | `dori adopt <key> --pane ID ...` | 이미 돌고 있는 레인을 등록 |
 | `dori sync [--write]` | 레지스트리와 실제 pane 비교, 어긋난 곳 표시 |

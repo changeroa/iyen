@@ -55,6 +55,7 @@ Everything lives in `~/.dori/config.json`, and every field is optional. The ones
 | `laneWorkspace` | the herdr workspace new lane tabs open in |
 | `defaultCwd` | where lanes start, and the repo whose worktrees they own |
 | `agentCommand` | how to start an agent, as an argv list with `{model}` and `{prompt}` |
+| `workThresholdSec` | duration threshold in seconds for using a lane next time; default 120 |
 | `hooks.threadReply`, `hooks.threadDone` | your messenger CLI, as argv lists with `{thread}` and `{text}`, so lanes can post progress and be marked done |
 
 The rest (timings, thresholds, heavy-slot count) has sensible defaults. The full table is in [`references/scripts.md`](skills/dori-mode/references/scripts.md). `DORI_CONFIG`, `DORI_STATE_DIR` and `DORI_LEAD_PANE` override the file.
@@ -69,10 +70,14 @@ Everything is read-only. It writes what it learns to memory as it goes and ends 
 
 The Dori decides on its own how to handle each message.
 
+At intake it runs `dori work similar [--title T] [--tag TAG ...]` with at least a title or tag. The lookup shows completed direct work and closed-lane durations with the threshold, not a routing verdict. Similarity uses normalized title words, character bigrams for Korean, and tag overlap. If a previous same or similar task took at least `workThresholdSec` (default 120 seconds), use a lane next time. Otherwise the existing judgment applies:
+
 - Questions, status checks, lookups and small edits get answered directly, with no new session.
 - Code that ends in a PR, multi-step work, and anything long or parallel gets a lane. If an idle lane already owns that repo, the work goes there instead.
 - When the host is short on memory, disk or panes (`dori can-launch` says HOLD), nothing new opens. The work is queued and the Dori tells you why.
 - New work gets a new thread. A follow-up goes back to its original thread, reopening the old session if its lane was closed. A quick question is answered where you asked it.
+
+For direct handling, after the intake lookup and before the first work tool call, start `dori work start --title T [--tag TAG ...] [--thread REF]`. Keep its UUID id and run `dori work stop <id>` when the answer is delivered. Records are readable JSON at `<stateDir>/work/<id>.json`; closed lanes are read without modification.
 
 ## The session registry
 
@@ -114,6 +119,9 @@ The watcher runs each check itself when it closes the lane, with no shell, and n
 
 | Command | What it does |
 |---|---|
+| `dori work start --title T [--tag TAG ...] [--thread REF]` | start a direct-work timer; return its UUID id |
+| `dori work stop <id>` | stop the timer; print timestamps, elapsed seconds and threshold |
+| `dori work similar [--title T] [--tag TAG ...]` | require title or tag; print matching completed direct work and closed-lane durations with threshold, no routing verdict |
 | `dori launch <key> ...` | write the lane footer into the brief, open a tab, start the agent, check for startup errors |
 | `dori adopt <key> --pane ID ...` | register a lane that's already running |
 | `dori sync [--write]` | registry against live panes, plus drift |
