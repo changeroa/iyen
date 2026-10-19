@@ -34,7 +34,21 @@ export class Slack {
   }
 
   async post(channel: string, text: string, threadTs?: string): Promise<Posted> {
-    const r = await this.call("chat.postMessage", { channel, text: guardText(text), ...(threadTs ? { thread_ts: threadTs } : {}) });
+    const message = guardText(text);
+    if (threadTs) {
+      let replies: Record<string, unknown>;
+      try {
+        replies = await this.call("conversations.replies", { channel, ts: threadTs, limit: 1 });
+      } catch (e) {
+        const reason = e instanceof MessengerError ? e.code || e.message : e instanceof Error ? e.message : String(e);
+        throw new MessengerError(`THREAD_NOT_IN_CHANNEL ${channel} ${threadTs}: ${reason.replace(/\s+/g, " ")}`, e instanceof MessengerError ? e.status : 0, "THREAD_NOT_IN_CHANNEL");
+      }
+      const root: unknown = Array.isArray(replies.messages) ? replies.messages[0] : undefined;
+      if (typeof root !== "object" || root === null || !("ts" in root) || root.ts !== threadTs) {
+        throw new MessengerError(`THREAD_NOT_IN_CHANNEL ${channel} ${threadTs}: root_mismatch`, 200, "THREAD_NOT_IN_CHANNEL");
+      }
+    }
+    const r = await this.call("chat.postMessage", { channel, text: message, ...(threadTs ? { thread_ts: threadTs } : {}) });
     return { channel: String(r.channel), ts: String(r.ts) };
   }
 
