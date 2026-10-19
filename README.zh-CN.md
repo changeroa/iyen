@@ -55,6 +55,7 @@ Dori 会跟着你的说话方式走。你写得简短、随意、用小写，它
 | `laneWorkspace` | 新 lane 标签页打开的 herdr workspace |
 | `defaultCwd` | lane 的起始目录，也是 lane 创建 worktree 的仓库 |
 | `agentCommand` | 启动智能体的命令，写成含 `{model}` 和 `{prompt}` 的 argv 列表 |
+| `workThresholdSec` | 下次改用 lane 的耗时阈值(秒)，默认 120 |
 | `hooks.threadReply`, `hooks.threadDone` | 你的消息 CLI,写成含 `{thread}` 和 `{text}` 的 argv 列表，用来发布 lane 进度和标记完成 |
 
 其余项(时间、阈值、heavy 槽位数)用默认值就够了。完整表格见 [`references/scripts.md`](skills/dori-mode/references/scripts.md)。环境变量 `DORI_CONFIG`、`DORI_STATE_DIR`、`DORI_LEAD_PANE` 优先于配置文件。
@@ -69,10 +70,14 @@ Dori 会跟着你的说话方式走。你写得简短、随意、用小写，它
 
 每条消息怎么处理，由 Dori 自己决定。
 
+接到请求时，先运行 `dori work similar [--title T] [--tag TAG ...]`，至少提供标题或标签。查询显示已完成的直接工作和已关闭 lane 的耗时，以及阈值，不给出路由判定。相似度使用规范化的标题词语、用于韩语的字符二元组，以及标签重合度。如果之前相同或相似的任务耗时达到或超过 `workThresholdSec`(默认 120 秒)，下次就交给 lane。否则仍按现有判断规则处理：
+
 - 提问、查状态、查资料，以及几次工具调用就能完成的小改动，直接处理，不开新会话。
 - 最终要提交 PR 的代码工作、多步骤的工作、耗时长或可以并行的工作，开一条 lane。如果已经有一条空闲的 lane 负责这个仓库，就交给它，不再新开。
 - 内存、磁盘或 pane 数量不够时(`dori can-launch` 显示 HOLD),不开新 lane。工作先排队，并告诉你原因。
 - 新的工作开新的线程。后续的跟进回到原来的线程，如果那条 lane 已关闭，就重新打开记录下来的会话。简单的问题在哪里问的就在哪里答。
+
+直接处理时，在接收请求的查询之后、首次工作工具调用之前运行 `dori work start --title T [--tag TAG ...] [--thread REF]`。保留返回的 UUID id，答案送达时运行 `dori work stop <id>`。记录以可读 JSON 保存在 `<stateDir>/work/<id>.json`；已关闭 lane 的记录只读不改。
 
 ## 会话登记表
 
@@ -114,6 +119,9 @@ Done = command ["bun","test"] stdout~" 0 fail"; file qa/report.json json:.passed
 
 | 命令 | 作用 |
 |---|---|
+| `dori work start --title T [--tag TAG ...] [--thread REF]` | 启动直接工作计时器，返回 UUID id |
+| `dori work stop <id>` | 停止计时器，显示起止时间戳、耗时秒数和阈值 |
+| `dori work similar [--title T] [--tag TAG ...]` | 必须提供标题或标签；显示相似的已完成直接工作和已关闭 lane 的耗时，以及阈值，不给出路由判定 |
 | `dori launch <key> ...` | 在 brief 里写入 lane footer,打开标签页，启动智能体，检查启动错误 |
 | `dori adopt <key> --pane ID ...` | 登记一条已经在运行的 lane |
 | `dori sync [--write]` | 对照登记表和实际 pane,列出不一致 |

@@ -22,6 +22,7 @@ import { Telegram } from "./messenger/telegram.ts";
 import { Discord, discordPresence } from "./messenger/discord.ts";
 import { realTimers } from "./messenger/typing.ts";
 import { transcribe, TranscriptionError } from "./messenger/voice.ts";
+import { WorkError, WorkTimers } from "./work.ts";
 
 const USAGE = `dori <command> [options]
 
@@ -39,6 +40,9 @@ const USAGE = `dori <command> [options]
   guard [--loop MIN]                   host load, memory, disk and pane-count alerts
   heavy <label> -- <command ...>       run a heavy command when a slot is free and load is low
   can-launch                           exit 0 if the host has room for a new lane, else print why and exit 4
+  work start --title T [--tag TAG ...] [--thread REF]
+  work stop <id>                       record elapsed seconds alongside workThresholdSec
+  work similar [--title T] [--tag TAG ...]  completed direct work and closed-lane durations
   send <slack|telegram|discord> --to TARGET --text TEXT [--thread ID] [--edit ID]
                                        post or edit a message (tokens from DORI_SLACK_TOKEN, DORI_TELEGRAM_TOKEN, DORI_DISCORD_TOKEN)
   presence <slack|discord>             keep the account shown as online until stopped
@@ -64,6 +68,7 @@ const flags = parseArgs({
     model: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, evidence: { type: "string" },
     reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, loop: { type: "string" },
     to: { type: "string" }, text: { type: "string" }, edit: { type: "string" },
+    tag: { type: "string", multiple: true },
   },
 });
 const opt = (name: string): string | undefined => {
@@ -91,6 +96,32 @@ const every = async (minutes: number, tick: () => Promise<void>): Promise<void> 
 
 try {
   switch (command) {
+    case "work": {
+      const timers = new WorkTimers(config.stateDir, realClock);
+      const tags = Array.isArray(flags.values.tag) ? flags.values.tag.filter((tag): tag is string => typeof tag === "string") : [];
+      console.log(`WORK threshold=${config.workThresholdSec}s`);
+      switch (key) {
+        case "start": {
+          const work = await timers.start(need("title"), tags, opt("thread"));
+          console.log(`STARTED ${work.id} ${JSON.stringify(work)}`);
+          break;
+        }
+        case "stop": {
+          const work = await timers.stop(flags.positionals[1] ?? die("work stop needs a work id"));
+          console.log(`STOPPED ${work.id} elapsed=${work.elapsedSec}s threshold=${config.workThresholdSec}s ${JSON.stringify(work)}`);
+          break;
+        }
+        case "similar": {
+          const matches = await timers.similar(opt("title"), tags);
+          for (const work of matches) console.log(`PAST ${work.source} ${work.id} elapsed=${work.elapsedSec}s threshold=${config.workThresholdSec}s ${JSON.stringify(work)}`);
+          if (!matches.length) console.log("NO_MATCHES");
+          break;
+        }
+        default:
+          die("usage: dori work start --title T | stop <id> | similar [--title T] [--tag TAG ...]");
+      }
+      break;
+    }
     case "launch": {
       const r = await launchLane(deps, { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), model: opt("model"), cwd: opt("cwd") });
       console.log(`LAUNCHED ${r.lane.key} pane=${r.lane.pane} tab=${r.lane.tab ?? "?"}`);
@@ -244,6 +275,6 @@ try {
       process.exit(command ? 1 : 0);
   }
 } catch (e) {
-  if (e instanceof LaunchError || e instanceof UnsafeMessageError || e instanceof MessengerError || e instanceof TranscriptionError) die(e.message);
+  if (e instanceof LaunchError || e instanceof UnsafeMessageError || e instanceof MessengerError || e instanceof TranscriptionError || e instanceof WorkError) die(e.message);
   throw e;
 }

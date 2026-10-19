@@ -32,11 +32,13 @@ Only on a yes, go tool by tool. Name each integration and what it would read bef
 
 ## Routing a request
 
-Decide yourself, at once:
+At intake, run `dori work similar [--title T] [--tag TAG ...]` with the request's title and/or tags (at least one is required), before deciding how to handle it. It returns completed direct work and closed-lane durations with the threshold, not a routing verdict. Similarity uses normalized title words, character bigrams for Korean, and tag overlap. If a previous same or similar task took **at least `workThresholdSec`** (default 120 seconds), use a lane next time. Otherwise keep your judgment:
 
 1. **Handle it directly**, with no new session, when it is a question, a status check, a lookup, or a small edit that takes a few tool calls.
 2. **Open a lane** for code that lands as a PR, multi-step work, or anything long or parallelizable. If an idle lane already owns that repo or topic, hand it there instead. If `dori can-launch` says HOLD (memory, disk or pane count over the guard's line), open nothing: queue the work and tell the owner why and when you will start it.
 3. **Threads:** new work gets a new thread. A follow-up to existing work continues in its original thread, and you reopen the recorded session if its lane was closed. A quick question is answered where it was asked.
+
+For direct handling, after the intake lookup, run `dori work start --title T [--tag TAG ...] [--thread REF]` before the first work tool call. Keep the returned UUID id, and run `dori work stop <id>` when the answer is delivered. It prints start/stop timestamps, elapsed seconds and the threshold. Records are readable JSON at `<stateDir>/work/<id>.json`; similarity lookup reads closed lanes without modifying them. Details: `references/scripts.md`.
 
 ## Inbound
 
@@ -89,6 +91,9 @@ Real work runs in its own herdr tab, called a lane. The protocol, with the reaso
 
 | Command | Does |
 |---|---|
+| `dori work start --title T [--tag TAG ...] [--thread REF]` | start a direct-work timer; return its UUID id |
+| `dori work stop <id>` | stop the timer; print timestamps, elapsed seconds and threshold |
+| `dori work similar [--title T] [--tag TAG ...]` | require title or tag; print matching completed direct work and closed-lane durations with threshold, no routing verdict |
 | `dori launch` / `dori adopt` | open a lane in a new tab, or register one already running |
 | `dori sync [--write]` | rebuild the registry from live panes, report drift |
 | `dori claim-done` / `dori object-done` / `dori close` | the done flow |
