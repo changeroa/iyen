@@ -99,6 +99,8 @@ Prints `CAN_LAUNCH` and exits 0 when the host has room for another lane. Otherwi
 ### `dori send <slack|telegram|discord> --to TARGET --text TEXT [--thread ID] [--edit ID]`
 Posts a message, or edits one with `--edit`. Tokens come from `DORI_SLACK_TOKEN` (plus `DORI_SLACK_COOKIE` for a user token), `DORI_TELEGRAM_TOKEN` or `DORI_DISCORD_TOKEN`. Text containing `$(` is refused, since it can only come from a shell string. Rate limits are retried with the server's wait time; other errors fail at once.
 
+Slack threaded posts are refused unless the thread is verified in the target channel; a missing or different root, or any check failure, prints `THREAD_NOT_IN_CHANNEL <channel> <thread>: <reason>` and sends nothing. The bot token needs the history read scopes for the conversations it posts threads into: `channels:history`, `groups:history`, `im:history`, `mpim:history`.
+
 ### `dori presence <slack|discord>`
 Keeps the account shown as online until stopped.
 - **Discord:** the bot connects to the gateway and identifies as online.
