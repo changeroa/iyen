@@ -91,6 +91,8 @@ The optional control field is for explicit owner UI actions. The service validat
 Allowed controls: pause, resume, object-done, approval-respond. Approval IDs must belong to the same messenger thread. An ordinary message saying yes is never automatically interpreted as an approval. Replies and read receipts use hooks; when a delivery result is unknown, inspect the outbox before retrying.
 
 
+Slack threaded posts are refused unless the thread is verified in the target channel; a missing or different root, or any check failure, prints `THREAD_NOT_IN_CHANNEL <channel> <thread>: <reason>` and sends nothing. The bot token needs the history read scopes for the conversations it posts threads into: `channels:history`, `groups:history`, `im:history`, `mpim:history`.
+
 ## Approval response examples
 
 Command/file change: {"decision":"accept"}, {"decision":"decline"}, or {"decision":"cancel"}. Only one-shot decisions are accepted.
