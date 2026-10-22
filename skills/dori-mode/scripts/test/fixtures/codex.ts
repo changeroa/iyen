@@ -23,9 +23,9 @@ for await(const chunk of Bun.stdin.stream()) {
   else if(m.method==="thread/goal/set"){goal={...goal,...m.params};result={goal};}
   else if(m.method==="thread/turns/list")result={data:[],nextCursor:null};
   else if(m.method==="turn/start"){
-   const id=crypto.randomUUID();result={turn:{id,status:"completed"}};
+   const id=crypto.randomUUID(),failed=m.params.input?.some((i:any)=>i.text==="fixture-fail-auth");result={turn:{id,status:failed?"failed":"completed"}};
    send({method:"turn/started",params:{threadId,turn:{id,status:"inProgress"}}});
-   send({method:"turn/completed",params:{threadId,turn:{id,status:"completed"}}});
+   send({method:"turn/completed",params:{threadId,turn:{id,status:failed?"failed":"completed",error:failed?{codexErrorInfo:"unauthorized",message:"fixture auth failure"}:null}}});
   } else if(m.method==="account/read")result={account:{type:"fixture"}};
   send({id:m.id,result});
  }

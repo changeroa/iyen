@@ -16,6 +16,7 @@ import { run, realClock, type Runner } from "./run.ts";
 import { bootstrapPath, type Bootstrap } from "./runtime/session-host.ts";
 import type { RuntimeControl, RuntimeRef, RuntimeSnapshot } from "./runtime/types.ts";
 import { WorkTimers } from "./work.ts";
+import { turnFailure } from "./turn-failure.ts";
 import { Mailbox, postHook } from "./mailbox.ts";
 
 export type Caller = { role: "admin" | "lead" | "lane" | "host"; key?: string };
@@ -24,16 +25,19 @@ export class DoriService {
   readonly inbox: Mailbox;
   readonly outbox: Mailbox;
   readonly operations: Mailbox;
+  readonly failures: Mailbox;
   readonly deps: FlowDeps;
   private workQueue = new SerialQueue();
   private launchQueue = new SerialQueue();
   private dispatchQueue = new SerialQueue();
+  private failureQueue = new SerialQueue();
   private stopping = false;
   private ticks = new Set<string>();
   private lastTick = new Map<string, number>();
   constructor(readonly config: DoriConfig, readonly runner: Runner = run) {
     this.registry = new Registry(config.stateDir); this.registry.enableJournal(config.stateDir);
     this.inbox = new Mailbox(config.stateDir, "inbox"); this.outbox = new Mailbox(config.stateDir, "outbox"); this.operations = new Mailbox(config.stateDir, "operations");
+    this.failures = new Mailbox(config.stateDir, "failures");
     const call = async <T>(key: string, action: string, args: any = {}): Promise<T> => {
       const lane = await this.registry.read(key);
       if (!lane?.runtime?.threadId) throw new Error("Runtime is not registered");
@@ -48,7 +52,7 @@ export class DoriService {
       input: (key, text, operationId) => this.dispatchQueue.run(key, async () => {
         const lane = await this.registry.read(key);
         if (!lane || lane.dispatchBlocked || statusOf(lane) === "closed") throw new Error("Lane dispatch is blocked");
-        const mail = this.inbox.put({ id: operationId, target: key, text, state: "queued", at: new Date().toISOString() });
+        const mail = this.inbox.put({ id: operationId, target: key, text, thread: lane.thread, state: "queued", at: new Date().toISOString() });
         const delivered = await this.inbox.deliver(mail.id, row => call<{ turnId: string }>(key, "input", { text: row.text, operationId: row.id }));
         if (!delivered.turnId) throw new Error("Missing turn receipt");
         return { turnId: delivered.turnId };
@@ -128,6 +132,12 @@ export class DoriService {
       if (action === "host-event" && args.event?.method === "runtime/disconnected" && lane.role !== "lead") {
         this.inbox.put({ id: `runtime-failed:${lane.key}:${args.instance}`, target: "lead", text: `Runtime failed for ${lane.key}. Inspect status and reconcile unknown operations before recover.`, state: "queued", at: new Date().toISOString() });
       }
+      if (action === "host-event" && args.event?.method === "turn/completed" && args.event.params?.turn?.status === "failed") {
+        const turnId = args.event.params.turn.id;
+        if (typeof turnId !== "string" || !turnId || (args.event.params.threadId && args.event.params.threadId !== lane.runtime.threadId)) throw new Error("Invalid failed turn identity");
+        this.failures.put({ id: `failed-turn:${lane.key}:${args.instance}:${turnId}`, target: lane.key, turnId, source: args.instance,
+          text: JSON.stringify(turnFailure(args.event.params.turn.error)), state: "queued", at: new Date().toISOString() });
+      }
       if (action === "host-event" && args.event?.method === "serverRequest/resolved") {
         const id = `approval:${args.instance}:${args.event.params.requestId}`;
         if (this.outbox.get(id)) this.outbox.mark(id, { state: "sent" });
@@ -198,7 +208,7 @@ export class DoriService {
     if (action === "input") {
       if (!args.text || !args.operationId) throw new Error("text and operationId required");
       const lane = await this.lane(key);
-      const mail = this.inbox.put({ id: args.operationId, target: key, text: args.text, state: "queued", at: new Date().toISOString() });
+      const mail = this.inbox.put({ id: args.operationId, target: key, text: args.text, thread: args.thread ?? lane.thread, state: "queued", at: new Date().toISOString() });
       if (lane.dispatchBlocked) return { queued: true, operationId: mail.id };
       return this.deps.runtime.input(key, args.text, args.operationId);
     }
@@ -227,7 +237,7 @@ export class DoriService {
       const boot = readJson<Bootstrap>(bootstrapPath(this.config.stateDir, selected.key));
       return ipc(hostSocket(this.config.stateDir, selected.key), boot.hostToken, "approval", { id: selected.requestId, response: args.response });
     }
-    if (action === "mail-list") return { inbox: this.inbox.list(), outbox: this.outbox.list(), operations: this.operations.list() };
+    if (action === "mail-list") return { inbox: this.inbox.list(), outbox: this.outbox.list(), operations: this.operations.list(), failures: this.failures.list() };
     if (action === "mail-resolve") {
       if (caller.role !== "admin" || !["sent", "queued"].includes(args.state) || !args.evidence) throw new Error("Explicit reconciliation evidence required");
       const box = args.box === "inbox" ? this.inbox : args.box === "outbox" ? this.outbox : undefined;
@@ -279,6 +289,33 @@ export class DoriService {
     }
     return result;
   }
+  async notifyFailures(): Promise<void> {
+    for (const failure of this.failures.list().filter(row => row.state === "queued")) {
+      await this.failureQueue.run(failure.id, async () => {
+        if (this.failures.get(failure.id)?.state !== "queued") return;
+        const lane = await this.lane(failure.target);
+        const metadata = JSON.parse(failure.text) as ReturnType<typeof turnFailure>;
+        const text = `Codex task failed (${metadata.category}). ${metadata.guidance} The task was not automatically retried.`;
+        if (lane.role !== "lead") {
+          this.inbox.put({ id: `notice:${failure.id}`, target: "lead", thread: lane.thread, text: `Lane ${lane.key}: ${text}`, state: "queued", at: failure.at });
+        } else {
+          // Completion notifications can precede the input RPC receipt. Keep the failure
+          // pending until a sent receipt associates that turn with its owner thread.
+          const threads = [...new Set(this.inbox.list().filter(row => row.target === lane.key && row.state === "sent" && row.turnId === failure.turnId).map(row => row.thread).filter((thread): thread is string => Boolean(thread && thread !== "none")))];
+          if (!threads.length) return;
+          for (const thread of threads) {
+            const id = `notice:${failure.id}:${thread}`;
+            this.outbox.put({ id, target: thread, text, state: "queued", at: failure.at });
+            if (this.config.hooks.threadReply) {
+              // postHook preserves unknown outcomes and never blindly replays them.
+              try { await this.deps.post!(id, this.config.hooks.threadReply, { key: lane.key, thread, text }); } catch { /* visible in outbox */ }
+            }
+          }
+        }
+        this.failures.mark(failure.id, { state: "sent" });
+      });
+    }
+  }
   async receive(source: string, event: any): Promise<void> {
     const ingress = this.config.ingress.find(i => i.id === source);
     if (!ingress || !ingress.owners.includes(event.user) || !event.id || !event.thread || typeof event.text !== "string") throw new Error("Untrusted or incomplete inbound event");
@@ -301,12 +338,13 @@ export class DoriService {
   }
   async tick(): Promise<void> {
     const once = async (name: string, fn: () => Promise<unknown>) => {
-      const interval = name === "inbox" ? 1000 : name === "done" ? 30000 : name === "launch-queue" ? 10000 : 60000;
+      const interval = name === "inbox" || name === "failures" ? 1000 : name === "done" ? 30000 : name === "launch-queue" ? 10000 : 60000;
       if (this.ticks.has(name) || Date.now() - (this.lastTick.get(name) ?? 0) < interval) return;
       this.lastTick.set(name, Date.now()); this.ticks.add(name);
       try { await fn(); } catch { console.error(`MONITOR_ERROR ${name}`); } finally { this.ticks.delete(name); }
     };
     await Promise.all([
+      once("failures", () => this.notifyFailures()),
       once("done", () => watchTick(this.deps).then(lines => lines.forEach(l => console.log(l)))),
       once("freshness", () => freshnessTick(this.deps, process.env.HOME ?? "")),
       once("runtime-health", async () => {

@@ -44,6 +44,11 @@ test("CLI daemon and isolated session-hosts launch, pause, resume, close and reo
   expect(JSON.parse(await new Response(history.stdout).text()).matches[0].id).toBe(timed.work.id);expect(await history.exited).toBe(0);
   const missing=Bun.spawn([process.execPath,join(import.meta.dir,"../src/cli.ts"),"work","stop","00000000-0000-0000-0000-000000000000"],{env,stdout:"pipe",stderr:"pipe"});
   expect((await new Response(missing.stderr).text()).trim()).toBe('no started work "00000000-0000-0000-0000-000000000000"');expect(await missing.exited).toBe(1);
+  await call("input",{key:"lead",text:"fixture-fail-auth",thread:"chat:failure",operationId:"failure-input"});
+  const failedMail=await waitFor(()=>call("mail-list"),v=>v.outbox.some((m:any)=>m.target==="chat:failure"));
+  expect(failedMail.outbox.filter((m:any)=>m.target==="chat:failure")).toHaveLength(1);
+  expect(failedMail.outbox.find((m:any)=>m.target==="chat:failure").text).toContain("authentication");
+  expect((await call("status",{key:"lead"})).runtime.hostInstanceId).toBe(lead.lane.runtime.hostInstanceId);
   const launched=await call("launch",{key:"test-lane",title:"Test",brief:join(state.dir,"brief.md"),done:`file ${join(state.dir,"ready.json")} json:.ready=true`,cwd:state.dir,operationId:"launch-1"});
   expect(launched.startup).toStartWith("STARTUP_OK");const threadId=launched.lane.runtime.threadId;
   const createdPanes=JSON.parse(readFileSync(join(state.dir,"fixture-panes.json"),"utf8"));

@@ -59,7 +59,7 @@ Managed Codex leads use `dori_runtime.control` actions `work-start` (`title,tags
 - watch/freshness/dead-panes/guard: compatibility status queries. The daemon owns the actual schedules; these do not launch duplicate loops.
 - approval list: current pending server requests and generation-qualified IDs.
 - approval respond ID --response-file FILE: operator response with the request's typed payload. Stale IDs are rejected.
-- mail list: inbox, outbox and launch operations. Unknown delivery is visible and is not replayed automatically.
+- mail list: inbox, outbox, launch operations and sanitized failed-turn metadata. Unknown delivery is visible and is not replayed automatically.
 - mail resolve ID --box inbox|outbox --state sent|queued --evidence TEXT: operator reconciliation after checking external state. queued is for a proven non-execution.
 - migrate --dry-run / --apply [--handoff-file FILE]: state migration with backups, no runtime launch.
 - send/presence/transcribe/heavy: existing standalone utilities.
@@ -113,6 +113,8 @@ The default command sandbox can block Unix socket connections. Do not broaden ne
 The socket directory is a private /tmp/dori-UID-HASH directory derived from stateDir. Control tokens are never command-line arguments. This is local-user isolation, not a security boundary against arbitrary code running as that same OS user.
 
 Host connection loss holds its goal and turn; failed stop confirmation terminates the owned Codex process. Reconnect does not silently resume a held lane. Inspect status/mail, then explicitly resume. For unknown external sends, inspect the actual messenger before marking sent or retrying through the original reply command.
+
+A final failed Codex turn is recorded even while the host remains healthy. Each host-instance/turn pair produces one actionable lane-to-lead notice, or a direct owner-thread notice for a failed lead. Lead notices wait for the sent input receipt to identify the originating thread, including when completion arrived before the receipt. Only fixed error categories and guidance are retained; raw error messages and command output are excluded. Notices use the durable outbox and configured threadReply hook, and uncertain notice delivery is never automatically retried. Without a hook the notice remains queued in the outbox. Failed tasks are not replayed.
 
 The current journal retains history without rotation. Archive completed state only while the service is stopped, and keep the snapshot/journal pair together. Live connector compatibility, real model behavior and deployment-specific OS sandbox policy should be validated in a separate state directory before migrating production work.
 
