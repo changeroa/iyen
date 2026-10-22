@@ -1,6 +1,6 @@
 import type { DoriConfig } from "./config.ts";
 import { serviceClient } from "./ipc.ts";
-const actions = ["status", "can-launch", "launch", "input", "report", "reply", "claim-done", "object-done", "pause", "resume", "close", "recover", "reopen", "sync", "approval-list", "mail-list"];
+const actions = ["work-start", "work-stop", "work-similar", "status", "can-launch", "launch", "input", "report", "reply", "claim-done", "object-done", "pause", "resume", "close", "recover", "reopen", "sync", "approval-list", "mail-list"];
 /** stdio MCP keeps lifecycle RPC outside the command sandbox without granting network access. */
 export const mcpServer = async (config: DoriConfig): Promise<void> => {
   if (!process.env.DORI_CONTEXT) throw new Error("MCP requires a managed lane context");
@@ -12,7 +12,7 @@ export const mcpServer = async (config: DoriConfig): Promise<void> => {
       let result: any;
       if (message.method === "initialize") result = { protocolVersion: ["2024-11-05", "2025-03-26", "2025-06-18"].includes(message.params?.protocolVersion) ? message.params.protocolVersion : "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "dori-runtime", version: "0.2.0" } };
       else if (message.method === "ping") result = {};
-      else if (message.method === "tools/list") result = { tools: [{ name: "control", description: "Control your Dori work using scoped lifecycle operations. args is the Dori service payload. launch requires key,title,brief,done,operationId and optional cwd/thread/worktree. input/reply require text and operationId. report requires key,kind,text,eventId. claim-done requires key,evidence. Use stable unique IDs; unknown deliveries are not retried. Lanes may only status/report/claim their own work. The lead may dispatch and report; approvals require the owner.", inputSchema: { type: "object", properties: { action: { type: "string", enum: actions }, args: { type: "object", additionalProperties: true } }, required: ["action", "args"], additionalProperties: false } }] };
+      else if (message.method === "tools/list") result = { tools: [{ name: "control", description: "Control your Dori work using scoped lifecycle operations. args is the Dori service payload. launch requires key,title,brief,done,operationId and optional cwd/thread/worktree. input/reply require text and operationId. report requires key,kind,text,eventId. claim-done requires key,evidence. Use stable unique IDs; unknown deliveries are not retried. Lanes may only status/report/claim their own work. The lead may dispatch and report; work-start requires title, optional tags/thread and a stable UUID operationId (also timer id); work-stop requires id; work-similar requires title and/or tags. Work results contain timestamps, elapsedSec and workThresholdSec; timer actions are lead/operator-only; approvals require the owner.", inputSchema: { type: "object", properties: { action: { type: "string", enum: actions }, args: { type: "object", additionalProperties: true } }, required: ["action", "args"], additionalProperties: false } }] };
       else if (message.method === "tools/call" && message.params?.name === "control") {
         const { action, args } = message.params.arguments ?? {};
         if (!actions.includes(action)) throw new Error("Unsupported Dori action");

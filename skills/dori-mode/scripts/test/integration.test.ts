@@ -26,6 +26,24 @@ test("CLI daemon and isolated session-hosts launch, pause, resume, close and reo
   const call=(action:string,args:any={})=>ipc<any>(serviceSocket(state.dir),token,action,args,20000);
   await waitFor(()=>call("status"),Array.isArray);
   const lead=await call("lead");expect(lead.startup).toStartWith("STARTUP_OK");
+  const leadWrapper = join(state.dir,"clients/lead/dori");
+  const leadMcp = async (action: string, args: any) => {
+    const child = Bun.spawn([leadWrapper,"mcp-server"],{env:{PATH:env.PATH,HOME:state.dir},stdin:"pipe",stdout:"pipe",stderr:"pipe"});
+    child.stdin.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"control",arguments:{action,args}}})+"\n");child.stdin.end();
+    const response=JSON.parse((await new Response(child.stdout).text()).trim());
+    expect(await child.exited).toBe(0);expect(response.result.isError).toBe(false);
+    return JSON.parse(response.result.content[0].text);
+  };
+  const workArgs={title:"Direct docs lookup",tags:["docs"],thread:"chat:docs",operationId:crypto.randomUUID()};
+  const timed=await leadMcp("work-start",workArgs);
+  expect(timed.work.id).toBe(workArgs.operationId);expect(timed.work.startedAt).toBeTruthy();
+  expect(await leadMcp("work-start",workArgs)).toEqual(timed);
+  const finished=await leadMcp("work-stop",{id:timed.work.id});
+  expect(finished.work.endedAt).toBeTruthy();expect(finished.work.elapsedSec).toBeGreaterThanOrEqual(0);
+  const history=Bun.spawn([process.execPath,join(import.meta.dir,"../src/cli.ts"),"work","similar","--tag","docs"],{env,stdout:"pipe",stderr:"pipe"});
+  expect(JSON.parse(await new Response(history.stdout).text()).matches[0].id).toBe(timed.work.id);expect(await history.exited).toBe(0);
+  const missing=Bun.spawn([process.execPath,join(import.meta.dir,"../src/cli.ts"),"work","stop","00000000-0000-0000-0000-000000000000"],{env,stdout:"pipe",stderr:"pipe"});
+  expect((await new Response(missing.stderr).text()).trim()).toBe('no started work "00000000-0000-0000-0000-000000000000"');expect(await missing.exited).toBe(1);
   const launched=await call("launch",{key:"test-lane",title:"Test",brief:join(state.dir,"brief.md"),done:`file ${join(state.dir,"ready.json")} json:.ready=true`,cwd:state.dir,operationId:"launch-1"});
   expect(launched.startup).toStartWith("STARTUP_OK");const threadId=launched.lane.runtime.threadId;
   expect(threadId).toBeTruthy();expect(threadId).not.toBe("distinct-session");
@@ -44,9 +62,13 @@ test("CLI daemon and isolated session-hosts launch, pause, resume, close and reo
     {jsonrpc:"2.0",id:1,method:"initialize",params:{protocolVersion:"2025-03-26"}},
     {jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"control",arguments:{action:"status",args:{}}}},
     {jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"control",arguments:{action:"pause",args:{key:"lead"}}}},
+    {jsonrpc:"2.0",id:4,method:"tools/call",params:{name:"control",arguments:{action:"work-similar",args:{tags:["docs"]}}}},
+    {jsonrpc:"2.0",id:5,method:"tools/list"},
   ].map(x=>JSON.stringify(x)).join("\n")+"\n");mcp.stdin.end();
   const replies=(await new Response(mcp.stdout).text()).trim().split("\n").map(x=>JSON.parse(x));
   expect(await mcp.exited).toBe(0);expect(replies.find(x=>x.id===2)?.result.isError).toBe(false);expect(replies.find(x=>x.id===3)?.result.isError).toBe(true);
+  expect(replies.find(x=>x.id===4)?.result.isError).toBe(true);
+  expect(replies.find(x=>x.id===5)?.result.tools[0].inputSchema.properties.action.enum).toContain("work-start");
   if(process.env.DORI_LIVE_PROTOCOL==="1") {
     mkdirSync(join(state.dir,"real-codex"));
     const actual=await startCodex(defaultConfig().runtime,{PATH:process.env.PATH,HOME:state.dir,CODEX_HOME:join(state.dir,"real-codex"),DORI_STATE_DIR:state.dir,DORI_CONTEXT:join(state.dir,"clients/test-lane/context.json"),DORI_CONFIG:join(state.dir,"clients/test-lane/config.json")});

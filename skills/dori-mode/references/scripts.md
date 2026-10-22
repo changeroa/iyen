@@ -21,7 +21,8 @@ Use ~/.dori/config.json or DORI_CONFIG. DORI_STATE_DIR overrides state placement
 | runtime.sandbox / approvalPolicy | workspace-write / on-request |
 | runtime.startupTimeoutMs / rpcTimeoutMs | 30000 / 15000 |
 | runtime.heartbeatIntervalMs / heartbeatTimeoutMs | 5000 / 20000 |
-| stateDir | ~/.dori/state |
+| stateDir | ~/.dori/state; registry, mailboxes and direct-task timers |
+| workThresholdSec | 120 seconds; historical duration at or above this means delegate next time |
 | defaultCwd / laneWorkspace | home / current Herdr workspace |
 | nudgeAfterMin / postAfterMin / closeAfterMin | 15 / 20 / 5 |
 | heavySlots / heavyMaxLoad | 1 / 80 |
@@ -34,6 +35,15 @@ Models must be IDs from Codex model/list. Provider/model routes and silent model
 ## Commands
 
 Run dori help for all flags.
+
+- `work start --title T [--tag TAG ...] [--thread REF] [--operation-id UUID]`: start a direct-task timer; return `{workThresholdSec,work}`. `work` contains a UUID id, title, tags, optional thread and `startedAt`. Repeat a start with the same UUID and content to retrieve its original record safely; changed content is refused.
+- `work stop ID`: persist `endedAt` and `elapsedSec`, returning the record and threshold. Unknown or already-stopped ids fail without changing the record.
+- `work similar [--title T] [--tag TAG ...]`: require a title or tag; return `{workThresholdSec,matches}` across completed direct tasks and completed lane cycles. Matching uses normalized words, character bigrams and tags. Running direct timers are excluded. Completed cycles remain discoverable after a lane reopens; execution ends at the final done claim when recorded, excluding the review window. Legacy lanes without claims use open-to-close time. History reads do not modify lane records.
+
+Timers are private readable JSON at `<stateDir>/work/<id>.json` and survive service restarts. The service serializes timer writes. Start after the intake lookup and before work; stop immediately before the final reply and include start/end timestamps and elapsed seconds. Similarity supplies duration facts, not a routing verdict: delegate if similar work took at least the configured threshold; otherwise use the skill’s direct/complex-work rules. Resource HOLD still means queue.
+
+Managed Codex leads use `dori_runtime.control` actions `work-start` (`title,tags?,thread?,operationId` with a stable UUID), `work-stop` (`id`), and `work-similar` (`title?,tags?`). These are lead/operator-only; lanes cannot read or change direct-task timers. Operators use the CLI above, which calls the same service. No sandbox CLI or extra network permission is needed.
+
 
 - serve: one state writer, socket owner, monitor supervisor. A second owner is refused.
 - lead: open the reserved Codex lead, once.
@@ -79,6 +89,7 @@ The optional control field is for explicit owner UI actions. The service validat
 ```
 
 Allowed controls: pause, resume, object-done, approval-respond. Approval IDs must belong to the same messenger thread. An ordinary message saying yes is never automatically interpreted as an approval. Replies and read receipts use hooks; when a delivery result is unknown, inspect the outbox before retrying.
+
 
 ## Approval response examples
 

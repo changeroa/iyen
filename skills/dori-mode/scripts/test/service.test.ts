@@ -5,7 +5,7 @@ import { DoriService } from "../src/service.ts";
 import { atomicJson } from "../src/journal.ts";
 import { bootstrapPath } from "../src/runtime/session-host.ts";
 import type { Lane } from "../src/registry.ts";
-import { withState, fakeRunner, newWorld } from "./fakes.ts";
+import { withState, fakeRunner, fakeClock, newWorld } from "./fakes.ts";
 let state:ReturnType<typeof withState>;let s:DoriService;
 beforeEach(()=>{state=withState();s=new DoriService({...defaultConfig(),stateDir:state.dir,ingress:[{id:"test",command:["fixture"],owners:["owner"]}]},fakeRunner(newWorld()));});afterEach(()=>state.done());
 const lane:Lane={key:"service-lane",title:"test",thread:"chat:1",brief:"/b",done:"closed a/b#1",openedAt:new Date().toISOString(),runtime:{kind:"codex",threadId:"t1",state:"idle",hostInstanceId:"host1",generation:1,binaryVersion:"0.163.0"}};
@@ -54,4 +54,37 @@ test("ambiguous thread creation without a checkpoint cannot silently create anot
  await s.registry.write({...lane,pane:"w:p1",runtime:{...lane.runtime!,threadId:undefined}});
  atomicJson(bootstrapPath(state.dir,lane.key),{instance:"old-host",hostToken:"fixture"});
  await expect(s.boot((await s.registry.read(lane.key))!)).rejects.toThrow("Thread creation outcome unknown");
+});
+
+test("lead timers preserve exact timestamps and duration across service restart", async () => {
+ const clock = fakeClock(Date.parse("2026-10-22T00:00:00Z")); s.deps.clock = clock;
+ const caller = { role: "lead" as const, key: "lead" };
+ const args = { title: "Direct lookup", tags: ["DOCS", "docs"], thread: "slack:C/1", operationId: crypto.randomUUID() };
+ const started = await s.handle("work-start", args, caller);
+ expect(started).toMatchObject({workThresholdSec:120,work:{id:args.operationId,startedAt:"2026-10-22T00:00:00.000Z",tags:["docs"]}});
+ clock.at += 120_500;
+ s = new DoriService(s.config, fakeRunner(newWorld())); s.deps.clock = clock;
+ expect(await s.handle("work-start", args, caller)).toEqual(started);
+ const stopped = await s.handle("work-stop", {id:started.work.id}, caller);
+ expect(stopped).toMatchObject({workThresholdSec:120,work:{startedAt:"2026-10-22T00:00:00.000Z",endedAt:"2026-10-22T00:02:00.500Z",elapsedSec:120.5}});
+ const history = await s.handle("work-similar", {tags:["docs"]}, caller);
+ expect(history.matches).toEqual([{...stopped.work,source:"direct"}]);
+ await expect(s.handle("work-stop", {id:started.work.id}, caller)).rejects.toThrow("already stopped");
+});
+
+test("timer actions reject lane capabilities and invalid input before writing", async () => {
+ for (const action of ["work-start", "work-stop", "work-similar"]) {
+   await expect(s.handle(action, {}, {role:"lane",key:lane.key})).rejects.toThrow("capability");
+ }
+ for (const args of [{title:5},{title:"Task",tags:[false]},{title:"Task",thread:7},{title:"Task",operationId:"../bad"}]) {
+   await expect(s.handle("work-start", args, {role:"lead",key:"lead"})).rejects.toThrow();
+ }
+ await expect(s.handle("work-similar", {}, {role:"lead",key:"lead"})).rejects.toThrow("title or tag");
+});
+
+test("concurrent stops serialize so only one completes a timer", async () => {
+ const result = await s.handle("work-start", {title:"Task",operationId:crypto.randomUUID()}, {role:"admin"});
+ const results = await Promise.allSettled([1,2].map(() => s.handle("work-stop", {id:result.work.id}, {role:"admin"})));
+ expect(results.filter(r => r.status === "fulfilled")).toHaveLength(1);
+ expect(results.filter(r => r.status === "rejected")).toHaveLength(1);
 });

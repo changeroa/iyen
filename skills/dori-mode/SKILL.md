@@ -32,11 +32,15 @@ Only on a yes, go tool by tool. Name each integration and what it would read bef
 
 ## Routing a request
 
-Decide yourself, at once:
+At intake, run `dori work similar [--title T] [--tag TAG ...]` with the request's title and/or tags (at least one is required), before deciding how to handle it. It returns completed direct work and closed-lane durations with the threshold, not a routing verdict. Similarity uses normalized title words, character bigrams for Korean, and tag overlap. If a previous same or similar task took **at least `workThresholdSec`** (default 120 seconds), use a lane next time. Otherwise keep your judgment:
 
 1. **Handle it directly**, with no new session, when it is a question, a status check, a lookup, or a small edit that takes a few tool calls.
 2. **Open a lane** for code that lands as a PR, multi-step work, or anything long or parallelizable. If an idle lane already owns that repo or topic, hand it there instead. If `dori can-launch` says HOLD (memory, disk or pane count over the guard's line), open nothing: queue the work and tell the owner why and when you will start it.
 3. **Threads:** new work gets a new thread. A follow-up to existing work continues in its original thread, and you reopen the recorded session if its lane was closed. A quick question is answered where it was asked.
+
+For direct handling, after the intake lookup, run `dori work start --title T [--tag TAG ...] [--thread REF]` before the first work tool call. Keep the returned UUID id, and run `dori work stop <id>` immediately before delivering the final answer. Include the task’s start timestamp, end timestamp and elapsed seconds in that final report. It prints start/stop timestamps, elapsed seconds and the threshold. Records are readable JSON at `<stateDir>/work/<id>.json`; similarity lookup reads closed lanes without modifying them. Details: `references/scripts.md`.
+
+For complex work, split the objective into bounded lanes with an exact repository/cwd, file ownership, constraints, a checkable `Done =` line and a reporting destination. Use separate owned worktrees for concurrent writers, review milestone evidence, integrate the results and verify the combined outcome. Keep the lead available for owner input and coordination. For each lane task, report its start/end timestamps and elapsed duration from the recorded cycle; do not use the five-minute review window as execution time.
 
 ## Inbound
 
@@ -91,7 +95,7 @@ Real work runs in its own herdr tab, called a lane. The protocol, with the reaso
 
 ## Runtime tool
 
-In a managed Codex session, use the required dori_runtime MCP control tool. CLI examples in this skill correspond to action plus args: text is supplied directly instead of text-file, and eventId/operationId remain stable. The tool carries your scoped capability. Do not invoke the CLI through the sandbox or broaden network access to reach the service. Operators can use the CLI normally.
+In a managed Codex session, use the required dori_runtime MCP control tool. CLI examples in this skill correspond to action plus args: text is supplied directly instead of text-file, and eventId/operationId remain stable. The lead uses `work-similar` with `{title,tags}` at intake, `work-start` with `{title,tags,thread,operationId}` before direct work, and `work-stop` with `{id}` before the final reply. Keep a stable UUID `operationId` for `work-start`; it is also the timer id and makes a repeated start safe. Results contain `workThresholdSec` and a `work` record (or `matches` for similarity). Work timer actions are lead/operator-only. The tool carries your scoped capability. Do not invoke the CLI through the sandbox or broaden network access to reach the service. Operators can use the CLI normally.
 
 ## Scripts
 
@@ -99,6 +103,7 @@ In a managed Codex session, use the required dori_runtime MCP control tool. CLI 
 
 | Command | Does |
 |---|---|
+| `dori work start` / `stop` / `similar` | direct-task timestamps and duration evidence for routing |
 | `dori serve` / `dori lead` | supervise monitors and open the Codex lead |
 | `dori launch` / `dori adopt` | launch a Codex lane or explicitly transfer a recorded thread |
 | `dori input` / `dori report` / `dori reply` | send input, report milestones, reply in messenger threads |

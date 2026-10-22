@@ -24,6 +24,8 @@ const help = `dori — Codex-only messenger lead and lanes
   approval list | approval respond ID --response-file FILE
   mail list | mail resolve ID --box inbox|outbox --state queued|sent --evidence TEXT
   migrate --dry-run | migrate --apply
+  work start --title T [--tag TAG ...] [--thread REF] [--operation-id UUID]
+  work stop ID | work similar [--title T] [--tag TAG ...]
   heavy LABEL -- COMMAND ...
   send slack|telegram|discord --to TARGET --text TEXT [--thread ID] [--edit ID]
   presence slack|discord | transcribe FILE | inbound slack [--loop MIN]
@@ -35,6 +37,7 @@ const flags = parseArgs({ args: rest, allowPositionals: true, strict: true, opti
   ...["title", "brief", "done", "thread", "model", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "response-file", "state-dir", "handoff-file", "key", "box", "state"].map(k => [k, { type: "string" }]),
   ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help"].map(k => [k, { type: "boolean" }]),
   ["reason", { type: "string", multiple: true }],
+  ["tag", { type: "string", multiple: true }],
 ]) as any });
 const values = flags.values as Record<string, string | boolean | string[] | undefined>;
 const opt = (name: string): string | undefined => typeof values[name] === "string" ? String(values[name]) : undefined;
@@ -55,6 +58,12 @@ try {
   const operationId = opt("operation-id") ?? crypto.randomUUID();
   let result: any;
   switch (command) {
+    case "work":
+      if (key === "start") result = await call("work-start", { title: need("title"), tags: values.tag ?? [], thread: opt("thread"), operationId });
+      else if (key === "stop") result = await call("work-stop", { id: flags.positionals[1] ?? (() => { throw new Error("work stop needs a work id"); })() });
+      else if (key === "similar") result = await call("work-similar", { title: opt("title"), tags: values.tag ?? [] });
+      else throw new Error("usage: dori work start --title T | stop ID | similar [--title T] [--tag TAG ...]");
+      break;
     case "launch": case "adopt":
       result = await call(command, { key, title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), cwd: opt("cwd"), model: opt("model"), worktree: Boolean(values.worktree), operationId, pane: opt("pane"), threadId: opt("thread-id"), transferConfirmed: Boolean(values["transfer-confirmed"]) }); break;
     case "input": case "reply": result = await call(command, { key, text, thread: opt("thread"), operationId }); break;

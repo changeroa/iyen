@@ -10,6 +10,7 @@
   "nudgeAfterMin": 15,
   "postAfterMin": 20,
   "closeAfterMin": 5,
+  "workThresholdSec": 120,
   "heavySlots": 1,
   "heavyMaxLoad": 80,
   "guard": {

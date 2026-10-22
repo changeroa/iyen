@@ -32,4 +32,6 @@ bun run typecheck
 - [Sessions](skills/dori-mode/references/sessions.md)
 - [Technical specification](docs/specs/codex-runtime-migration.md)
 
+依頼の振り分け前に `dori work similar --title "作業"` で履歴を確認し、類似作業が `workThresholdSec`（既定120秒）以上ならレーンへ委任します。小さな直接作業は `dori work start --title "作業"` / `dori work stop ID` で計測し、最終報告に開始・終了時刻と所要秒数を含めます。複雑な作業は範囲と完了条件を明示したレーンへ分割し、統合後に検証します。CodexリードはMCPの `work-similar`、`work-start`、`work-stop` を使います。
+
 MIT.

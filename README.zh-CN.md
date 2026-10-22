@@ -32,4 +32,6 @@ bun run typecheck
 - [Sessions](skills/dori-mode/references/sessions.md)
 - [Technical specification](docs/specs/codex-runtime-migration.md)
 
+分配请求前，使用 `dori work similar --title "任务"` 查询历史。如果类似任务耗时达到 `workThresholdSec`（默认120秒），则委派给工作通道。小型直接任务用 `dori work start --title "任务"` / `dori work stop ID` 计时，并在最终报告中包含开始、结束时间和耗时秒数。复杂任务分成范围和完成条件明确的通道，整合后验证。Codex主代理使用MCP的 `work-similar`、`work-start` 和 `work-stop`。
+
 MIT.

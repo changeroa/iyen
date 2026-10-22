@@ -15,6 +15,7 @@ import { canLaunch } from "./routing.ts";
 import { run, realClock, type Runner } from "./run.ts";
 import { bootstrapPath, type Bootstrap } from "./runtime/session-host.ts";
 import type { RuntimeControl, RuntimeRef, RuntimeSnapshot } from "./runtime/types.ts";
+import { WorkTimers } from "./work.ts";
 import { Mailbox, postHook } from "./mailbox.ts";
 
 export type Caller = { role: "admin" | "lead" | "lane" | "host"; key?: string };
@@ -24,6 +25,7 @@ export class DoriService {
   readonly outbox: Mailbox;
   readonly operations: Mailbox;
   readonly deps: FlowDeps;
+  private workQueue = new SerialQueue();
   private launchQueue = new SerialQueue();
   private dispatchQueue = new SerialQueue();
   private stopping = false;
@@ -135,6 +137,22 @@ export class DoriService {
     if (caller.role === "host") throw new Error("Host cannot issue user commands");
     const key = args.key ?? caller.key;
     if (caller.role === "lane" && (!(["report", "claim-done", "status"].includes(action)) || key !== caller.key)) throw new Error("Lane capability does not authorize this command");
+    if (["work-start", "work-stop", "work-similar"].includes(action)) {
+      if (caller.role !== "lead" && caller.role !== "admin") throw new Error("Work timers require lead or operator");
+      const timers = new WorkTimers(this.config.stateDir, this.deps.clock);
+      const tags = args.tags ?? [];
+      if (!Array.isArray(tags) || tags.some((tag: unknown) => typeof tag !== "string")) throw new Error("tags must be strings");
+      if (args.title !== undefined && typeof args.title !== "string") throw new Error("title must be a string");
+      if (args.thread !== undefined && typeof args.thread !== "string") throw new Error("thread must be a string");
+      const workThresholdSec = this.config.workThresholdSec;
+      if (action === "work-similar") return { workThresholdSec, matches: await timers.similar(args.title, tags) };
+      if (action === "work-start") {
+        if (typeof args.title !== "string" || typeof args.operationId !== "string") throw new Error("title and UUID operationId required");
+        return this.workQueue.run(args.operationId, async () => ({ workThresholdSec, work: await timers.start(args.title, tags, args.thread, args.operationId) }));
+      }
+      if (typeof args.id !== "string") throw new Error("work id required");
+      return this.workQueue.run(args.id, async () => ({ workThresholdSec, work: await timers.stop(args.id) }));
+    }
     if (action === "status") return key ? this.lane(key) : this.registry.list();
     if (action === "can-launch") return canLaunch(await sampleHost(this.runner), this.config.guard);
     if (action === "launch") {
