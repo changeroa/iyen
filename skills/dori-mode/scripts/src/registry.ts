@@ -1,4 +1,6 @@
-import { mkdirSync, readdirSync, renameSync } from "node:fs";
+import { mkdirSync, readdirSync } from "node:fs";
+import { atomicJson, Journal, SerialQueue } from "./journal.ts";
+import type { RuntimeRef } from "./runtime/types.ts";
 import { join } from "node:path";
 
 export const LANE_KEY = /^[a-z0-9][a-z0-9._-]{1,60}$/;
@@ -9,13 +11,24 @@ export type Objection = { readonly at: string; readonly reasons: readonly string
 export type HistoryEntry = { readonly at: string; readonly status: LaneStatus; readonly note: string };
 
 export type Lane = {
+  readonly schemaVersion?: 2;
+  readonly revision?: number;
+  readonly runtime?: RuntimeRef;
+  readonly dispatchBlocked?: boolean;
+  readonly holdReason?: "owner-pause" | "done-review" | "recovery";
+  readonly cycle?: number;
+  readonly role?: "lead" | "lane";
+  readonly repository?: string;
+  readonly baseSha?: string;
+  readonly resumeRefs?: Readonly<Record<string, { sha: string; branch?: string }>>;
+  readonly cleanupFence?: string;
+  readonly report?: { id: string; kind: string; text: string; at: number };
+  readonly legacy?: { sessionId?: string };
   readonly key: string;
   readonly title: string;
   readonly thread: string;
   readonly pane?: string;
   readonly tab?: string;
-  readonly session?: string;
-  readonly sessionVia?: string;
   readonly brief: string;
   readonly done: string;
   readonly cwd?: string;
@@ -59,6 +72,7 @@ export class Registry {
   }
 
   path(key: string): string {
+    if (!LANE_KEY.test(key)) throw new Error("Invalid lane key");
     return join(this.dir, `${key}.json`);
   }
 
@@ -67,12 +81,40 @@ export class Registry {
     return (await f.exists()) ? ((await f.json()) as Lane) : null;
   }
 
-  // temp file + rename so a concurrent reader never sees a half-written lane
+  private queue = new SerialQueue();
+  private journal: Journal | undefined;
+
+  enableJournal(stateDir: string): void {
+    this.journal = new Journal(join(stateDir, "journal"));
+    for (const record of this.journal.read()) {
+      if (record.type !== "lane") continue;
+      const lane = record.lane as Lane;
+      if (!LANE_KEY.test(lane.key)) throw new Error("Invalid journal lane key");
+      atomicJson(this.path(lane.key), lane);
+    }
+  }
+
   async write(lane: Lane): Promise<void> {
-    mkdirSync(this.dir, { recursive: true });
-    const tmp = `${this.path(lane.key)}.${process.pid}.tmp`;
-    await Bun.write(tmp, JSON.stringify(lane, null, 1));
-    renameSync(tmp, this.path(lane.key));
+    await this.queue.run(lane.key, async () => {
+      const current = await this.read(lane.key);
+      if ((current?.revision ?? 0) !== (lane.revision ?? 0)) throw new Error(`Revision conflict: ${lane.key}`);
+      this.persist({ ...lane, schemaVersion: 2, revision: (current?.revision ?? 0) + 1 });
+    });
+  }
+
+  async update(key: string, fn: (lane: Lane) => Lane): Promise<Lane> {
+    return this.queue.run(key, async () => {
+      const current = await this.read(key);
+      if (!current) throw new Error(`Unknown lane ${key}`);
+      const next = { ...fn(current), schemaVersion: 2 as const, revision: (current.revision ?? 0) + 1 };
+      if (next.key !== key) throw new Error("Lane identity cannot change");
+      this.persist(next); return next;
+    });
+  }
+
+  private persist(lane: Lane): void {
+    this.journal?.append({ type: "lane", lane });
+    atomicJson(this.path(lane.key), lane);
   }
 
   async list(): Promise<Lane[]> {

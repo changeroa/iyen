@@ -5,26 +5,13 @@
     "lanes"
   ],
   "ignorePanes": [],
-  "leadPane": "<your herdr pane id, from: herdr pane current>",
+  "leadPane": "",
   "defaultCwd": "~/code/my-project",
-  "agentCommand": [
-    "omo",
-    "--model",
-    "{model}",
-    "{prompt}"
-  ],
-  "defaultModel": "anthropic/claude-opus-5-5",
-  "launchKeywords": "ulw set goal and work",
-  "sessionsDir": "~/.omo/agent/sessions",
   "nudgeAfterMin": 15,
   "postAfterMin": 20,
   "closeAfterMin": 5,
   "heavySlots": 1,
   "heavyMaxLoad": 80,
-  "deadPanePatterns": [
-    "has stopped",
-    "no suitable jobs"
-  ],
   "guard": {
     "loadAlert": 150,
     "loadOk": 80,
@@ -32,29 +19,24 @@
     "diskFreeMinGb": 50,
     "panesMax": 20
   },
-  "hooks": {
-    "threadReply": [
-      "my-messenger",
-      "reply",
-      "--thread",
-      "{thread}",
-      "--text",
-      "{text}"
-    ],
-    "threadDone": [
-      "my-messenger",
-      "set-status",
-      "--thread",
-      "{thread}",
-      "--status",
-      "done",
-      "--note",
-      "{text}"
-    ],
-    "transcribe": [
-      "my-stt",
-      "--file",
-      "{file}"
-    ]
-  }
+  "hooks": {},
+  "schemaVersion": 2,
+  "runtime": {
+    "kind": "codex",
+    "binary": "codex",
+    "requiredVersion": "0.163.0",
+    "roles": {
+      "lead": {
+        "model": null,
+        "effort": null
+      },
+      "lane": {
+        "model": null,
+        "effort": null
+      }
+    },
+    "sandbox": "workspace-write",
+    "approvalPolicy": "on-request"
+  },
+  "ingress": []
 }

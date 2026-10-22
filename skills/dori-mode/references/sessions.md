@@ -1,24 +1,18 @@
 # Sessions (lanes)
 
-A lane is one agent session doing one job in its own herdr tab. You launch it, track it in the registry, answer it when it is stuck, and close it when its work is proven done.
+Every lane and the lead run a separate Codex app-server in a Herdr tab, managed by session-host. The service records the returned thread.id; it never inspects process environments or guesses session files.
 
-## Launching
+## Launch
 
 ```sh
-dori launch fix-login --title "Fix the login redirect loop" \
-  --brief ~/briefs/fix-login.md --done "merged acme/app#412; closed acme/app#398" \
-  --thread "telegram:<chat>/<topic>" --model anthropic/claude-opus-5-5
+dori launch fix-login --title "Fix login" --brief ~/briefs/fix-login.md \
+  --done "merged acme/app#412; closed acme/app#398" \
+  --thread "telegram:<chat>/<topic>" --cwd ~/code/app --worktree
 ```
 
-`launch` checks the key and the `Done =` line, appends a footer to the brief, opens a tab in `laneWorkspace`, starts the agent, and after 20 seconds checks the start: `STARTUP_ERROR` on a known failure (missing module, no API key, rate limit, quota), `STARTUP_OK` only when herdr reports the agent idle or working, `STARTUP_UNCONFIRMED` otherwise. On `STARTUP_ERROR`, relaunch on another model; on `STARTUP_UNCONFIRMED`, look at the pane before doing anything else.
+Write the objective, evidence, expected behavior, scope and forbidden changes into the brief. The service generates a separate brief with the lane contract, leaving the original intact. --worktree records a base SHA and creates an owned branch/worktree for concurrent writers. Without it, the supplied cwd is used and is never owned for deletion.
 
-Write the brief like a careful prompt:
-
-- open with the keywords you would type yourself (for example `ulw set goal and work`);
-- where the code is and what has been learned so far;
-- the ideal end state, from the point of view of whoever uses the result;
-- what not to touch;
-- how and when to report.
+STARTUP_OK requires a registered Codex thread and an accepted first input. A missing response yields STARTUP_UNCONFIRMED; inspect status and mail list instead of relaunching. Reusing --operation-id deduplicates a completed launch. Resource HOLD leaves the request queued.
 
 **Why the `Done =` line has to be checkable:** the watcher closes lanes on its own, so it can only trust what it can read back itself. `launch` and `adopt` refuse any signal outside this list. Signals are joined with `;`, and every one has to pass.
 
@@ -41,43 +35,25 @@ Done = command ["bun","test"] stdout~" 0 fail"; file qa/report.json json:.passed
 
 Work no script can check (a design review, a judgement call) stays in the lane's own plan. You judge it yourself before the claim.
 
-## The registry
+## Registry and reporting
 
-One JSON file per lane under `<stateDir>/lanes/`, written atomically (temp file + rename), so two writers never leave a half-written file. Each lane records:
+The service is the only writer. Lane snapshots live in state/lanes; append-only journal records are flushed before ACK. A lane revision prevents stale overwrites. The lead is a reserved lane named lead and is never automatically closed.
 
-| Field | Meaning |
-|---|---|
-| `thread` | where its updates go, as `platform:thread` (or `none`) |
-| `pane`, `tab` | its herdr location |
-| `session` | the agent's own session id, so a closed job can be reopened later |
-| `status` | `working`, `done-claimed`, `verified-done`, `not-done`, `closed` |
-| `claim`, `objection`, `history` | what was claimed, what was objected, every status change |
+- thread: messenger reference; runtime.threadId: Codex RPC identity. They are different namespaces.
+- pane/tab: Herdr placement; runtime.generation: fences old host events.
+- status: working, paused, done-claimed, verified-done, not-done, closed.
+- dispatchBlocked and holdReason: fail-closed barrier independent of business status.
+- claim/history/receipt: evidence, deadline and cleanup history.
+- worktrees/resumeRefs: explicit ownership and saved Git resume points.
 
-`dori sync` compares the registry with live panes and prints drift (a pane that is gone, a session id that changed, an empty `Done =` line). It never deletes anything. With `--write` it stores the session ids it found.
+Use dori report KEY --kind milestone --text-file PATH --event-id ID. The service persists the event and forwards it to the lead; configured threadReply hooks post milestones. Identical event IDs are not reposted. Do not infer progress from terminal text.
 
-How the session id is found for a pane, in order:
+## Pause and recovery
 
-1. the agent process's `--session <id>` argument;
-2. `PI_SESSION_ID` in the environment of one of its child processes;
-3. the session file whose timestamp falls within three minutes after the agent process started.
+Pause persists a dispatch barrier, deactivates an active native goal, interrupts the current turn and verifies inactivity. Unknown responses leave the barrier in place. Resume is explicit and restores the previous status without resetting goal usage.
 
-The id from step 1 is the session the agent was launched with. If someone switches sessions inside the agent, only steps 2 and 3 notice.
+Use dori recover KEY after a host dies. An existing live host/process prevents a second writer. Use dori resume KEY to release a recovery hold after reconciliation. An unknown mail is not retried automatically: inspect actual work/history, then use dori mail resolve ID --box inbox --state sent|queued --evidence TEXT. Choose queued only after proving it was not executed.
 
-When the owner writes in a closed lane's thread, reopen its recorded session in a new tab, set its monitors again, and keep replying there.
+A closed lane is reopened with dori reopen KEY --text-file PATH. It keeps the Codex thread and messenger reference, increments cycle, and removes the old claim deadline from the active cycle. Owned worktrees are restored from saved branch/SHA references. A genuinely missing Codex thread is an error, never silently replaced.
 
-## Messaging a session
-
-Before you type into a pane:
-
-1. check it runs a live agent (`herdr pane process-info --pane <id>`), not a shell, a stopped agent or a startup screen;
-2. read it (`herdr pane read <id> --source recent-unwrapped --lines 40`) and confirm the input line is empty and no approval or question prompt is open;
-3. send once, as one argument (the scripts' `sendVerified` does this);
-4. confirm delivery from a state change: the pane's `agent_status` moving to working, or the message showing up in the session record. Never press Enter again because of what the screen shows; if no change shows up, treat the send as unconfirmed.
-
-Exit code 0 and echoed input are not proof the agent got the message. A reply from the session, or its record of handling the message, is.
-
-## Watching
-
-- Sessions that turn blocked or ask a question: answer them or bring them to the owner.
-- Sessions that report a bug: reproduce it before it counts, then give it its own thread.
-- `dori dead-panes` reports agent panes that stopped; restart the session in place (`<agent> --session <id>`) unless its work is finished.
+To transfer an existing external Codex thread, stop its other client first and use dori adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS --transfer-confirmed. Adoption starts held. Resume only after verifying ownership and context.

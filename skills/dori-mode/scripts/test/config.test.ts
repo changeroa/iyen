@@ -21,7 +21,8 @@ test("a missing config file falls back to defaults and DORI_STATE_DIR wins over 
   process.env.DORI_STATE_DIR = state.dir;
   const c = await loadConfig("/nonexistent/config.json", "/home/ana");
   expect(c.stateDir).toBe(state.dir);
-  expect(c.agentCommand).toEqual(["omo", "--model", "{model}", "{prompt}"]);
+  expect(c.runtime.kind).toBe("codex");
+  expect(c.runtime.requiredVersion).toBe("0.163.0");
 });
 
 test("hook templates fill each argument separately, so text with spaces or quotes stays one argument", () => {
