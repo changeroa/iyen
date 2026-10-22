@@ -88,3 +88,38 @@ test("concurrent stops serialize so only one completes a timer", async () => {
  expect(results.filter(r => r.status === "fulfilled")).toHaveLength(1);
  expect(results.filter(r => r.status === "rejected")).toHaveLength(1);
 });
+
+test("TUI blocked transitions notify lead once, resolve durable notice, and permit a fresh notice",async()=>{
+ await s.registry.write(lane);
+ const event={id:"tui:t1:1",method:"tui/inputRequired",params:{pane:"w:p1",turnId:"turn1",message:"Inspect real TUI"}};
+ const host={role:"host" as const,key:lane.key};
+ await s.handle("host-event",{key:lane.key,instance:"host1",runtime:lane.runtime,event},host);
+ await s.handle("host-event",{key:lane.key,instance:"host1",runtime:lane.runtime,event},host);
+ expect(s.outbox.list()).toHaveLength(1);expect(s.inbox.list()).toHaveLength(1);
+ await s.handle("host-event",{key:lane.key,instance:"host1",runtime:lane.runtime,event:{method:"tui/inputResolved",params:{requestId:event.id}}},host);
+ expect(s.outbox.list()[0]?.state).toBe("sent");
+ await s.handle("host-event",{key:lane.key,instance:"host1",runtime:lane.runtime,event:{...event,id:"tui:t1:2"}},host);
+ expect(s.outbox.list()).toHaveLength(2);expect(s.inbox.list()).toHaveLength(2);
+});
+test("a live thread owner prevents recovery before creating a tab or touching runtime intent",async()=>{
+ const world=newWorld();world.panes=[{pane_id:"other",workspace_id:"w",agent:"codex",agent_session:{value:"t1"}} as any];s=new DoriService(s.config,fakeRunner(world));await s.registry.write(lane);
+ await expect(s.handle("recover",{key:lane.key},{role:"admin"})).rejects.toThrow("live TUI");
+ expect(world.calls.some(a=>a[0]==="herdr"&&a[1]==="tab"&&a[2]==="create")).toBe(false);
+ expect((await s.registry.read(lane.key))?.runtime?.threadId).toBe("t1");
+});
+test("legacy private-RPC sessions require an explicit preserved new-session handoff",async()=>{
+ await s.registry.write({...lane,pane:"w:p1"});await expect(s.boot((await s.registry.read(lane.key))!)).rejects.toThrow("new-session");
+ await expect(s.handle("recover",{key:lane.key,newSession:true,handoff:"summary"},{role:"lead",key:"lead"})).rejects.toThrow("operator");
+});
+
+test("explicit operator handoff archives legacy control state, preserves old identity and queues new session held",async()=>{
+ const world=newWorld(),base=fakeRunner(world);
+ s=new DoriService(s.config,async(argv,opts)=>argv[0]==="herdr"&&argv[1]==="tab"&&argv[2]==="create"?{code:0,err:"",out:JSON.stringify({result:{root_pane:{pane_id:"new-pane",tab_id:"new-tab"},tab_id:"new-tab"}})}:base(argv,opts));
+ await s.registry.write({...lane,pane:"old-pane"});atomicJson(bootstrapPath(state.dir,lane.key),{instance:"host1",hostToken:"old-token"});
+ s.inbox.put({id:"uncertain",target:lane.key,text:"unknown side effect",state:"unknown",at:new Date().toISOString()});
+ await s.handle("recover",{key:lane.key,newSession:true,handoff:"Confirmed A; B remains uncertain",operationId:"migration1"},{role:"admin"});
+ const current=(await s.registry.read(lane.key))!;
+ expect(current.runtimeHistory?.[0]?.threadId).toBe("t1");expect(current.runtime?.threadId).toBeUndefined();expect(current.runtime?.backend).toBe("herdr-tui");expect(current.dispatchBlocked).toBe(true);
+ expect(s.inbox.get("migration1")).toMatchObject({state:"queued",target:lane.key});expect(s.inbox.get("migration1")?.text).toContain("Confirmed A");expect(s.inbox.get("uncertain")?.state).toBe("unknown");
+ expect(await Bun.file(join(state.dir,"hosts/history/service-lane-1-t1/service-lane.json")).json()).toMatchObject({instance:"host1"});
+});

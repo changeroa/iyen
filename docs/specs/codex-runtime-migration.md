@@ -7,6 +7,14 @@
 - 목표: Dori의 메신저·리드·레인·완료 검증 구조를 유지하고, 리드와 모든 작업 레인의 에이전트 런타임을 Codex로 통일한다. OMO 실행·세션·goal·monitor 의존성을 제거한다.
 - 범위: 이 문서는 구현 계약이다. 아래 신규 명령·파일·설정은 제안이며 아직 존재하지 않는다.
 
+## Visible TUI 후속 구현 (2026-10-22)
+
+기존 pane의 session-host 텍스트 출력 방식은 interactive Codex TUI 기준을 충족하지 못했다. 후속 구현에서는 Herdr `agent start/prompt/get/read/send-keys`가 실제 TUI의 session mutation을 소유한다. off-pane host는 전용 Unix WebSocket app-server endpoint를 감독하고 allowlist read-only observer로 정확한 userMessage operation marker와 실제 turn ID, goal 상태를 확인한다. observer는 thread start/resume, turn submit, goal mutation, approval response를 수행하지 않는다.
+
+아래 초기 RPC 설계의 직접 mutation 부분은 이 후속 결정으로 대체한다. 설정·도구·플러그인·인증 갱신·기존 history는 established CODEX_HOME을 그대로 사용하며 Dori 역할, MCP capability, 모델/effort, 정책만 process-scoped override로 전달한다. 전역 설정을 수정하거나 auth snapshot을 덮어쓰지 않는다. 기존 private-RPC thread는 오래된 developer instructions를 그대로 재개할 수 있으므로 명시적 새 session/handoff migration을 지원하며 원래 history와 runtime identity를 보존한다.
+
+운영 명령과 제한은 [runtime guide](../../skills/dori-mode/references/scripts.md#visible-runtime-and-recovery)를 따른다. live smoke 검증과 실제 운영 전환은 별도이며 이 변경 자체는 배포하지 않는다.
+
 ## 구현 기록 (2026-10-22)
 
 이 문서의 설계를 코드로 옮겼다. 최종 검증: `bun test` **74 pass / 0 fail**, `bun run typecheck` 통과, `DORI_LIVE_PROTOCOL=1 bun test test/integration.test.ts` 통과. `git diff --check`, installer shell 문법, 문서 로컬 링크도 확인했다. 실행 중 확인한 차이는 다음과 같다.
@@ -559,3 +567,5 @@ inbox/outbox, watcher supervision, migration dry-run/apply, 문서와 installer�
 이번 조사에서 확인한 것은 repository 실행 경로, 관련 테스트 소스, 로컬 CLI help와 생성 스키마다. 실제 Codex 모델 호출, native goal 동작, live Herdr session-host, 메신저 E2E, migration 실행은 **미검증**이다. 이 문서 변경에는 runtime 테스트를 실행하지 않았으며, Phase 0 및 회귀 검증은 구현 작업의 출하 조건이다.
 
 아키텍처 점검은 책임 소유권, runtime 경계, 추상화 비용, 초기화 순서, 동작 보존을 중심으로 수행했다. 구체적으로 launch → registry → runtime, pause → goal → interrupt, claim → timer → verifier → cleanup 경로를 추적했다. 메신저 API 내부 전체와 외부 agent-messenger 구현은 전체 감사 범위에 포함하지 않았다.
+
+Untrusted working directories retain Codex’s real folder-trust UI. Startup reports a blocked TUI; Dori does not accept trust or write global project trust on the owner’s behalf. Use an already trusted workspace or resolve the visible trust UI explicitly before launch.

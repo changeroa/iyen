@@ -12,11 +12,11 @@ const waitFor = async<T>(fn:()=>Promise<T>,accept:(value:T)=>boolean):Promise<T>
  do{try{const v=await fn();if(accept(v))return v;}catch(e){last=e;}await Bun.sleep(50);}while(Date.now()<end);
  throw new Error(`Timed out: ${String(last)}`);
 };
-test("CLI daemon and isolated session-hosts launch, pause, resume, close and reopen the same Codex thread",async()=>{
+test("CLI service and private backends manage visible Herdr agents with exact receipts, pause, close and same-thread reopen",async()=>{
  const state=withState();let daemon:ReturnType<typeof Bun.spawn>|undefined;
  try{
   const bin=join(state.dir,"bin");mkdirSync(bin);symlinkSync(join(import.meta.dir,"fixtures/herdr.ts"),join(bin,"herdr"));
-  const config={...defaultConfig(),stateDir:state.dir,defaultCwd:state.dir,leadWorkspace:"lead-space",laneWorkspace:"worker-space",closeAfterMin:0.01,guard:{...defaultConfig().guard,memFreeMinPct:0,diskFreeMinGb:0},runtime:{...defaultConfig().runtime,binary:join(import.meta.dir,"fixtures/codex.ts"),startupTimeoutMs:10000,rpcTimeoutMs:3000}};
+  const config={...defaultConfig(),stateDir:state.dir,defaultCwd:state.dir,leadWorkspace:"lead-space",laneWorkspace:"worker-space",closeAfterMin:0.01,guard:{...defaultConfig().guard,memFreeMinPct:0,diskFreeMinGb:0},runtime:{...defaultConfig().runtime,binary:join(import.meta.dir,"fixtures/codex.ts"),roles:{lead:{model:"test",effort:"medium"},lane:{model:"test",effort:"medium"}},startupTimeoutMs:10000,rpcTimeoutMs:3000,heartbeatIntervalMs:250,heartbeatTimeoutMs:5000}};
   const cfgPath=join(state.dir,"config.json");atomicJson(cfgPath,config);await Bun.write(join(state.dir,"brief.md"),"fixture task");await Bun.write(join(state.dir,"ready.json"),'{"ready":true}');
   const env={PATH:`${bin}:${dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`,HOME:state.dir,DORI_CONFIG:cfgPath,DORI_STATE_DIR:state.dir};
   daemon=Bun.spawn([process.execPath,join(import.meta.dir,"../src/cli.ts"),"serve"],{env,stdout:"pipe",stderr:"pipe"});
@@ -25,7 +25,12 @@ test("CLI daemon and isolated session-hosts launch, pause, resume, close and reo
   const token=readJson<{token:string}>(join(state.dir,"control.json")).token;
   const call=(action:string,args:any={})=>ipc<any>(serviceSocket(state.dir),token,action,args,20000);
   await waitFor(()=>call("status"),Array.isArray);
-  const lead=await call("lead");expect(lead.startup).toStartWith("STARTUP_OK");
+  const lead=await call("lead");
+  if(!lead.startup.startsWith("STARTUP_OK")) {
+    const debug=(path:string)=>existsSync(join(state.dir,path))?readJson(join(state.dir,path)):null;
+    throw new Error(JSON.stringify({startup:lead.startup,backendError:debug("fixture-backend-error.json"),phase:debug("hosts/lead.startup.json"),hostError:debug("hosts/lead.error.json")}));
+  }
+  expect(lead.startup).toStartWith("STARTUP_OK");
   const leadWrapper = join(state.dir,"clients/lead/dori");
   const leadMcp = async (action: string, args: any) => {
     const child = Bun.spawn([leadWrapper,"mcp-server"],{env:{PATH:env.PATH,HOME:state.dir},stdin:"pipe",stdout:"pipe",stderr:"pipe"});
@@ -101,11 +106,16 @@ test("CLI daemon and isolated session-hosts launch, pause, resume, close and reo
   expect(reopened.runtime.threadId).toBe(threadId);expect(reopened.cycle).toBe(2);expect(reopened.claim).toBeUndefined();
   expect(JSON.parse(readFileSync(join(state.dir,"fixture-panes.json"),"utf8")).find((p:any)=>p.pane_id===reopened.pane).workspace_id).toBe("worker-space");
   expect(existsSync(join(state.dir,".omo"))).toBe(false);
+  const herdrCalls=readFileSync(join(state.dir,"fixture-herdr-calls.jsonl"),"utf8").trim().split("\n").map(s=>JSON.parse(s));
+  for(const command of ["start","prompt","get","read","send-keys"])expect(herdrCalls.some(a=>a[0]==="agent"&&a[1]===command)).toBe(true);
+  expect(herdrCalls.filter(a=>a[0]==="pane"&&a[1]==="run").every(a=>a[3].startsWith("export CODEX_HOME="))).toBe(true);
+  expect((await call("mail-list")).inbox.filter((m:any)=>m.id.startsWith("runtime-failed:"))).toHaveLength(0);
   daemon.kill("SIGTERM");await daemon.exited;
   expect(await errs).toBe("");expect(await logs).toContain("DORI_SERVICE_READY");
  }finally{
   daemon?.kill();
-  if(existsSync(join(state.dir,"fixture-pids")))for(const raw of readFileSync(join(state.dir,"fixture-pids"),"utf8").trim().split("\n")){try{process.kill(-Number(raw),"SIGTERM");}catch{}}
+  for(const path of new Bun.Glob("hosts/*.pid.json").scanSync(state.dir)){try{process.kill(readJson<{pid:number}>(join(state.dir,path)).pid,"SIGTERM");}catch{}}
+  if(existsSync(join(state.dir,"fixture-pids")))for(const raw of readFileSync(join(state.dir,"fixture-pids"),"utf8").trim().split("\n")){try{process.kill(Number(raw),"SIGTERM");}catch{}}
   await Bun.sleep(100);state.done();
  }
 },30000);

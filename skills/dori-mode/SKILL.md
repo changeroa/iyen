@@ -17,7 +17,7 @@ Before anything else, ask the owner what to call you. Plain "Dori" is fine, and 
 
 Run once, in order. Details and commands: `references/setup.md`.
 
-1. Use Codex CLI 0.163.0 and herdr. The lead and every lane run through dori session-host and Codex app-server; herdr provides their tabs.
+1. Use Codex CLI 0.163.0 and herdr. The lead and every lane are real interactive Codex TUIs, started and controlled through Herdr. Each TUI connects to its own protected app-server endpoint; an off-pane host observes it read-only and supervises its lifetime.
 2. Install agent-messenger, ask the owner which platform (Telegram, Discord, Slack, ...), and wait for the answer. If it is Slack, also ask: user token (a real member with a paid seat the owner pays for, sees everything that member sees, can show online) or bot token (an app, no seat cost, only invited channels and its scopes). Give that trade-off in one short list and wait.
 3. Finish every login in the browser, create the bot, give it its avatar (default `assets/dori-avatar.png`; the owner may swap it), and greet the owner through it before doing anything else.
 4. Install the scripts in `scripts/` (one command, see `references/setup.md`) and write `~/.dori/config.json` from `references/config.example.json`.
@@ -89,7 +89,7 @@ Real work runs in its own herdr tab, called a lane. The protocol, with the reaso
 - All parallel work goes through dori launch, with --worktree for concurrent writers. Do not use unregistered agent spawning or share mutable checkouts. Record scope and base revision in the brief.
 - Use dori report KEY --kind milestone|blocker|question|done --text-file PATH --event-id ID. Reports are structured events; terminal text is not evidence of delivery.
 - Use dori reply --thread REF --text-file PATH --operation-id ID for owner replies. Messenger credentials stay in the service and its adapters, not the Codex subprocess.
-- Only authenticated owner control events or the local owner CLI may answer dori approval requests. Relay questions and request IDs; do not self-approve on the owner's behalf.
+- Only the authenticated owner may answer approvals in the actual Herdr Codex TUI. Relay the pane and request notice; do not self-approve or translate a structured response into guessed UI keys. `dori approval list` identifies the TUI; `approval respond` is unavailable for interactive TUI requests.
 - Keep memory in approved files under ~/.dori/memory or the owner's existing memory integration. Record identity and onboarding consent there; the service does not infer consent from messages by other people.
 
 

@@ -29,12 +29,12 @@
     "requiredVersion": "0.163.0",
     "roles": {
       "lead": {
-        "model": null,
-        "effort": null
+        "model": "gpt-6-luna",
+        "effort": "low"
       },
       "lane": {
-        "model": null,
-        "effort": null
+        "model": "gpt-6-luna",
+        "effort": "low"
       }
     },
     "sandbox": "workspace-write",
