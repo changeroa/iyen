@@ -1,120 +1,129 @@
-# Scripts
+# CLI and runtime
 
-`scripts/` is a bun + TypeScript package with one CLI, `dori`. Every external command runs as an argv array; nothing builds a shell string.
-
-## Install and test
+The Bun/TypeScript package exposes dori. Codex app-server runs the lead and each lane; dori serve owns lifecycle state, monitor schedules and durable input/output ledgers. Herdr owns tabs. Managed agents use the required `dori_runtime.control` stdio MCP tool; operator CLI and host control use local sockets. See sessions.md for Done signal grammar.
 
 ```sh
-cd skills/dori-mode/scripts
-bun install          # dev dependencies only (types, tsc)
-bun link             # puts `dori` on your PATH
-bun test             # behavior tests with fake herdr/git/gh; nothing real is touched
-bunx tsc --noEmit    # typecheck
+bun install --frozen-lockfile
+bun test
+bun run typecheck
 ```
 
-Needs: bun 1.3+, herdr, git, and the GitHub CLI (`gh`) for `merged`/`closed` signals (npm for `published`). The `command`, `file` and `url` signals need nothing extra. The full list of signal kinds is in `sessions.md`. The host guard reads `sysctl`, `memory_pressure` and `df` on macOS; on Linux it reads `/proc/loadavg` and `df`, and memory and swap read as unknown.
+Unit tests use fake transports and clocks. The process integration test starts isolated fixture Codex/Herdr executables and Unix sockets; it never calls a model or messenger API.
 
 ## Configuration
 
-`~/.dori/config.json` (or the path in `DORI_CONFIG`). Every field is optional; see `config.example.json`. `DORI_STATE_DIR` and `DORI_LEAD_PANE` override the file.
+Use ~/.dori/config.json or DORI_CONFIG. DORI_STATE_DIR overrides state placement. Config schemaVersion is 2. Legacy execution fields are rejected with a migration instruction.
 
-| Field | Default | Used by |
-|---|---|---|
-| `stateDir` | `~/.dori/state` | registry, heavy slots |
-| `laneWorkspace` | current workspace | `launch` |
-| `workspaces` | all | `sync`, `dead-panes` |
-| `ignorePanes`, `leadPane` | none | panes the sweeps skip; `leadPane` is also where lanes report |
-| `defaultCwd` | home | where lanes start, and the repo whose worktrees they own |
-| `agentCommand`, `defaultModel`, `launchKeywords` | `omo --model {model} {prompt}` | `launch` |
-| `sessionsDir` | `~/.omo/agent/sessions` | session-id lookup |
-| `nudgeAfterMin`, `postAfterMin` | 15, 20 | `freshness` |
-| `closeAfterMin` | 5 | `watch` |
-| `heavySlots`, `heavyMaxLoad` | 1, 80 | `heavy` |
-| `deadPanePatterns` | `has stopped`, `no suitable jobs` | `dead-panes` |
-| `guard` | load 150/80, 20% memory, 50 GB disk, 20 panes | `guard` |
-| `hooks.threadReply`, `hooks.threadDone` | none | `freshness`, `close` |
-| `hooks.transcribe` | none | `transcribe` (argv with `{file}`, prints the text) |
-
-Hooks are argv templates for your messenger CLI. `{thread}`, `{text}` and `{key}` are filled into each argument separately, so the text stays one argument whatever it contains.
-
-## Library modules
-
-The CLI is a thin layer over typed modules you can import in your own scripts:
-
-| Module | What it gives you |
+| Field | Default / meaning |
 |---|---|
-| `src/messenger/slack.ts` | `Slack`: post, edit, thread replies, file upload (upload URL + complete), presence; 429 backoff |
-| `src/messenger/telegram.ts` | `Telegram`: send, edit, typing, `sendMessageDraft` streaming with a `Thinking…` start, forum topics (create, rename, close, reopen), HTML tables |
-| `src/messenger/discord.ts` | `Discord`: send without pings, edit, typing, threads (start, rename, archive); gateway presence |
-| `src/messenger/typing.ts` | `typingWhile`: show typing while a piece of work runs, stop when it ends |
-| `src/messenger/voice.ts` | `transcribe`: voice note to text through your hook |
-| `src/messenger/thread-ledger.ts` | `ThreadLedger`: every thread the Dori posts in, persisted; given to `Slack`, it records each `chat.postMessage` (also raw `call`s) |
-| `src/messenger/slack-inbound.ts` | `pollSlackInbound`: threads view, the ledger's threads and unread counts, deduplicated, own messages filtered |
-| `src/messenger/slack-presence.ts` | `slackPresence`: hold a user account active |
-| `src/routing.ts` | `canLaunch`, `idleLaneFor`: the routing checks |
+| runtime.kind / binary / requiredVersion | codex / codex / 0.163.0 |
+| runtime.roles.lead / lane | model and effort null: inherit Codex settings |
+| runtime.sandbox / approvalPolicy | workspace-write / on-request |
+| runtime.startupTimeoutMs / rpcTimeoutMs | 30000 / 15000 |
+| runtime.heartbeatIntervalMs / heartbeatTimeoutMs | 5000 / 20000 |
+| stateDir | ~/.dori/state; registry, mailboxes and direct-task timers |
+| workThresholdSec | 120 seconds; historical duration at or above this means delegate next time |
+| defaultCwd / laneWorkspace | home / current Herdr workspace |
+| leadWorkspace | optional lead workspace; falls back to laneWorkspace when omitted; also applies to recovery |
+| nudgeAfterMin / postAfterMin / closeAfterMin | 15 / 20 / 5 |
+| heavySlots / heavyMaxLoad | 1 / 80 |
+| guard | load 150/80, free memory 20%, disk 50GB, 20 panes |
+| hooks | threadReply, threadDone, transcribe argv templates |
+| ingress | owner-filtered, replayable JSON-line source processes |
 
-Every module takes its HTTP, clock and timers as arguments. That is how the tests run without the network.
+Models must be IDs from Codex model/list. Provider/model routes and silent model fallback are not supported. The CLI requires the pinned version and doctor checks startup, authentication metadata, model selection and local tools without calling a model.
 
 ## Commands
 
-### `dori launch <key> --title T --brief FILE --done "..." [--thread REF] [--model M] [--cwd DIR]`
-Opens a lane: appends the footer to the brief, opens a tab, starts the agent, and after 20 seconds checks it: `STARTUP_ERROR` on a known failure in the pane, `STARTUP_OK` only when herdr reports the agent idle or working, and `STARTUP_UNCONFIRMED` (with the last lines) otherwise. Exit 3 on anything but `STARTUP_OK`.
+Run dori help for all flags.
 
-### `dori adopt <key> --pane ID --title T --brief FILE --done "..." [--thread REF]`
-Registers a lane that is already running.
+- `work start --title T [--tag TAG ...] [--thread REF] [--operation-id UUID]`: start a direct-task timer; return `{workThresholdSec,work}`. `work` contains a UUID id, title, tags, optional thread and `startedAt`. Repeat a start with the same UUID and content to retrieve its original record safely; changed content is refused.
+- `work stop ID`: persist `endedAt` and `elapsedSec`, returning the record and threshold. Unknown or already-stopped ids fail without changing the record.
+- `work similar [--title T] [--tag TAG ...]`: require a title or tag; return `{workThresholdSec,matches}` across completed direct tasks and completed lane cycles. Matching uses normalized words, character bigrams and tags. Running direct timers are excluded. Completed cycles remain discoverable after a lane reopens; execution ends at the final done claim when recorded, excluding the review window. Legacy lanes without claims use open-to-close time. History reads do not modify lane records.
 
-### `dori sync [--write]`
-Prints `key | thread | pane | session | status` for every open lane and every unregistered agent pane, followed by drift. Read-only unless `--write`, which stores session ids.
+Timers are private readable JSON at `<stateDir>/work/<id>.json` and survive service restarts. The service serializes timer writes. Start after the intake lookup and before work; stop immediately before the final reply and include start/end timestamps and elapsed seconds. Similarity supplies duration facts, not a routing verdict: delegate if similar work took at least the configured threshold; otherwise use the skill’s direct/complex-work rules. Resource HOLD still means queue.
 
-### `dori claim-done [<key>] --evidence TEXT` / `dori object-done <key> --reason TEXT ...`
-The two halves of the done flow. Both message the lane's pane and check that Enter registered.
+Managed Codex leads use `dori_runtime.control` actions `work-start` (`title,tags?,thread?,operationId` with a stable UUID), `work-stop` (`id`), and `work-similar` (`title?,tags?`). These are lead/operator-only; lanes cannot read or change direct-task timers. Operators use the CLI above, which calls the same service. No sandbox CLI or extra network permission is needed.
 
-### `dori close <key> [--note TEXT]`
-Closes a lane now. Refuses (exit 2) unless every `Done =` signal reads back live. On success it marks the thread done through `hooks.threadDone`, closes the tab, and removes the lane's worktrees with a plain `git worktree remove`, which refuses a dirty worktree.
 
-### `dori pause <key> [--note TEXT]` / `dori resume <key> [--note TEXT]`
-`pause` is for when the owner said wait. It works on a `working` or `not-done` lane. It sends `/goal pause` to the lane's pane, then reads the screen back until the goal command's own line appears on a line of its own: `Goal paused`, or `cannot update goal: no goal exists`, since a lane with no goal has nothing to continue. Only then does it mark the lane `paused` (recorded in its history) and send Escape if a turn is running. The goal is paused first, so stopping the turn cannot hand off to a goal continuation. If the line does not appear, or the send fails, the lane is left as it was and the command prints `PAUSE_UNVERIFIED` and exits 3.
+- serve: one state writer, socket owner, monitor supervisor. A second owner is refused.
+- lead: open the reserved Codex lead, once.
+- launch KEY: validate Done, enforce resources, optionally create an owned worktree, create tab/host, persist thread.id, submit brief. Supply --operation-id when callers may replay requests.
+- input KEY --text-file FILE: structured input; active turns are steered. Paused inputs remain queued.
+- report KEY --kind KIND --text-file FILE --event-id ID: milestone/blocker/question/done event. A done report alone does not claim completion.
+- reply --thread REF --text-file FILE --operation-id ID: durable messenger hook send, available to lead/operator.
+- pause/resume/claim-done/object-done/close: lifecycle operations; see done-protocol.md. Pausing a running turn without a native goal persists a continuation marker. Explicit resume queues one stable instruction to inspect confirmed state and continue unfinished work before clearing dispatch. Idle pauses and native-goal resumes do not start an extra turn; automatic releases do not enqueue continuation. Inspect mail for any unknown continuation outcome instead of replaying the original task.
+- recover KEY: create a replacement host only after the old process is gone. It reuses a known thread or imports a legacy handoff into a new one. A thread created before registration is recovered from the host checkpoint. If creation itself is ambiguous, inspect Codex history and use recover KEY --thread-id ID; an already-known identity cannot be replaced.
+- reopen KEY: new cycle on the same recorded thread, restoring an owned worktree when necessary.
+- sync [--write]: read runtime/pane drift; write refreshes verified runtime state, never replaces a conflicting identity.
+- watch/freshness/dead-panes/guard: compatibility status queries. The daemon owns the actual schedules; these do not launch duplicate loops.
+- approval list: current pending server requests and generation-qualified IDs.
+- approval respond ID --response-file FILE: operator response with the request's typed payload. Stale IDs are rejected.
+- mail list: inbox, outbox, launch operations and sanitized failed-turn metadata. Unknown delivery is visible and is not replayed automatically.
+- mail resolve ID --box inbox|outbox --state sent|queued --evidence TEXT: operator reconciliation after checking external state. queued is for a proven non-execution.
+- migrate --dry-run / --apply [--handoff-file FILE]: state migration with backups, no runtime launch.
+- send/presence/transcribe/heavy: existing standalone utilities.
+- inbound slack: existing read-only diagnostic polling output. Use a replayable adapter for supervised ingestion.
 
-A paused lane is skipped by `freshness`: no nudge, no post. Only `dori resume` ends a pause, on the owner's word. Activity never does, because a paused lane can still be woken by a background result, a queued message or a turn after Escape. If its pane reads `working` on two ticks in a row, `freshness` prints `WORKING-WHILE-PAUSED` once per working stretch (again after it goes idle and is woken, or after a new pause), so the lead can ask the owner, and the lane stays paused.
+Exit codes: 0 success, 1 configuration/transport/request error, 2 refused lifecycle or failed doctor, 3 unconfirmed runtime operation, 4 queued launch HOLD. A nonzero or lost RPC result is not evidence that an external mutation failed to execute.
 
-`resume` sends `/goal resume` and reads back `Goal active` the same way, then restores the status the lane had before the pause (`pausedFrom`) and restarts its quiet time, so a long pause does not turn into an instant nudge. Unconfirmed: `RESUME_UNVERIFIED`, exit 3.
+## Ingress adapter contract
 
-Both print `PAUSED` / `RESUMED` and exit 0 on success. A lane in any other state is refused (`NOT_PAUSED` / `NOT_RESUMED`, exit 2), and a second `pause` is a no-op. `claim-done` and `object-done` on a paused lane move it out of `paused` in the registry while its goal stays paused.
+Each configured process writes one JSON object per line to stdout:
 
-### `dori watch`
-Runs forever. Every 30 seconds it prints each new claim once (`LANE_DONE_CLAIMED`). Claims older than `closeAfterMin` are settled: unpushed or uncommitted work and failing signals turn into objections (`LANE_NOT_DONE`); otherwise the lane is closed (`LANE_CLOSED`). The deadline lives in the registry, so a restart picks up where it left off.
+```json
+{"id":"stable-platform-message-id","thread":"telegram:chat/topic","user":"owner-id","text":"Please continue"}
+```
 
-### `dori freshness [--loop MIN]`
-For working lanes that have gone quiet: a nudge in the pane after `nudgeAfterMin`, then the lane's last `[REPORT]` line posted to its thread after `postAfterMin`, with home paths and pane ids scrubbed. Each happens once per silence. The line is posted only once it is still the last `[REPORT]` line on the next tick (`PENDING-REPORT` the first time) and differs from the line posted last time (`STALE-REPORT` otherwise). A held-back outcome is printed once per change, not on every tick. A nudge reports its delivery as `delivered` (the agent status moved to working) or `unconfirmed`.
+After durable acceptance, the service writes this JSON line to the adapter's stdin:
 
-### `dori dead-panes [--loop MIN]`
-Prints `DEAD_PANE <id>` once per hour for a pane with no running agent status whose last lines match `deadPanePatterns` on two ticks in a row with the same text. A pane herdr reports as idle, working, blocked or done is never dead. A pane that is neither is unrecognised; three unrecognised ticks in a row print `UNRECOGNISED_PANE <id> ...` once (list non-agent panes in `ignorePanes`).
+```json
+{"ack":"stable-platform-message-id","thread":"telegram:chat/topic"}
+```
 
-### `dori guard [--loop MIN]`
-Prints `HOST_GUARD ALERT <reasons>` when load, free memory, free disk or the pane count crosses its threshold, and `HOST_GUARD CLEAR` when it recovers. It also prints `COMPUTE_READY` / `COMPUTE_BUSY` as load crosses `loadOk`. Only changes are printed.
+Advance source cursors only after the matching ACK. Replay unacknowledged messages after reconnect; deduplication keys include source, thread and message ID. stdout must contain only events; write diagnostics to stderr. Do not use ephemeral unread-count notifications as message IDs. Resolve Slack unread hints to actual messages before submitting them. Quoted/forwarded messages remain content under the authenticated sender, never a new owner identity.
 
-### `dori can-launch`
-Prints `CAN_LAUNCH` and exits 0 when the host has room for another lane. Otherwise it prints `HOLD <reasons>` and exits 4. The reasons come from the guard's memory, disk and pane-count thresholds. CPU load alone never holds a launch, because it moves too fast to plan around.
+The optional control field is for explicit owner UI actions. The service validates owner identity and target thread before dispatch:
 
-### `dori send <slack|telegram|discord> --to TARGET --text TEXT [--thread ID] [--edit ID]`
-Posts a message, or edits one with `--edit`. Tokens come from `DORI_SLACK_TOKEN` (plus `DORI_SLACK_COOKIE` for a user token), `DORI_TELEGRAM_TOKEN` or `DORI_DISCORD_TOKEN`. Text containing `$(` is refused, since it can only come from a shell string. Rate limits are retried with the server's wait time; other errors fail at once.
+```json
+{"id":"control-17","thread":"telegram:chat/topic","user":"owner-id","text":"Pause","control":{"action":"pause","args":{"key":"fix-login"}}}
+```
 
-### `dori presence <slack|discord>`
-Keeps the account shown as online until stopped.
-- **Discord:** the bot connects to the gateway and identifies as online.
-- **Slack, user token:** it opens one web-client-type socket and tickles it every minute. Slack shows a user active only while such a socket is open, and auto-aways an idle one after about 30 minutes.
-- Run one instance per account. Two writers flip each other's presence.
+Allowed controls: pause, resume, object-done, approval-respond. Approval IDs must belong to the same messenger thread. An ordinary message saying yes is never automatically interpreted as an approval. Replies and read receipts use hooks; when a delivery result is unknown, inspect the outbox before retrying.
 
-### `dori inbound slack [--loop MIN]`
-Prints `INBOUND <source> <channel> <thread> <ts> <user> <text>`. It reads from three places, each message once:
-- `threads-view`: unread replies in threads the account follows (Slack's own Threads view);
-- `own-thread`: new replies in any thread the Dori posted in, tagged or not;
-- `unread`: DMs, group DMs and channels with unread mentions.
 
-The Dori's own messages and bot messages are skipped. Every message the Dori posts records its thread in `<stateDir>/slack-threads.json`, whichever helper sends it, so a guest's untagged reply under a root posted with a raw API call is still found.
+Slack threaded posts are refused unless the thread is verified in the target channel; a missing or different root, or any check failure, prints `THREAD_NOT_IN_CHANNEL <channel> <thread>: <reason>` and sends nothing. The bot token needs the history read scopes for the conversations it posts threads into: `channels:history`, `groups:history`, `im:history`, `mpim:history`.
 
-### `dori transcribe <audio-file>`
-Runs `hooks.transcribe` and prints the transcript. A failed or empty transcription is an error, never an empty message.
+## Approval response examples
 
-### `dori heavy <label> -- <command ...>`
-Waits until load is under `heavyMaxLoad` and one of `heavySlots` is free, then runs the command and frees the slot when it exits. A slot held by a process that no longer exists (or a zombie) is taken over. Use it for full builds and test suites. Installs, focused tests and git do not need it.
+Command/file change: {"decision":"accept"}, {"decision":"decline"}, or {"decision":"cancel"}. Only one-shot decisions are accepted.
+
+User input: {"answers":{"question-id":{"answers":["answer"]}}}; IDs must match the pending questions.
+
+Permissions: {"permissions":{},"scope":"turn"} declines additional access. Explicit grants must be a subset of the request; turn/session scopes are supported. The service never broadens a grant.
+
+MCP elicitation: {"action":"accept","content":{...}}, or action decline/cancel. Unsupported server request kinds receive a protocol error rather than implicit approval.
+
+## Storage and recovery
+
+state/lanes includes the lead record as lead.json. state/journal is append-only and fsynced before snapshot ACK. Host bootstrap and credentials are private files under state/hosts; runtime files record thread identity and local pause barriers. inbox/outbox/operations preserve queued, sending, sent and unknown outcomes. A crash changes incomplete sending entries to unknown on startup.
+
+The default command sandbox can block Unix socket connections. Do not broaden network access for lifecycle operations: the required stdio MCP server calls the service with a lane-scoped capability. The local managed CLI wrapper is for operator tooling and supplies context from a private file even when parent shell filters remove variables.
+
+The socket directory is a private /tmp/dori-UID-HASH directory derived from stateDir. Control tokens are never command-line arguments. This is local-user isolation, not a security boundary against arbitrary code running as that same OS user.
+
+Host connection loss holds its goal and turn; failed stop confirmation terminates the owned Codex process. Reconnect does not silently resume a held lane. Inspect status/mail, then explicitly resume. For unknown external sends, inspect the actual messenger before marking sent or retrying through the original reply command.
+
+A final failed Codex turn is recorded even while the host remains healthy. Each host-instance/turn pair produces one actionable lane-to-lead notice, or a direct owner-thread notice for a failed lead. Lead notices wait for the sent input receipt to identify the originating thread, including when completion arrived before the receipt. Only fixed error categories and guidance are retained; raw error messages and command output are excluded. Notices use the durable outbox and configured threadReply hook, and uncertain notice delivery is never automatically retried. Without a hook the notice remains queued in the outbox. Failed tasks are not replayed.
+
+The current journal retains history without rotation. Archive completed state only while the service is stopped, and keep the snapshot/journal pair together. Live connector compatibility, real model behavior and deployment-specific OS sandbox policy should be validated in a separate state directory before migrating production work.
+
+## Optional real-protocol smoke test
+
+```sh
+DORI_LIVE_PROTOCOL=1 bun test test/integration.test.ts
+```
+
+This initializes the installed Codex 0.163.0 with a temporary home, creates a thread and verifies the required stdio MCP tool catalog. It does not start a model turn. The normal process integration still uses fixture runtimes. A network-off workspace-write command probe revealed that direct socket IPC is blocked on macOS; that is why managed agents use stdio MCP.
+
+Protocol and configuration references: [Codex App Server](https://learn.chatgpt.com/docs/app-server), [Shell environment policy](https://learn.chatgpt.com/docs/config-file/config-advanced). Per-thread MCP setup is also checked against the locally generated version-specific schema and the opt-in smoke test.

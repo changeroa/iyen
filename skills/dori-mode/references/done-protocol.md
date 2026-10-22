@@ -1,28 +1,19 @@
-# Lane done protocol
+# Lane completion
 
-Give this file to every lane you launch.
-
-When your lane's `Done =` signals are live and every change is pushed, claim done from your own session. The signals might be a PR merged, an issue closed or a version published. For local or QA-only work they can also be a command that passes, a file with the expected content, or a URL that answers (see `sessions.md`). Run them yourself first: the watcher re-runs every one and never takes your word for it.
+Run every Done signal yourself, commit/push work, then record a claim:
 
 ```sh
-dori claim-done <your-lane-key> --evidence "<merge SHA, closed issue, version, links>"
+dori claim-done <key> --evidence "merge SHA, closed issue, published version, or verified local result"
 ```
 
-The key is in your brief's lane footer. If you leave it out, the lane registered for your pane is used.
+The key defaults to DORI_LANE_KEY inside a managed Codex process. The command persists the claim and returns immediately; it does not interrupt the shell tool waiting for that response.
 
-## What happens next
+The service blocks new dispatch, stops goal continuation and the active turn, and waits until the persisted five-minute deadline. Remain idle. An identical repeated claim does not extend that deadline. A report of kind done is informational and does not replace claim-done.
 
-1. The Dori gets a `LANE_DONE_CLAIMED` event, and you get a `[LEAD]` line saying when the lane closes.
-2. Stay idle and start no new work.
-3. If the Dori does not object within 5 minutes, the watcher closes the lane. Before closing, it reads back every `Done =` signal live. It refuses to close if any of your worktrees still has uncommitted tracked changes, or commits that are on no remote.
-4. Closing marks your thread done (when a thread hook is configured), closes your tab, and removes your worktrees.
+The lead can object with dori object-done KEY --reason TEXT. The lane becomes not-done and receives a structured input with the reasons. Fix them and claim again. A paused lane cannot claim completion or be reactivated by an objection.
 
-## If the Dori objects, or a check fails
+After the deadline, the service rechecks every Done signal and all explicitly owned worktrees. Untracked, uncommitted, unpushed, unreadable Git state or unconfirmed runtime inactivity blocks closure. An objection during verification invalidates that close attempt. Direct dori close uses the same checks.
 
-You get `[LEAD] not done: <reasons>; keep working, claim again when fixed` in your pane, and the lane goes back to not-done. This happens when:
+After verification, the service records a cleanup fence, stops the runtime, saves worktree branch/SHA resume points, removes only owned clean worktrees, records the thread-done delivery, and closes the tab. Failed cleanup remains verified-done and is retried through checked cleanup; it is not reported closed. Unknown messenger delivery remains visible in the outbox. Codex thread history is retained for reopen.
 
-- the Dori objects;
-- a `Done =` signal does not read back live;
-- there is unpushed work (the reason names the path).
-
-Fix every reason, then claim again. A new claim starts a fresh 5-minute window.
+Do not delete worktrees or close the pane yourself. Never treat Codex turn/completed or a native goal's complete status as proof that the lane's Done signals passed.

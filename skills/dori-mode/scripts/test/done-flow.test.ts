@@ -1,13 +1,12 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 
 import { claimDone, closeLane, objectDone, watchTick } from "../src/done-flow.ts";
-import { sendVerified, UnsafeTextError } from "../src/panes.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
-import { depsFor, fakeClock, newWorld, sent, withState, type World, WT } from "./fakes.ts";
+import { depsFor, fakeClock, newWorld, withState, type World, WT } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
 const MIN = 60_000;
-const lane: Lane = { key: "demo-lane", title: "demo", thread: "chat:team/123", pane: "w:p1", brief: "/briefs/demo.md", done: "merged acme/app#1; closed acme/app#2", cwd: "/repo", openedAt: new Date(T0 - 60 * MIN).toISOString() };
+const lane: Lane = { key: "demo-lane", title: "demo", thread: "chat:team/123", pane: "w:p1", brief: "/briefs/demo.md", done: "merged acme/app#1; closed acme/app#2", cwd: "/repo", worktrees: [WT], openedAt: new Date(T0 - 60 * MIN).toISOString() };
 
 let state: ReturnType<typeof withState>;
 let world: World;
@@ -28,15 +27,15 @@ test("an objection inside the window keeps the lane open and the lane hears why"
   const after = await at(T0).registry.read("demo-lane");
   expect(after && statusOf(after)).toBe("not-done");
   expect(closedVia()).toHaveLength(0);
-  expect(sent(world).some((t) => t.startsWith("[LEAD] not done: changelog entry missing"))).toBe(true);
+  expect((world.runtimeCalls ?? []).some((t) => t.startsWith("Not done: changelog entry missing"))).toBe(true);
 });
 
 test("five quiet minutes after a claim the lane is closed, its thread marked done and its worktree removed", async () => {
   await claimDone(at(T0), lane, "merged acme/app#1 abc123");
-  expect(await watchTick(at(T0 + 4 * MIN))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123"]);
+  expect(await watchTick(at(T0 + 4 * MIN))).toEqual(["LANE_DONE_CLAIMED demo-lane merged acme/app#1 abc123"]);
   expect(closedVia()).toHaveLength(0);
   const lines = await watchTick(at(T0 + 5 * MIN + 1));
-  expect(lines[0]).toStartWith("LANE_CLOSED demo-lane");
+  expect(lines.at(-1)).toStartWith("CLOSED demo-lane");
   expect(closedVia()).toEqual([["herdr", "pane", "close", "w:p1"]]);
   expect(world.calls).toContainEqual(["notify", "chat:team/123", "Done: merged acme/app#1 abc123"]);
   expect(world.calls).toContainEqual(["git", "-C", "/repo", "worktree", "remove", WT]);
@@ -50,7 +49,7 @@ test("commits that reached no remote block the close and name the worktree", asy
   await claimDone(at(T0), lane, "merged acme/app#1");
   await watchTick(at(T0 + 6 * MIN));
   const after = await at(T0).registry.read("demo-lane");
-  expect(after?.objection?.reasons).toEqual([`unpushed work in ${WT}`]);
+  expect(after?.objection?.reasons).toEqual([`uncommitted, untracked or unpushed work in ${WT}`]);
   expect(closedVia()).toHaveLength(0);
 });
 
@@ -58,7 +57,7 @@ test("uncommitted tracked changes also block the close", async () => {
   world.dirty = " M src/app.ts";
   await claimDone(at(T0), lane, "merged acme/app#1");
   await watchTick(at(T0 + 6 * MIN));
-  expect((await at(T0).registry.read("demo-lane"))?.objection?.reasons).toEqual([`unpushed work in ${WT}`]);
+  expect((await at(T0).registry.read("demo-lane"))?.objection?.reasons).toEqual([`uncommitted, untracked or unpushed work in ${WT}`]);
   expect(closedVia()).toHaveLength(0);
 });
 
@@ -68,7 +67,7 @@ test("a Done signal that does not read back live becomes the objection", async (
   await watchTick(at(T0 + 6 * MIN));
   const after = await at(T0).registry.read("demo-lane");
   expect(after && statusOf(after)).toBe("not-done");
-  expect(after?.objection?.reasons).toEqual(["closed acme/app#2 -> OPEN"]);
+  expect(after?.objection?.reasons).toEqual(["closed acme/app#2: OPEN"]);
   expect(closedVia()).toHaveLength(0);
 });
 
@@ -79,7 +78,7 @@ test("a watcher restarted inside the window keeps the original deadline and anno
   const settled = await watchTick(at(T0 + 6 * MIN));
   expect(first).toHaveLength(1);
   expect(afterRestart).toEqual([]);
-  expect(settled[0]).toStartWith("LANE_CLOSED demo-lane");
+  expect(settled.at(-1)).toStartWith("CLOSED demo-lane");
   expect(closedVia()).toHaveLength(1);
 });
 
@@ -87,31 +86,30 @@ test("closing directly refuses while a signal is not live and leaves the pane al
   world.prState = "OPEN";
   const r = await closeLane(at(T0), lane, "manual");
   expect(r.closed).toBe(false);
-  expect(r.lines.at(-1)).toStartWith("REFUSED demo-lane");
+  expect(r.lines.at(-1)).toStartWith("LANE_NOT_DONE demo-lane");
   expect(closedVia()).toHaveLength(0);
 });
 
-test("delivery is confirmed by the pane's agent status moving to working, with exactly one Enter", async () => {
-  world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "idle" }];
-  world.onEnterStatus = "working";
-  expect(await sendVerified(at(T0).run, at(T0).clock, "w:p1", "[LEAD] please report")).toBe("delivered");
-  expect(world.calls.filter((c) => c[2] === "send-keys")).toHaveLength(1);
+test("direct close refuses untracked work even after live evidence passes", async () => {
+ world.dirty="?? important.txt";
+ const result=await closeLane(at(T0),lane,"manual");expect(result.closed).toBe(false);expect(closedVia()).toHaveLength(0);
+ expect(world.calls.some(c=>c.includes("--untracked-files=all"))).toBe(true);
 });
-
-test("a screen that still shows the text never causes another Enter; no status change is unconfirmed", async () => {
-  world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "idle" }];
-  world.stuckReads = 10;
-  expect(await sendVerified(at(T0).run, at(T0).clock, "w:p1", "[LEAD] stuck text still here")).toBe("unconfirmed");
-  expect(world.calls.filter((c) => c[2] === "send-keys")).toHaveLength(1);
+test("an objection received during slow verification invalidates cleanup", async () => {
+ const d=at(T0);await claimDone(d,lane,"done");const claimed=(await d.registry.read(lane.key))!;
+ let triggered=false;
+ const slow={...d,run:async(argv:readonly string[],opts?:any)=>{
+  if(!triggered && argv[0]==="gh") {triggered=true;await objectDone(d,(await d.registry.read(lane.key))!,["new requirement"]);}
+  return d.run(argv,opts);
+ }};
+ await expect(closeLane(slow,claimed,"done")).rejects.toThrow("invalidated");expect(closedVia()).toHaveLength(0);
+ expect((await d.registry.read(lane.key))?.status).toBe("not-done");
 });
-
-test("a pane that was already working cannot show a change, so the send is unconfirmed, not delivered", async () => {
-  world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "working" }];
-  expect(await sendVerified(at(T0).run, at(T0).clock, "w:p1", "[LEAD] queued while busy")).toBe("unconfirmed");
-  expect(world.calls.filter((c) => c[2] === "send-keys")).toHaveLength(1);
+test("worktree removal failure never records closed",async()=>{
+ const d=at(T0);const failing={...d,run:async(argv:readonly string[],opts?:any)=>argv.includes("remove")?{code:1,out:"",err:"busy"}:d.run(argv,opts)};
+ expect((await closeLane(failing,lane,"done")).closed).toBe(false);expect((await d.registry.read(lane.key))?.status).toBe("verified-done");expect(closedVia()).toHaveLength(0);
 });
-
-test("text with a backtick never reaches a pane", async () => {
-  await expect(sendVerified(at(T0).run, at(T0).clock, "w:p1", "run `rm -rf`")).rejects.toBeInstanceOf(UnsafeTextError);
-  expect(world.calls).toHaveLength(0);
+test("duplicate claim does not extend the original deadline",async()=>{
+ const d=at(T0);await claimDone(d,lane,"same evidence");const first=(await d.registry.read(lane.key))!.claim!.at;
+ await claimDone(at(T0+MIN),lane,"same evidence");expect((await d.registry.read(lane.key))!.claim!.at).toBe(first);
 });

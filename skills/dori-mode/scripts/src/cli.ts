@@ -1,249 +1,90 @@
 #!/usr/bin/env bun
 import { parseArgs } from "node:util";
+import { loadConfig, defaultConfig } from "./config.ts";
+import { serviceClient } from "./ipc.ts";
+import { serve } from "./service.ts";
+import { runSessionHost } from "./runtime/session-host.ts";
+import { doctor } from "./doctor.ts";
+import { migrate } from "./migrate.ts";
+import { mcpServer } from "./mcp.ts";
+import { utilities } from "./utilities.ts";
+const help = `dori — Codex-only messenger lead and lanes
 
-import { loadConfig } from "./config.ts";
-import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
-import { claimDone, closeLane, type FlowDeps, objectDone, watchTick } from "./done-flow.ts";
-import { freshnessTick } from "./freshness.ts";
-import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
-import { guardTick, sampleHost } from "./host-guard.ts";
-import { adoptLane, launchLane, LaunchError } from "./launch.ts";
-import { pauseLane, resumeLane } from "./pause.ts";
-import { Registry, statusOf } from "./registry.ts";
-import { realClock, run } from "./run.ts";
-import { syncRegistry } from "./sync.ts";
-import { canLaunch } from "./routing.ts";
-import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.ts";
-import { Slack } from "./messenger/slack.ts";
-import { pollSlackInbound } from "./messenger/slack-inbound.ts";
-import { ThreadLedger } from "./messenger/thread-ledger.ts";
-import { slackPresence } from "./messenger/slack-presence.ts";
-import { Telegram } from "./messenger/telegram.ts";
-import { Discord, discordPresence } from "./messenger/discord.ts";
-import { realTimers } from "./messenger/typing.ts";
-import { transcribe, TranscriptionError } from "./messenger/voice.ts";
+  doctor | serve | lead | status [key]
+  launch KEY --title T --brief FILE --done SIGNALS [--thread REF] [--cwd DIR] [--model M] [--worktree]
+  input KEY --text-file FILE [--operation-id ID]
+  report KEY --kind milestone|blocker|question|done --text-file FILE --event-id ID
+  reply --thread REF --text-file FILE [--operation-id ID]
+  claim-done [KEY] --evidence TEXT
+  object-done KEY --reason TEXT [--reason TEXT]
+  pause KEY | resume KEY | close KEY [--note TEXT]
+  recover KEY | reopen KEY [--text-file FILE]
+  adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS --transfer-confirmed
+  sync [--write] | can-launch | watch | freshness | dead-panes | guard
+  approval list | approval respond ID --response-file FILE
+  mail list | mail resolve ID --box inbox|outbox --state queued|sent --evidence TEXT
+  migrate --dry-run | migrate --apply
+  work start --title T [--tag TAG ...] [--thread REF] [--operation-id UUID]
+  work stop ID | work similar [--title T] [--tag TAG ...]
+  heavy LABEL -- COMMAND ...
+  send slack|telegram|discord --to TARGET --text TEXT [--thread ID] [--edit ID]
+  presence slack|discord | transcribe FILE | inbound slack [--loop MIN]
 
-const USAGE = `dori <command> [options]
-
-  launch <key> --title T --brief FILE --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]
-  adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF]
-  sync   [--write]                     registry vs live panes; read-only unless --write
-  claim-done [<key>] --evidence TEXT  key defaults to the lane registered for $HERDR_PANE_ID
-  object-done <key> --reason TEXT [--reason TEXT ...]
-  close  <key> [--note TEXT]           close now (Done signals must read back live)
-  pause  <key> [--note TEXT]           the owner said wait: goal paused (read back), running turn stopped, no nudges; exit 3 if unconfirmed
-  resume <key> [--note TEXT]           undo pause: goal resumed (read back), lane back to its earlier status
-  watch                                long-running: emits LANE_* lines every 30 s
-  freshness [--loop MIN]               nudge silent lanes, post their last report via hooks.threadReply
-  dead-panes [--loop MIN]              print DEAD_PANE <id> for stopped agent panes
-  guard [--loop MIN]                   host load, memory, disk and pane-count alerts
-  heavy <label> -- <command ...>       run a heavy command when a slot is free and load is low
-  can-launch                           exit 0 if the host has room for a new lane, else print why and exit 4
-  send <slack|telegram|discord> --to TARGET --text TEXT [--thread ID] [--edit ID]
-                                       post or edit a message (tokens from DORI_SLACK_TOKEN, DORI_TELEGRAM_TOKEN, DORI_DISCORD_TOKEN)
-  presence <slack|discord>             keep the account shown as online until stopped
-  transcribe <audio-file>              run hooks.transcribe and print the text
-  inbound slack [--loop MIN]           print INBOUND lines: unread thread replies (threads view), replies in threads
-                                       the Dori posted in (any helper), DMs and channels with unread mentions`;
-
-const die = (message: string, code = 1): never => {
-  console.error(message);
-  process.exit(code);
-};
-
-const config = await loadConfig();
-const deps: FlowDeps = { run, clock: realClock, registry: new Registry(config.stateDir), config };
+Always start dori serve before lifecycle commands. Operations with unknown delivery are not replayed.
+Use --operation-id to repeat a request safely; status/mail list show durable outcomes.`;
 const [command = "", ...rest] = process.argv.slice(2);
-
-const flags = parseArgs({
-  args: rest,
-  allowPositionals: true,
-  strict: false,
-  options: {
-    title: { type: "string" }, brief: { type: "string" }, done: { type: "string" }, thread: { type: "string" },
-    model: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, evidence: { type: "string" },
-    reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, loop: { type: "string" },
-    to: { type: "string" }, text: { type: "string" }, edit: { type: "string" },
-  },
-});
-const opt = (name: string): string | undefined => {
-  const v = flags.values[name];
-  return typeof v === "string" ? v.trim() : undefined;
-};
-const need = (name: string): string => opt(name) || die(`--${name} is required`);
-const key = flags.positionals[0];
-const loopMin = Number(opt("loop") ?? 0);
-
-const lane = async (k: string | undefined) => {
-  const found = k ? await deps.registry.read(k) : await deps.registry.byPane(process.env.HERDR_PANE_ID ?? "");
-  if (!found) return die(k ? `no registered lane "${k}"` : "no open lane is registered for this pane");
-  if (statusOf(found) === "closed") return die(`lane ${found.key} is already closed`);
-  return found;
-};
-
-const every = async (minutes: number, tick: () => Promise<void>): Promise<void> => {
-  for (;;) {
-    await tick().catch((e: unknown) => console.log(`WARN ${e instanceof Error ? e.message : String(e)}`.slice(0, 300)));
-    if (minutes <= 0) return;
-    await Bun.sleep(minutes * 60_000);
-  }
-};
-
+const flags = parseArgs({ args: rest, allowPositionals: true, strict: true, options: Object.fromEntries([
+  ...["title", "brief", "done", "thread", "model", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "response-file", "state-dir", "handoff-file", "key", "box", "state"].map(k => [k, { type: "string" }]),
+  ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help"].map(k => [k, { type: "boolean" }]),
+  ["reason", { type: "string", multiple: true }],
+  ["tag", { type: "string", multiple: true }],
+]) as any });
+const values = flags.values as Record<string, string | boolean | string[] | undefined>;
+const opt = (name: string): string | undefined => typeof values[name] === "string" ? String(values[name]) : undefined;
+const need = (name: string): string => { const value = opt(name); if (!value) throw new Error(`--${name} required`); return value; };
+const output = (value: unknown) => console.log(typeof value === "string" ? value : JSON.stringify(value, null, 2));
 try {
+  if (!command || values.help || command === "help") { console.log(help); process.exit(0); }
+  if (command === "migrate") { output(await migrate(Boolean(values.apply), undefined, opt("handoff-file") ? await Bun.file(need("handoff-file")).json() : undefined)); process.exit(0); }
+  if (command === "session-host") { await runSessionHost(opt("state-dir") ?? process.env.DORI_STATE_DIR ?? defaultConfig().stateDir, need("key")); process.exit(0); }
+  const config = await loadConfig();
+  if (command === "mcp-server") { await mcpServer(config); process.exit(0); }
+  if (command === "serve") { await serve(config); process.exit(0); }
+  if (command === "doctor") { const result = await doctor(config); output(result); process.exit(result.ok ? 0 : 2); }
+  const key = flags.positionals[0] ?? process.env.DORI_LANE_KEY;
+  if (await utilities(command, key, rest, config, opt)) process.exit(process.exitCode ?? 0);
+  const call = serviceClient(config);
+  const text = opt("text-file") ? await Bun.file(need("text-file")).text() : opt("text");
+  const operationId = opt("operation-id") ?? crypto.randomUUID();
+  let result: any;
   switch (command) {
-    case "launch": {
-      const r = await launchLane(deps, { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), model: opt("model"), cwd: opt("cwd") });
-      console.log(`LAUNCHED ${r.lane.key} pane=${r.lane.pane} tab=${r.lane.tab ?? "?"}`);
-      console.log(r.startup);
-      process.exit(r.startup.startsWith("STARTUP_OK") ? 0 : 3);
-    }
-    case "adopt": {
-      const l = await adoptLane(deps, { key: key ?? "", title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), pane: need("pane") });
-      console.log(`ADOPTED ${l.key} pane=${l.pane} thread=${l.thread}`);
+    case "work":
+      if (key === "start") result = await call("work-start", { title: need("title"), tags: values.tag ?? [], thread: opt("thread"), operationId });
+      else if (key === "stop") result = await call("work-stop", { id: flags.positionals[1] ?? (() => { throw new Error("work stop needs a work id"); })() });
+      else if (key === "similar") result = await call("work-similar", { title: opt("title"), tags: values.tag ?? [] });
+      else throw new Error("usage: dori work start --title T | stop ID | similar [--title T] [--tag TAG ...]");
       break;
-    }
-    case "sync": {
-      const r = await syncRegistry(deps, Boolean(flags.values.write));
-      console.log("key | thread | pane | session | status");
-      for (const row of [...r.rows, ...r.unregistered]) console.log([row.key, row.thread, row.pane, row.session, row.status].join(" | "));
-      console.log(r.drift.length ? `DRIFT (${r.drift.length}):\n${r.drift.map((d) => `- ${d}`).join("\n")}` : "DRIFT none");
-      console.log(flags.values.write ? "WROTE session ids" : "READ_ONLY");
-      break;
-    }
-    case "claim-done":
-      console.log(await claimDone(deps, await lane(key), need("evidence")));
-      break;
-    case "object-done": {
-      const reasons = (flags.values.reason as string[] | undefined)?.map((r) => r.trim()).filter(Boolean) ?? [];
-      if (!reasons.length) die("--reason is required");
-      console.log(await objectDone(deps, await lane(key ?? die("object-done needs a lane key")), reasons));
-      break;
-    }
-    case "close": {
-      const r = await closeLane(deps, await lane(key ?? die("close needs a lane key")), opt("note") ?? "closed by the lead");
-      for (const line of r.lines) console.log(line);
-      process.exit(r.closed ? 0 : 2);
-    }
-    case "pause":
-    case "resume": {
-      const act = command === "pause" ? pauseLane : resumeLane;
-      const r = await act(deps, await lane(key ?? die(`${command} needs a lane key`)), opt("note") ?? `${command}d by the lead`);
-      for (const line of r.lines) console.log(line);
-      process.exit(r.code);
-    }
-    case "watch":
-      console.log("LANE_WATCH_READY");
-      for (;;) {
-        for (const line of await watchTick(deps).catch((e: unknown) => [`LANE_WATCH_WARN ${String(e).slice(0, 200)}`])) console.log(line);
-        await Bun.sleep(30_000);
-      }
-    case "freshness":
-      await every(loopMin, async () => {
-        for (const a of await freshnessTick(deps, process.env.HOME ?? "")) console.log(`${a.kind.toUpperCase()} ${a.lane} ${a.detail}`);
-      });
-      break;
-    case "dead-panes": {
-      const seen = new Set<string>();
-      const paneState = newDeadPaneState();
-      await every(loopMin, async () => {
-        for (const line of await deadPaneTick(run, config, seen, new Date().toISOString().slice(0, 13), paneState)) console.log(line);
-      });
-      break;
-    }
-    case "guard": {
-      const state = { alerting: false };
-      console.log("HOST_GUARD_READY");
-      await every(loopMin, async () => {
-        for (const line of guardTick(await sampleHost(run), config.guard, state)) console.log(line);
-      });
-      break;
-    }
-    case "heavy": {
-      const sep = rest.indexOf("--");
-      const label = rest[0];
-      const cmd = sep >= 0 ? rest.slice(sep + 1) : [];
-      if (!label || label === "--" || !cmd.length) die("usage: dori heavy <label> -- <command ...>");
-      const load = async () => (await sampleHost(run)).load1;
-      const slot = await acquireSlot({ dir: `${config.stateDir}/heavy`, slots: config.heavySlots, maxLoad: config.heavyMaxLoad, clock: realClock, load, alive: pidAlive, pid: process.pid }, label ?? "");
-      try {
-        const child = Bun.spawn(cmd, { stdout: "inherit", stderr: "inherit", stdin: "inherit" });
-        process.exitCode = await child.exited;
-      } finally {
-        releaseSlot(slot);
-      }
-      break;
-    }
-    case "can-launch": {
-      const v = canLaunch(await sampleHost(run), config.guard);
-      console.log(v.ok ? "CAN_LAUNCH" : `HOLD ${v.reasons.join(" | ")}`);
-      process.exit(v.ok ? 0 : 4);
-    }
-    case "send": {
-      const platform = key ?? die("send needs slack, telegram or discord");
-      const to = need("to");
-      const text = need("text");
-      const thread = opt("thread");
-      const edit = opt("edit");
-      const token = (name: string) => process.env[name] ?? die(`${name} is not set`);
-      if (platform === "slack") {
-        const slack = new Slack(fetchHttp, realClock, { token: token("DORI_SLACK_TOKEN"), cookie: process.env.DORI_SLACK_COOKIE }, undefined, new ThreadLedger(`${config.stateDir}/slack-threads.json`));
-        if (edit) await slack.edit(to, edit, text);
-        else console.log(`SENT ${(await slack.post(to, text, thread)).ts}`);
-      } else if (platform === "telegram") {
-        const tg = new Telegram(fetchHttp, realClock, token("DORI_TELEGRAM_TOKEN"));
-        const target = { chatId: to, ...(thread ? { threadId: Number(thread) } : {}) };
-        if (edit) await tg.edit(target, Number(edit), text);
-        else console.log(`SENT ${await tg.send(target, text)}`);
-      } else if (platform === "discord") {
-        const dc = new Discord(fetchHttp, realClock, token("DORI_DISCORD_TOKEN"));
-        if (edit) await dc.edit(to, edit, text);
-        else console.log(`SENT ${await dc.send(thread ?? to, text)}`);
-      } else die(`unknown platform ${platform}`);
-      break;
-    }
-    case "presence": {
-      if (key === "slack") {
-        const auth = { token: process.env.DORI_SLACK_TOKEN ?? die("DORI_SLACK_TOKEN is not set"), cookie: process.env.DORI_SLACK_COOKIE ?? die("DORI_SLACK_COOKIE is not set (user-token presence needs the d cookie)") };
-        const p = slackPresence(new Slack(fetchHttp, realClock, auth), (url, headers) => {
-          const options: Bun.WebSocketOptions = { headers: { ...headers } };
-          const ws = new WebSocket(url, options);
-          return { isOpen: () => ws.readyState === WebSocket.OPEN, send: (f) => ws.send(f), close: () => ws.close() };
-        }, auth);
-        console.log("PRESENCE_READY slack");
-        await every(1, async () => console.log(`PRESENCE slack ${await p.hold()}`));
-      } else if (key === "discord") {
-        const token = process.env.DORI_DISCORD_TOKEN ?? die("DORI_DISCORD_TOKEN is not set");
-        discordPresence(() => {
-          const ws = new WebSocket("wss://gateway.discord.gg/?v=10&encoding=json");
-          let handler: (d: string) => void = () => {};
-          ws.addEventListener("message", (e) => handler(String(e.data)));
-          return { send: (d) => ws.send(d), close: () => ws.close(), onMessage: (cb) => { handler = cb; } };
-        }, token, realTimers);
-        console.log("PRESENCE_READY discord");
-        await new Promise(() => {});
-      } else die("presence needs slack or discord");
-      break;
-    }
-    case "inbound": {
-      if (key !== "slack") die("inbound supports slack");
-      const auth = { token: process.env.DORI_SLACK_TOKEN ?? die("DORI_SLACK_TOKEN is not set"), cookie: process.env.DORI_SLACK_COOKIE };
-      const ledger = new ThreadLedger(`${config.stateDir}/slack-threads.json`);
-      const slack = new Slack(fetchHttp, realClock, auth, undefined, ledger);
-      const me = String((await slack.call("auth.test", {})).user_id ?? die("auth.test returned no user_id"));
-      console.log("INBOUND_READY slack");
-      await every(loopMin, async () => {
-        for (const i of await pollSlackInbound(slack, ledger, { selfUserId: me })) console.log(`INBOUND ${i.source} ${i.channel} ${i.threadTs ?? "-"} ${i.ts || "-"} ${i.user ?? "-"} ${JSON.stringify((i.text ?? "").slice(0, 200))}`);
-      });
-      break;
-    }
-    case "transcribe":
-      console.log(await transcribe(run, config.hooks.transcribe, key ?? die("transcribe needs an audio file path")));
-      break;
-    default:
-      console.log(USAGE);
-      process.exit(command ? 1 : 0);
+    case "launch": case "adopt":
+      result = await call(command, { key, title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), cwd: opt("cwd"), model: opt("model"), worktree: Boolean(values.worktree), operationId, pane: opt("pane"), threadId: opt("thread-id"), transferConfirmed: Boolean(values["transfer-confirmed"]) }); break;
+    case "input": case "reply": result = await call(command, { key, text, thread: opt("thread"), operationId }); break;
+    case "report": result = await call(command, { key, text, kind: need("kind"), eventId: need("event-id") }); break;
+    case "claim-done": result = await call(command, { key, evidence: need("evidence") }); break;
+    case "object-done": result = await call(command, { key, reasons: values.reason }); break;
+    case "pause": case "resume": case "close": result = await call(command, { key, note: opt("note") }); break;
+    case "reopen": case "recover": result = await call(command, { key, text, operationId, threadId: opt("thread-id") }); break;
+    case "status": case "lead": case "can-launch": result = await call(command, { key }); break;
+    case "sync": result = await call(command, { write: Boolean(values.write) }); break;
+    case "approval":
+      result = key === "list" ? await call("approval-list") : key === "respond" ? await call("approval-respond", { id: flags.positionals[1], response: await Bun.file(need("response-file")).json() }) : (() => { throw new Error("approval list|respond required"); })(); break;
+    case "mail":
+      result = key === "list" ? await call("mail-list") : await call("mail-resolve", { id: flags.positionals[1], box: need("box"), state: need("state"), evidence: need("evidence") }); break;
+    case "watch": case "freshness": case "dead-panes": case "guard":
+      result = await call("status"); break;
+    default: throw new Error(`Unknown command ${command}`);
   }
-} catch (e) {
-  if (e instanceof LaunchError || e instanceof UnsafeMessageError || e instanceof MessengerError || e instanceof TranscriptionError) die(e.message);
-  throw e;
-}
+  output(result);
+  if (result?.code) process.exitCode = result.code;
+  if (result?.startup && !result.startup.startsWith("STARTUP_OK")) process.exitCode = 3;
+  if (command === "can-launch" && !result.ok) process.exitCode = 4;
+  if (command === "close" && !result.closed) process.exitCode = 2;
+} catch (error) { console.error(error instanceof Error ? error.message : "Command failed"); process.exitCode = 1; }

@@ -79,8 +79,8 @@ test("a Done line with a malformed signal is refused at launch, with the reason"
   const deps = depsFor(newWorld(), fakeClock(0), state.dir);
   const bad = ["two clean QA passes", "command bun test", 'command ["bun", 3]', "file x.json sha256=abc", "url ftp://host", 'command ["x"] stdout="y"', "file a.json json:.v~1"];
   for (const done of bad) expect(doneSyntaxErrors(done)).toHaveLength(1);
-  await expect(adoptLane(deps, { key: "qa-lane", title: "qa", brief: "/b.md", done: "command bun test", pane: "w:p9" })).rejects.toBeInstanceOf(LaunchError);
-  const lane = await adoptLane(deps, { key: "qa-lane", title: "qa", brief: "/b.md", done: 'command ["bun","test"] stdout~"0 fail"; file ~/qa/report.json json:.passed=true; url http://localhost:3000/health', pane: "w:p9" });
+  await expect(adoptLane(deps, { key: "qa-lane", title: "qa", brief: "/b.md", done: "command bun test", pane: "w:p9", threadId: "test-thread" })).rejects.toBeInstanceOf(LaunchError);
+  const lane = await adoptLane(deps, { key: "qa-lane", title: "qa", brief: "/b.md", done: 'command ["bun","test"] stdout~"0 fail"; file ~/qa/report.json json:.passed=true; url http://localhost:3000/health', pane: "w:p9", threadId: "test-thread" });
   expect(lane.done).toContain("command");
 });
 
@@ -89,7 +89,7 @@ test("a QA-only lane's claim is re-checked at close time: the lane says done, bu
   const clock = fakeClock(Date.parse("2026-01-01T00:00:00Z"));
   const flag = join(state.dir, "qa-passed");
   const deps = { ...depsFor(world, clock, state.dir), run, signalIo: { cwd: state.dir } };
-  const lane = await adoptLane(deps, { key: "local-setup", title: "setup", brief: "/b.md", done: `command ["test","-f","${flag}"]`, pane: "w:p3", cwd: state.dir });
+  const lane = await adoptLane(deps, { key: "local-setup", title: "setup", brief: "/b.md", done: `command ["test","-f","${flag}"]`, pane: "w:p3", threadId: "test-thread", cwd: state.dir });
   await claimDone(deps, lane, "I ran the setup and it works");
   clock.at += 6 * 60_000;
   await watchTick(deps);

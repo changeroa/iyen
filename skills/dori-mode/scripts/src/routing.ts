@@ -6,6 +6,7 @@ export type LaunchVerdict = { readonly ok: boolean; readonly reasons: readonly s
 
 export const canLaunch = (s: HostSample, t: GuardThresholds): LaunchVerdict => {
   const reasons: string[] = [];
+  if (s.panes < 0) reasons.push("pane inventory unavailable");
   if (s.memFreePct < t.memFreeMinPct) reasons.push(`memory free ${s.memFreePct}% < ${t.memFreeMinPct}%`);
   if (s.diskFreeGb < t.diskFreeMinGb) reasons.push(`disk free ${s.diskFreeGb.toFixed(0)} GB < ${t.diskFreeMinGb} GB`);
   if (t.panesMax > 0 && s.panes >= t.panesMax) reasons.push(`panes ${s.panes} >= ${t.panesMax}`);
@@ -13,4 +14,4 @@ export const canLaunch = (s: HostSample, t: GuardThresholds): LaunchVerdict => {
 };
 
 export const idleLaneFor = (lanes: readonly Lane[], cwd: string, idlePanes: ReadonlySet<string>): Lane | null =>
-  lanes.find((l) => statusOf(l) === "working" && l.cwd === cwd && l.pane !== undefined && idlePanes.has(l.pane)) ?? null;
+  lanes.find((l) => statusOf(l) === "working" && !l.dispatchBlocked && (!l.runtime || l.runtime.state === "idle") && l.cwd === cwd && l.pane !== undefined && idlePanes.has(l.pane)) ?? null;

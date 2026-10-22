@@ -1,76 +1,65 @@
-# Setup
+# Codex setup
 
-Run these once, in order. Stop and ask the owner wherever a step needs their choice or their hand.
+Keep the owner's bot name, messenger account, memory and onboarding consent. Both the lead and all work lanes use Codex CLI **0.163.0**. A different version is rejected until its generated protocol and tests are updated.
 
-## 1. herdr
+## Install
 
-herdr is the terminal multiplexer the Dori runs in. Every lane is a herdr tab, and herdr lets you read a pane, type into it and see which process runs there.
-
-```sh
-curl -fsSL https://herdr.dev/install.sh | sh
-herdr integration install pi        # or the integration for the agent you run in
-herdr --skill                       # load its skill unless it is already in your context
-```
-
-## 2. Messenger
-
-Install agent-messenger (github.com/agent-messenger/agent-messenger) and read which platforms it supports. Ask the owner which one to use and wait for the answer.
-
-agent-messenger wraps part of each platform. Read the platform's current bot API changelog and call the API directly for the rest:
-
-- Telegram: stream a reply as it grows and show "Thinking…" with message drafts, send rich messages for tables and headings, and use topics in the private chat (turn on threaded mode in BotFather's mini app; there is no API for that switch).
-- Discord: edit your own messages to grow them, and use threads.
-
-### If the owner picks Slack: user token or bot token
-
-Ask which mode, give the trade-off as a short list, and wait for the choice:
-
-- **User token**: the Dori acts as a real member of the workspace.
-  - It needs a paid seat, which the owner pays for.
-  - It reads everything that member can see.
-  - It can keep a green online dot (`dori presence slack`).
-- **Bot token**: the Dori is a Slack app.
-  - There's no seat cost.
-  - It only sees channels it is invited to, within the scopes the app was granted.
-  - It shows as an app, not a person.
-
-Record the choice. With a user token, set `DORI_SLACK_TOKEN` and `DORI_SLACK_COOKIE` (the `d` cookie from that member's browser session). With a bot token, set `DORI_SLACK_TOKEN` to the `xoxb-` token.
-
-## 3. Bot
-
-Finish every login in the browser. Create the bot with agent-messenger and finish its setup. Then give it its avatar: the default is `assets/dori-avatar.png` in this skill, and the owner can swap in any image.
-
-- **Telegram**: @BotFather → `/setuserpic` → pick the bot → send the image.
-- **Discord**: Developer Portal → your application → **General Information** → App Icon, and **Bot** → Icon.
-- **Slack**:
-  - bot token: the app's **Basic Information** → Display Information → App icon;
-  - user token: the member's profile photo (`users.setPhoto`, or the profile page).
-
-Greet the owner through the bot before doing anything else.
-
-## 4. Scripts
+Install Bun 1.3+, git, Herdr, Codex CLI, and gh for GitHub completion signals. Authenticate Codex using its normal login flow. Do not export credentials into config files. On this Mac, required secret reads use the configured op-agent wrapper and an explicit vault; inject only references into the consuming process.
 
 ```sh
-cd skills/dori-mode/scripts && bun install && bun link    # puts `dori` on PATH
-mkdir -p ~/.dori && cp ../references/config.example.json ~/.dori/config.json
+cd skills/dori-mode/scripts
+bun install --frozen-lockfile
+bun link
 ```
 
-Then edit `~/.dori/config.json`: at least `leadPane` (your own herdr pane, from `herdr pane current`), `laneWorkspace`, `defaultCwd`, and the two hooks if you want lane threads updated automatically. `references/scripts.md` explains every field.
+Copy references/config.example.json to ~/.dori/config.json only for a new installation. Set defaultCwd and laneWorkspace. Set role model/effort only if overriding the Codex defaults. Configure sandbox and approval policy explicitly; installation never relaxes them. Preserve existing config and use migration for legacy installs.
 
-## 5. Monitors
+```sh
+dori doctor
+dori serve
+```
 
-Arm these as persistent monitors in your own session:
+Keep serve running in a supervised terminal or the host's existing process supervisor. In another terminal:
 
-| Monitor | Command | Filter |
-|---|---|---|
-| inbound messages | your messenger's watch command | new owner messages |
-| done flow | `dori watch` | `^LANE_` |
-| dead panes | `dori dead-panes --loop 3` | `^(DEAD_PANE\|UNRECOGNISED_PANE)` |
-| host guard | `dori guard --loop 1` | `^HOST_GUARD` |
-| freshness | `dori freshness --loop 5` | `^(NUDGED\|POSTED\|NO-REPORT\|PENDING-REPORT\|STALE-REPORT)` |
-| Slack inbound (Slack only) | `dori inbound slack --loop 1` | `^INBOUND` |
-| presence (optional) | `dori presence slack` or `dori presence discord` | `^PRESENCE_READY` |
+```sh
+dori lead
+```
 
-## 6. First look around
+The service opens a no-focus Herdr lead tab. Every work lane has its own tab and Codex process. The terminal shows streamed responses; operators use dori input and approval commands for control. Managed agents use the required stdio MCP tool, so lifecycle commands do not require network-enabled sandbox access.
 
-Once the bot is live, explore the machine: running coding-agent sessions, the tools in use, recent logs. Write what you find into memory, and adopt any running lanes with `dori adopt`.
+## Messenger
+
+Ask the owner to choose Telegram, Discord or Slack and finish login themselves. For Slack, retain the user-token versus bot-token choice: user accounts use their member visibility and paid seat; bots use granted scopes and invited channels. Ask before onboarding each new integration, as described in onboarding.md.
+
+Existing messenger clients and agent-messenger can be used through argv hooks and ingress adapters. The repository does not assume an undocumented watch-output format. An adapter must normalize messages into the ACK/replay contract in scripts.md; a raw human-readable watch stream is not valid ingress.
+
+- threadReply hook: argv with {thread}, {text}, {key}; exit zero only after the remote service accepts it.
+- threadDone hook: completion marker with the same arguments.
+- transcribe hook: argv with {file}; outputs a transcript.
+- ingress: id, command argv and exact owner IDs. The service starts and supervises it.
+
+Credentials belong in the environment of the service/messenger adapter. Work-lane Codex processes receive a restricted environment. The owner can answer pending approvals locally with dori approval list/respond or through authenticated structured ingress control events.
+
+## Legacy state
+
+Stop the old lead, monitor processes and workers before apply. Preview first:
+
+```sh
+dori migrate --dry-run
+```
+
+For active lanes, prepare a JSON handoff file:
+
+```json
+{"stoppedConfirmed":true,"lanes":{"fix-login":"/absolute/path/fix-login-handoff.md"}}
+```
+
+Each brief must record objective, changes, evidence, remaining work and owner questions. Apply:
+
+```sh
+dori migrate --apply --handoff-file /absolute/path/handoff.json
+```
+
+The migration backs up config/state, retains messenger references, histories and deadlines, and archives legacy session IDs. It creates no Codex thread and sends no messages. Active lanes remain held. Start serve, recover each lane, inspect the new context, then resume on the owner's instruction. Legacy transcripts are not imported as Codex internal history.
+
+Keep backup data until the new runtime has been validated. Do not let an old binary read v2 state. Do not run old and new writers against the same checkout or messenger stream.
