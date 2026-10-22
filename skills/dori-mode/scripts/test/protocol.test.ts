@@ -68,3 +68,53 @@ test("permission approvals cannot grant access absent from the pending request",
  h.session.answer("p1",{permissions:{network:{enabled:true}},scope:"turn"});
  expect(h.sent.at(-1)?.result).toEqual({permissions:{network:{enabled:true}},scope:"turn"});h.rpc.disconnect();
 });
+
+test("managed threads approve only the scoped Dori control tool and preserve sandbox/approval policy", async () => {
+ for (const approvalPolicy of ["never", "on-request"] as const) {
+  const h = harness(message => {
+   if (message.method === "model/list") return {data:[],nextCursor:null};
+   return {thread:{id:"thread1"},modelProvider:"openai",model:"test"};
+  });
+  const session = new CodexSession(h.rpc,{...defaultConfig().runtime,approvalPolicy},{file:"/context",configFile:"/config",stateDir:"/state"});
+  await session.open("/workspace",{model:null,effort:null},"instructions");
+  await session.open("/workspace",{model:null,effort:null},"instructions","thread1");
+  for (const message of h.sent.filter(m => ["thread/start","thread/resume"].includes(m.method ?? ""))) {
+   expect(message.params.approvalPolicy).toBe(approvalPolicy);
+   expect(message.params.sandbox).toBe("workspace-write");
+   const overrides = message.params.config;
+   expect(Object.keys(overrides).filter(k => k.startsWith("mcp_servers."))).toEqual(["mcp_servers.dori_runtime"]);
+   expect(overrides["mcp_servers.dori_runtime"]).toMatchObject({enabled:true,required:true,enabled_tools:["control"],tools:{control:{approval_mode:"approve"}}});
+   expect(overrides["mcp_servers.dori_runtime"].default_tools_approval_mode).toBeUndefined();
+   expect(overrides["mcp_servers.dori_runtime"].annotations).toBeUndefined();
+  }
+  h.rpc.disconnect();
+ }
+});
+
+for (const failedRead of ["thread/read", "thread/turns/list"]) {
+ test(`a known turn/start receipt survives subsequent ${failedRead} failure without retry or stale state overwrite`, async () => {
+  let accepted = false, starts = 0;
+  const rpc = new RpcClient({send: line => {
+   const message = JSON.parse(line); if (message.id === undefined) return;
+   queueMicrotask(() => {
+    if (accepted && message.method === failedRead) { rpc.feed(JSON.stringify({id:message.id,error:{code:-32000,message:"transient status failure"}})+"\n"); return; }
+    let result: any = {};
+    if (message.method === "thread/read") result = {thread:{id:"t1",status:accepted && failedRead === "thread/turns/list" ? {type:"active",activeFlags:[]} : {type:"idle"}}};
+    if (message.method === "thread/goal/get") result = {goal:null};
+    if (message.method === "turn/start") {
+     accepted = true; starts++;
+     // Completion races ahead of the successful mutation response.
+     rpc.feed(JSON.stringify({method:"turn/started",params:{threadId:"t1",turn:{id:"known-turn",status:"inProgress"}}})+"\n");
+     rpc.feed(JSON.stringify({method:"turn/completed",params:{threadId:"t1",turn:{id:"known-turn",status:"completed"}}})+"\n");
+     result = {turn:{id:"known-turn",status:"inProgress"}};
+    }
+    rpc.feed(JSON.stringify({id:message.id,result})+"\n");
+   });
+  },close:()=>{}},100);
+  const session = new CodexSession(rpc,defaultConfig().runtime); session.threadId = "t1";
+  expect(await session.input("one task","operation1")).toEqual({turnId:"known-turn"});
+  expect(session.state).toBe("idle"); expect(session.activeTurnId).toBeUndefined();
+  await expect(session.inspect()).rejects.toThrow("transient status failure");
+  expect(starts).toBe(1); expect(session.state).toBe("idle"); rpc.disconnect();
+ });
+}
