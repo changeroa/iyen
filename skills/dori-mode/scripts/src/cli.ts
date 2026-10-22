@@ -3,11 +3,13 @@ import { parseArgs } from "node:util";
 import { loadConfig, defaultConfig } from "./config.ts";
 import { serviceClient } from "./ipc.ts";
 import { serve } from "./service.ts";
-import { runSessionHost } from "./runtime/session-host.ts";
+import { runSessionHost, startSessionHost } from "./runtime/session-host.ts";
 import { doctor } from "./doctor.ts";
 import { migrate } from "./migrate.ts";
 import { mcpServer } from "./mcp.ts";
 import { utilities } from "./utilities.ts";
+import { atomicJson } from "./journal.ts";
+import { join } from "node:path";
 const help = `dori — Codex-only messenger lead and lanes
 
   doctor | serve | lead | status [key]
@@ -18,7 +20,7 @@ const help = `dori — Codex-only messenger lead and lanes
   claim-done [KEY] --evidence TEXT
   object-done KEY --reason TEXT [--reason TEXT]
   pause KEY | resume KEY | close KEY [--note TEXT]
-  recover KEY | reopen KEY [--text-file FILE]
+  recover KEY | reopen KEY [--text-file FILE] [--new-session --handoff-file FILE]
   adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS --transfer-confirmed
   sync [--write] | can-launch | watch | freshness | dead-panes | guard
   approval list | approval respond ID --response-file FILE
@@ -35,7 +37,7 @@ Use --operation-id to repeat a request safely; status/mail list show durable out
 const [command = "", ...rest] = process.argv.slice(2);
 const flags = parseArgs({ args: rest, allowPositionals: true, strict: true, options: Object.fromEntries([
   ...["title", "brief", "done", "thread", "model", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "response-file", "state-dir", "handoff-file", "key", "box", "state"].map(k => [k, { type: "string" }]),
-  ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help"].map(k => [k, { type: "boolean" }]),
+  ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help", "new-session"].map(k => [k, { type: "boolean" }]),
   ["reason", { type: "string", multiple: true }],
   ["tag", { type: "string", multiple: true }],
 ]) as any });
@@ -46,7 +48,13 @@ const output = (value: unknown) => console.log(typeof value === "string" ? value
 try {
   if (!command || values.help || command === "help") { console.log(help); process.exit(0); }
   if (command === "migrate") { output(await migrate(Boolean(values.apply), undefined, opt("handoff-file") ? await Bun.file(need("handoff-file")).json() : undefined)); process.exit(0); }
-  if (command === "session-host") { await runSessionHost(opt("state-dir") ?? process.env.DORI_STATE_DIR ?? defaultConfig().stateDir, need("key")); process.exit(0); }
+  if (command === "session-host") {
+    const stateDir = opt("state-dir") ?? process.env.DORI_STATE_DIR ?? defaultConfig().stateDir;
+    try { await runSessionHost(stateDir, need("key")); }
+    catch (error) { atomicJson(join(stateDir, "hosts", `${need("key")}.error.json`), { at: new Date().toISOString(), message: error instanceof Error ? error.message : "Runtime host failed" }); throw error; }
+    process.exit(0);
+  }
+  if (command === "session-host-start") { startSessionHost(need("state-dir"), need("key")); process.exit(0); }
   const config = await loadConfig();
   if (command === "mcp-server") { await mcpServer(config); process.exit(0); }
   if (command === "serve") { await serve(config); process.exit(0); }
@@ -71,7 +79,7 @@ try {
     case "claim-done": result = await call(command, { key, evidence: need("evidence") }); break;
     case "object-done": result = await call(command, { key, reasons: values.reason }); break;
     case "pause": case "resume": case "close": result = await call(command, { key, note: opt("note") }); break;
-    case "reopen": case "recover": result = await call(command, { key, text, operationId, threadId: opt("thread-id") }); break;
+    case "reopen": case "recover": result = await call(command, { key, text, operationId, threadId: opt("thread-id"), newSession: Boolean(values["new-session"]), handoff: opt("handoff-file") ? await Bun.file(need("handoff-file")).text() : undefined }); break;
     case "status": case "lead": case "can-launch": result = await call(command, { key }); break;
     case "sync": result = await call(command, { write: Boolean(values.write) }); break;
     case "approval":

@@ -35,7 +35,9 @@ export const fakeRunner = (w: World): Runner => async (argv) => {
   const ok = (out = ""): Ran => ({ code: 0, out, err: "" });
   const [cmd, a1, a2] = argv;
   if (cmd === "herdr" && a1 === "pane" && a2 === "list") return ok(JSON.stringify({ result: { panes: w.panes } }));
+  if (cmd === "herdr" && a1 === "agent" && a2 === "list") return ok(JSON.stringify({ result: { agents: w.panes.filter(p => p.agent) } }));
   if (cmd === "herdr") return ok();
+  if (argv.includes("session-host-start")) return ok();
   if (cmd === "git" && argv.includes("worktree") && argv.includes("list")) return ok(`worktree /repo\nbranch refs/heads/main\n\nworktree ${WT}\nbranch refs/heads/demo-lane`);
   if (cmd === "git" && argv.includes("rev-parse")) return ok("a".repeat(40));
   if (cmd === "git" && argv.includes("--show-current")) return ok("dori/demo-lane");

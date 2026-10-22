@@ -4,7 +4,7 @@
 
 Dori is an always-on messenger lead that delegates work into independent Codex sessions in Herdr tabs. The owner still talks to one bot; the lead keeps messenger threads, lane identity, progress and verified completion together.
 
-The lead and every lane now use **Codex app-server**. `dori serve` owns monitors and durable state; Codex owns reasoning, tools, turns and native goals; Herdr owns the tabs. Runtime control uses RPC receipts rather than terminal text. Managed agents call a scoped stdio MCP tool, preserving the command sandbox. OMO is not required.
+The lead and every lane now run a **real interactive Codex TUI in Herdr**, connected to a dedicated app-server endpoint. `dori serve` owns monitors and durable state; Codex owns reasoning, tools, turns and native goals; Herdr owns TUI start/resume, prompts, controls and exit. A read-only observer verifies exact persisted operation markers and turn/goal state; idle status is never a delivery receipt. Managed agents call a scoped stdio MCP tool, preserving the command sandbox. OMO is not required.
 
 ## Install and start
 

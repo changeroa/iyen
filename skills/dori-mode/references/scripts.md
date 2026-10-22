@@ -1,6 +1,6 @@
 # CLI and runtime
 
-The Bun/TypeScript package exposes dori. Codex app-server runs the lead and each lane; dori serve owns lifecycle state, monitor schedules and durable input/output ledgers. Herdr owns tabs. Managed agents use the required `dori_runtime.control` stdio MCP tool; operator CLI and host control use local sockets. See sessions.md for Done signal grammar.
+The Bun/TypeScript package exposes dori. Real Codex TUIs run the lead and each lane in Herdr, each connected to a dedicated app-server endpoint; dori serve owns lifecycle state, monitor schedules and durable input/output ledgers. Herdr owns tabs, TUI start/resume, prompts, interactive controls and exit. The off-pane host uses an allowlisted Unix WebSocket observer; it cannot start/resume threads, submit turns, or answer approvals. Managed agents use the required `dori_runtime.control` stdio MCP tool; operator CLI and host control use local sockets. See sessions.md for Done signal grammar.
 
 ```sh
 bun install --frozen-lockfile
@@ -17,7 +17,7 @@ Use ~/.dori/config.json or DORI_CONFIG. DORI_STATE_DIR overrides state placement
 | Field | Default / meaning |
 |---|---|
 | runtime.kind / binary / requiredVersion | codex / codex / 0.163.0 |
-| runtime.roles.lead / lane | model and effort null: inherit Codex settings |
+| runtime.roles.lead / lane | explicit available model ID and reasoning effort required for launch |
 | runtime.sandbox / approvalPolicy | workspace-write / on-request |
 | runtime.startupTimeoutMs / rpcTimeoutMs | 30000 / 15000 |
 | runtime.heartbeatIntervalMs / heartbeatTimeoutMs | 5000 / 20000 |
@@ -58,14 +58,14 @@ Managed Codex leads use `dori_runtime.control` actions `work-start` (`title,tags
 - sync [--write]: read runtime/pane drift; write refreshes verified runtime state, never replaces a conflicting identity.
 - watch/freshness/dead-panes/guard: compatibility status queries. The daemon owns the actual schedules; these do not launch duplicate loops.
 - approval list: current pending server requests and generation-qualified IDs.
-- approval respond ID --response-file FILE: operator response with the request's typed payload. Stale IDs are rejected.
+- approval respond ID --response-file FILE: legacy structured host requests only. Interactive TUI requests must be answered by the owner in the real Herdr pane; the observer never answers them.
 - mail list: inbox, outbox, launch operations and sanitized failed-turn metadata. Unknown delivery is visible and is not replayed automatically.
 - mail resolve ID --box inbox|outbox --state sent|queued --evidence TEXT: operator reconciliation after checking external state. queued is for a proven non-execution.
 - migrate --dry-run / --apply [--handoff-file FILE]: state migration with backups, no runtime launch.
 - send/presence/transcribe/heavy: existing standalone utilities.
 - inbound slack: existing read-only diagnostic polling output. Use a replayable adapter for supervised ingestion.
 
-Exit codes: 0 success, 1 configuration/transport/request error, 2 refused lifecycle or failed doctor, 3 unconfirmed runtime operation, 4 queued launch HOLD. A nonzero or lost RPC result is not evidence that an external mutation failed to execute.
+Exit codes: 0 success, 1 configuration/transport/request error, 2 refused lifecycle or failed doctor, 3 unconfirmed runtime operation, 4 queued launch HOLD. A Herdr prompt acknowledgement or idle status is not a delivery receipt. Input is sent with a durable operation marker and acknowledged only after the exact persisted userMessage maps to a real turn ID. A timeout remains unknown and is never automatically replayed.
 
 ## Ingress adapter contract
 
@@ -131,3 +131,26 @@ DORI_LIVE_PROTOCOL=1 bun test test/integration.test.ts
 This initializes the installed Codex 0.163.0 with a temporary home, creates a thread and verifies the required stdio MCP tool catalog. It does not start a model turn. The normal process integration still uses fixture runtimes. A network-off workspace-write command probe revealed that direct socket IPC is blocked on macOS; that is why managed agents use stdio MCP.
 
 Protocol and configuration references: [Codex App Server](https://learn.chatgpt.com/docs/app-server), [Shell environment policy](https://learn.chatgpt.com/docs/config-file/config-advanced). Per-thread MCP setup is also checked against the locally generated version-specific schema and the opt-in smoke test.
+
+## Visible runtime and recovery
+
+`session-host` is an off-pane supervisor. It starts a dedicated app-server Unix socket, then uses `herdr agent start` to run the interactive TUI with an explicit `--remote` endpoint. The first prompt is a tiny handshake, never the full task. The exact backend-owned thread ID is verified against the handshake/resume and reported to Herdr before task dispatch. A missing or `notLoaded` thread, changed TUI occupant, unknown goal, or duplicate receipt blocks dispatch.
+
+The sidecar inherits the established Codex settings/auth/history (default CODEX_HOME, optional `runtime.settingsHome`). It does not copy auth snapshots or replace user tools/plugins. Protected `hosts/<key>.codex/settings.json` records the settings-home path and process-scoped overrides: role model/effort, OpenAI provider, sandbox/approval, role developer instructions, required scoped Dori MCP, native goals, disabled unregistered spawning. Target-pane HERDR IDs are verified before backend hooks run. The executable shim uses an absolute resolved binary and shell input contains paths, never capability tokens. New remote TUIs receive explicit sandbox/approval flags; remote resume omits flags that Codex rejects. Before dispatching any task, the exact handshake turn’s owned rollout context must match the configured sandbox and approval policy. A banner or backend default is insufficient evidence.
+
+Pause persists the dispatch barrier, uses native `/goal pause` and Escape through Herdr, and reads back both goal inactivity and stopped original turn. Resume reactivates only the unchanged paused goal, preserving its budget. Unknown state remains held. Automatic/user control origin is recorded by Dori; native slash-command provenance belongs to Codex's TUI. A recovery with an active goal is refused before opening the TUI. Inspect and reconcile it explicitly; do not claim a successful pause from terminal status.
+
+Blocked transitions create one durable lead/owner notice pointing to the real TUI. Resolved transitions close that notice; a later block creates a new notice. Deliberate close waits for TUI exit before stopping its owned sidecar, and does not emit a false runtime-disconnected failure. Service-loss watchdogs retain the held barrier and interrupt or terminate only their owned backend. PID, bootstrap and checkpoint records remain for recovery; do not delete them to force a second writer.
+
+Existing visible sessions reopen with the same recorded thread. Legacy private-RPC sessions use an operator-authenticated handoff because remote resume can preserve obsolete developer instructions. After fully stopping the old host/backend and closing its TUI, use:
+
+```sh
+dori recover lead --new-session --handoff-file /absolute/path/verified-handoff.md
+dori status lead
+dori mail list
+dori resume lead
+```
+
+The handoff must identify the old thread/history path, confirmed work, pending work and unknown operations. Recovery preserves `runtimeHistory`, old bootstrap/checkpoints and the handoff under `hosts/history/`; the original Codex history remains in its established home. The new session starts held and the handoff queues durably until explicit resume. This is a new identity, not claimed thread continuity. Existing unknown inbox/outbox rows still require explicit reconciliation.
+
+Untrusted working directories retain Codex’s real folder-trust UI. Startup reports a blocked TUI; Dori does not accept trust or write global project trust on the owner’s behalf. Use an already trusted workspace or resolve the visible trust UI explicitly before launch.

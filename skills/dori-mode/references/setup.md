@@ -12,7 +12,7 @@ bun install --frozen-lockfile
 bun link
 ```
 
-Copy references/config.example.json to ~/.dori/config.json only for a new installation. Set defaultCwd and laneWorkspace. Set role model/effort only if overriding the Codex defaults. Configure sandbox and approval policy explicitly; installation never relaxes them. Preserve existing config and use migration for legacy installs.
+Copy references/config.example.json to ~/.dori/config.json only for a new installation. Set defaultCwd and laneWorkspace. Set an explicit model and reasoning effort for both runtime roles; launch validates them against the installed catalog. The private sidecar inherits the established CODEX_HOME settings/tools/plugins/auth/history and adds process-scoped Dori overrides without writing global config. Set runtime.settingsHome only when selecting another established settings home. Configure sandbox and approval policy explicitly; installation never relaxes them. Preserve existing config and use migration for legacy installs.
 
 ```sh
 dori doctor
@@ -63,3 +63,5 @@ dori migrate --apply --handoff-file /absolute/path/handoff.json
 The migration backs up config/state, retains messenger references, histories and deadlines, and archives legacy session IDs. It creates no Codex thread and sends no messages. Active lanes remain held. Start serve, recover each lane, inspect the new context, then resume on the owner's instruction. Legacy transcripts are not imported as Codex internal history.
 
 Keep backup data until the new runtime has been validated. Do not let an old binary read v2 state. Do not run old and new writers against the same checkout or messenger stream.
+
+Untrusted working directories retain Codex’s real folder-trust UI. Startup reports a blocked TUI; Dori does not accept trust or write global project trust on the owner’s behalf. Use an already trusted workspace or resolve the visible trust UI explicitly before launch.

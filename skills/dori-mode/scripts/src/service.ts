@@ -75,11 +75,22 @@ export class DoriService {
       const pidFile = join(this.config.stateDir, "hosts", `${lane.key}.pid.json`);
       if (existsSync(pidFile)) { const { pid } = readJson<{ pid: number }>(pidFile); try { process.kill(pid, 0); throw new Error("Prior host process still exists; refuse second writer"); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e; } }
     }
+    const backend = join(this.config.stateDir, "hosts", `${lane.key}.backend.json`);
+    if (existsSync(backend)) {
+      const { pid } = readJson<{ pid: number }>(backend);
+      try { process.kill(pid, 0); throw new Error("Prior backend process still exists; refuse second writer"); }
+      catch (e) { if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e; }
+    }
+    const live = await this.runner(["herdr", "agent", "list"]);
+    if (live.code !== 0) throw new Error("Cannot prove exclusive TUI ownership");
+    const agents = JSON.parse(live.out).result.agents as { pane_id: string; agent_session?: { value: string } }[];
+    if (agents.some(a => a.pane_id === lane.pane || (lane.runtime?.threadId && a.agent_session?.value === lane.runtime.threadId))) throw new Error("A live TUI already owns this pane or thread");
   }
   async boot(lane: Lane): Promise<void> {
     if (!lane.pane) throw new Error("A Herdr pane is required");
     const pane = lane.pane;
     await this.assertHostStopped(lane);
+    if (lane.runtime?.threadId && lane.runtime.backend !== "herdr-tui") throw new Error("Legacy private-RPC thread requires explicit recover --new-session --handoff-file; preserve its history");
     const path = bootstrapPath(this.config.stateDir, lane.key);
     if (!lane.runtime?.threadId && existsSync(path)) {
       const prior = readJson<Bootstrap>(path);
@@ -89,7 +100,7 @@ export class DoriService {
       lane = await this.registry.update(lane.key, l => ({ ...l, runtime: l.runtime && { ...l.runtime, threadId: checkpoint.threadId } }));
     }
     const instance = crypto.randomUUID();
-    const boot: Bootstrap = { key: lane.key, role: lane.role ?? "lane", instance, generation: (lane.runtime?.generation ?? 0) + 1, hostToken: crypto.randomUUID(), laneToken: crypto.randomUUID(), cwd: lane.cwd ?? this.config.defaultCwd, threadId: lane.runtime?.threadId, model: lane.model, blocked: Boolean(lane.dispatchBlocked), config: this.config };
+    const boot: Bootstrap = { key: lane.key, role: lane.role ?? "lane", pane, instance, generation: (lane.runtime?.generation ?? 0) + 1, hostToken: crypto.randomUUID(), laneToken: crypto.randomUUID(), cwd: lane.cwd ?? this.config.defaultCwd, threadId: lane.runtime?.threadId, model: lane.model, blocked: Boolean(lane.dispatchBlocked), config: this.config };
     atomicJson(path, boot);
     const clientDir = join(this.config.stateDir, "clients", lane.key);
     mkdirSync(clientDir, { recursive: true, mode: 0o700 });
@@ -97,11 +108,10 @@ export class DoriService {
     atomicJson(join(clientDir, "config.json"), this.config);
     const wrapper = `#!/bin/sh\nDORI_CONTEXT=${quoteForPane(join(clientDir, "context.json"))} DORI_STATE_DIR=${quoteForPane(this.config.stateDir)} DORI_CONFIG=${quoteForPane(join(clientDir, "config.json"))} DORI_LANE_KEY=${quoteForPane(lane.key)} exec ${quoteForPane(process.execPath)} ${quoteForPane(resolve(import.meta.dir, "cli.ts"))} "$@"\n`;
     writeFileSync(join(clientDir, "dori"), wrapper, { mode: 0o700 });
-    await this.registry.update(lane.key, current => ({ ...current, runtime: { kind: "codex", threadId: boot.threadId, state: "starting", hostInstanceId: instance, generation: boot.generation, binaryVersion: this.config.runtime.requiredVersion, lastHeartbeatAt: new Date().toISOString() } }));
+    await this.registry.update(lane.key, current => ({ ...current, runtime: { kind: "codex", backend: "herdr-tui", threadId: boot.threadId, state: "starting", hostInstanceId: instance, generation: boot.generation, binaryVersion: this.config.runtime.requiredVersion, lastHeartbeatAt: new Date().toISOString() } }));
     const cli = resolve(import.meta.dir, "cli.ts");
-    const argv = [process.execPath, cli, "session-host", "--state-dir", this.config.stateDir, "--key", lane.key];
-    const launched = await this.runner(["herdr", "pane", "run", pane, argv.map(quoteForPane).join(" ")]);
-    if (launched.code !== 0) throw new Error("Herdr failed to start session-host; intent retained");
+    const launched = await this.runner([process.execPath, cli, "session-host-start", "--state-dir", this.config.stateDir, "--key", lane.key]);
+    if (launched.code !== 0) throw new Error("Failed to start private backend host; intent retained");
   }
   async authorize(token: string): Promise<Caller> {
     const control = readJson<{ token: string }>(join(this.config.stateDir, "control.json"));
@@ -129,7 +139,7 @@ export class DoriService {
         ...(args.runtime.held && !l.dispatchBlocked ? { dispatchBlocked: true, holdReason: "recovery" as const } : {}),
         runtime: { ...args.runtime as RuntimeRef, lastHeartbeatAt: new Date().toISOString() } }));
       if (action === "host-event" && args.event?.id !== undefined) {
-        const id = `${args.instance}:${args.event.id}`;
+        const id = args.event.method === "tui/inputRequired" ? `${lane.key}:${args.event.id}` : `${args.instance}:${args.event.id}`;
         this.outbox.put({ id: `approval:${id}`, target: lane.thread, text: JSON.stringify({ lane: lane.key, id, method: args.event.method, params: args.event.params }), state: "queued", at: new Date().toISOString() });
         this.inbox.put({ id: `approval-notice:${id}`, target: "lead", text: `Approval or input required for ${lane.key}. Inspect dori approval list. ID: ${id}`, state: "queued", at: new Date().toISOString() });
       }
@@ -144,6 +154,10 @@ export class DoriService {
       }
       if (action === "host-event" && args.event?.method === "serverRequest/resolved") {
         const id = `approval:${args.instance}:${args.event.params.requestId}`;
+        if (this.outbox.get(id)) this.outbox.mark(id, { state: "sent" });
+      }
+      if (action === "host-event" && args.event?.method === "tui/inputResolved") {
+        const id = `approval:${lane.key}:${args.event.params.requestId}`;
         if (this.outbox.get(id)) this.outbox.mark(id, { state: "sent" });
       }
       return { accepted: true };
@@ -254,6 +268,18 @@ export class DoriService {
         if (action === "reopen" && statusOf(lane) !== "closed") throw new Error("Lane is not closed");
         if (action === "recover" && statusOf(lane) === "closed") throw new Error("Use reopen for closed lanes");
         await this.assertHostStopped(lane);
+        if (args.newSession) {
+          if (caller.role !== "admin" || typeof args.handoff !== "string" || !args.handoff.trim() || !lane.runtime?.threadId) throw new Error("New-session migration requires operator, known old thread and explicit handoff");
+          const archive = join(this.config.stateDir, "hosts", "history", `${key}-${lane.runtime.generation}-${lane.runtime.threadId}`);
+          mkdirSync(archive, { recursive: true, mode: 0o700 });
+          for (const suffix of [".json", ".runtime.json", ".pid.json", ".backend.json"]) {
+            const file = join(this.config.stateDir, "hosts", `${key}${suffix}`);
+            if (existsSync(file)) { writeFileSync(join(archive, `${key}${suffix}`), readFileSync(file), { mode: 0o600 }); unlinkSync(file); }
+          }
+          writeFileSync(join(archive, "handoff.md"), args.handoff, { mode: 0o600 });
+          lane = await this.registry.update(key, l => ({ ...l, runtimeHistory: [...(l.runtimeHistory ?? []), l.runtime!], runtime: { ...l.runtime!, backend: "herdr-tui", threadId: undefined, activeTurnId: undefined, state: "stopped" }, dispatchBlocked: true, holdReason: "recovery" }));
+          args.text = `Runtime migration from preserved thread ${lane.runtimeHistory!.at(-1)!.threadId}. History and handoff: ${archive}.\n${args.handoff}\nReconcile uncertain side effects; do not replay old tasks.`;
+        }
         if (args.threadId) {
           if (lane.runtime?.threadId && lane.runtime.threadId !== args.threadId) throw new Error("Refusing to replace a known thread identity");
           lane = await this.registry.update(key, l => ({ ...l, runtime: l.runtime && { ...l.runtime, threadId: args.threadId } }));

@@ -7,6 +7,7 @@ export type GuardThresholds = { readonly loadAlert: number; readonly loadOk: num
 export type RoleConfig = { model: string | null; effort: string | null };
 export type RuntimeConfig = {
   kind: "codex"; binary: string; requiredVersion: string; startupTimeoutMs: number; rpcTimeoutMs: number;
+  settingsHome?: string;
   heartbeatIntervalMs: number; heartbeatTimeoutMs: number;
   sandbox: "read-only" | "workspace-write" | "danger-full-access";
   approvalPolicy: "untrusted" | "on-request" | "never";
@@ -38,6 +39,7 @@ export const parseConfig = (raw: Record<string, any>, home = homedir()): DoriCon
     lead: { ...base.runtime.roles.lead, ...raw.runtime?.roles?.lead }, lane: { ...base.runtime.roles.lane, ...raw.runtime?.roles?.lane },
   } }, guard: { ...base.guard, ...raw.guard }, hooks: { ...base.hooks, ...raw.hooks } };
   if (cfg.runtime.kind !== "codex" || !cfg.runtime.binary || !/^\d+\.\d+\.\d+$/.test(cfg.runtime.requiredVersion)) throw new Error("A pinned Codex runtime is required");
+  if (cfg.runtime.settingsHome !== undefined && (typeof cfg.runtime.settingsHome !== "string" || !cfg.runtime.settingsHome)) throw new Error("settingsHome must be a directory path");
   if (cfg.leadWorkspace !== undefined && typeof cfg.leadWorkspace !== "string") throw new Error("leadWorkspace must be a string");
   if (!["read-only", "workspace-write", "danger-full-access"].includes(cfg.runtime.sandbox) || !["untrusted", "on-request", "never"].includes(cfg.runtime.approvalPolicy)) throw new Error("Invalid runtime policy");
   for (const [key, value] of Object.entries(cfg.runtime)) if (key.endsWith("Ms") && (!Number.isFinite(value) || Number(value) <= 0)) throw new Error(`Invalid ${key}`);

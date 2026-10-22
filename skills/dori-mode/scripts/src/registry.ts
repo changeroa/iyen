@@ -14,6 +14,7 @@ export type Lane = {
   readonly schemaVersion?: 2;
   readonly revision?: number;
   readonly runtime?: RuntimeRef;
+  readonly runtimeHistory?: readonly RuntimeRef[];
   readonly dispatchBlocked?: boolean;
   readonly holdReason?: "owner-pause" | "done-review" | "recovery";
   readonly cycle?: number;
