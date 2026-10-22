@@ -6,6 +6,7 @@ import { iso } from "./run.ts";
 import { doneSyntaxErrors } from "./signals.ts";
 import { canLaunch } from "./routing.ts";
 import { sampleHost } from "./host-guard.ts";
+import { workspaceForRole } from "./config.ts";
 export type LaunchInput = { key: string; title: string; brief: string; done: string; thread?: string; model?: string; cwd?: string; worktree?: boolean; role?: "lead" | "lane" };
 export class LaunchError extends Error { constructor(message: string, readonly exitCode = 2) { super(message); } }
 export const validateLaunch = async (deps: FlowDeps, input: LaunchInput): Promise<void> => {
@@ -41,7 +42,8 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, boot: (lane
   mkdirSync(join(deps.config.stateDir, "briefs"), { recursive: true, mode: 0o700 });
   await Bun.write(brief, briefText + (lane.role === "lead" ? "" : footer(lane)));
   await deps.registry.write(lane);
-  const created = await deps.run(["herdr", "tab", "create", ...(deps.config.laneWorkspace ? ["--workspace", deps.config.laneWorkspace] : []), "--cwd", cwd, "--label", input.key, "--no-focus"]);
+  const workspace = workspaceForRole(deps.config, lane.role);
+  const created = await deps.run(["herdr", "tab", "create", ...(workspace ? ["--workspace", workspace] : []), "--cwd", cwd, "--label", input.key, "--no-focus"]);
   if (created.code !== 0) throw new LaunchError("Herdr tab creation failed; lane intent retained");
   const made = JSON.parse(created.out).result;
   lane = await deps.registry.update(input.key, l => ({ ...l, pane: made.root_pane.pane_id, tab: made.tab_id ?? made.root_pane.tab_id }));

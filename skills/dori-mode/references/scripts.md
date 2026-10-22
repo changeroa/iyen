@@ -24,6 +24,7 @@ Use ~/.dori/config.json or DORI_CONFIG. DORI_STATE_DIR overrides state placement
 | stateDir | ~/.dori/state; registry, mailboxes and direct-task timers |
 | workThresholdSec | 120 seconds; historical duration at or above this means delegate next time |
 | defaultCwd / laneWorkspace | home / current Herdr workspace |
+| leadWorkspace | optional lead workspace; falls back to laneWorkspace when omitted; also applies to recovery |
 | nudgeAfterMin / postAfterMin / closeAfterMin | 15 / 20 / 5 |
 | heavySlots / heavyMaxLoad | 1 / 80 |
 | guard | load 150/80, free memory 20%, disk 50GB, 20 panes |

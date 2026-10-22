@@ -1,6 +1,6 @@
 import { chmodSync, existsSync, mkdirSync, unlinkSync, openSync, closeSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import type { DoriConfig } from "./config.ts";
+import { workspaceForRole, type DoriConfig } from "./config.ts";
 import { atomicJson, SerialQueue } from "./journal.ts";
 import { ipc, serviceSocket, hostSocket, readJson } from "./ipc.ts";
 import { Registry, statusOf, withStatus, type Lane, LANE_KEY } from "./registry.ts";
@@ -253,7 +253,8 @@ export class DoriService {
           if ((await this.runner(argv)).code !== 0) throw new Error("Cannot restore owned worktree; inspect repository");
         }
         if (action === "reopen") lane = await this.registry.update(key, l => withStatus(l, "working", "Reopened", new Date().toISOString(), { cycle: (l.cycle ?? 1) + 1, closedAt: undefined, claim: undefined, objection: undefined, cleanupFence: undefined, dispatchBlocked: false, holdReason: undefined }));
-        const created = await this.runner(["herdr", "tab", "create", "--cwd", lane.cwd ?? this.config.defaultCwd, "--label", key, "--no-focus"]);
+        const workspace = workspaceForRole(this.config, lane.role);
+        const created = await this.runner(["herdr", "tab", "create", ...(workspace ? ["--workspace", workspace] : []), "--cwd", lane.cwd ?? this.config.defaultCwd, "--label", key, "--no-focus"]);
         if (created.code !== 0) throw new Error("Cannot create recovery tab");
         const made = JSON.parse(created.out).result;
         lane = await this.registry.update(key, l => ({ ...l, pane: made.root_pane.pane_id, tab: made.tab_id ?? made.root_pane.tab_id }));

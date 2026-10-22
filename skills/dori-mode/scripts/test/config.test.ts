@@ -1,7 +1,7 @@
 import { afterAll, afterEach, expect, test } from "bun:test";
 import { join } from "node:path";
 
-import { fill, loadConfig } from "../src/config.ts";
+import { defaultConfig, fill, loadConfig, parseConfig, workspaceForRole } from "../src/config.ts";
 import { withState } from "./fakes.ts";
 
 const state = withState();
@@ -45,4 +45,12 @@ test("invalid work thresholds are refused at the config boundary", async () => {
     await Bun.write(path, JSON.stringify({ workThresholdSec: value }));
     await expect(loadConfig(path)).rejects.toThrow("workThresholdSec must be a positive number");
   }
+});
+
+test("lead workspace is independent and falls back to lane workspace for existing configs", () => {
+  const config = { ...defaultConfig(), laneWorkspace: "workers" };
+  expect(workspaceForRole(config, "lead")).toBe("workers");
+  expect(workspaceForRole({...config, leadWorkspace: "lead"}, "lead")).toBe("lead");
+  expect(workspaceForRole({...config, leadWorkspace: "lead"}, "lane")).toBe("workers");
+  expect(() => parseConfig({leadWorkspace: 5})).toThrow("leadWorkspace must be a string");
 });

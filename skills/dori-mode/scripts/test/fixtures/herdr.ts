@@ -6,7 +6,7 @@ const dir=process.env.DORI_STATE_DIR!,args=process.argv.slice(2);
 const file=join(dir,"fixture-panes.json");const panes=existsSync(file)?JSON.parse(readFileSync(file,"utf8")):[];
 if(args[0]==="--version")console.log("fixture-herdr");
 else if(args[0]==="tab"&&args[1]==="create"){
- const id=crypto.randomUUID();panes.push({pane_id:`p-${id}`,tab_id:`t-${id}`});writeFileSync(file,JSON.stringify(panes));console.log(JSON.stringify({result:{root_pane:panes.at(-1),tab_id:panes.at(-1).tab_id}}));
+ const id=crypto.randomUUID();panes.push({pane_id:`p-${id}`,tab_id:`t-${id}`,workspace_id:args.includes("--workspace")?args[args.indexOf("--workspace")+1]:undefined});writeFileSync(file,JSON.stringify(panes));console.log(JSON.stringify({result:{root_pane:panes.at(-1),tab_id:panes.at(-1).tab_id}}));
 }else if(args[0]==="pane"&&args[1]==="run"){
  const fd=openSync(join(dir,"fixture-host.log"),"a");const p=spawn("/bin/sh",["-c",args[3]!],{detached:true,stdio:["ignore",fd,fd],env:process.env});p.unref();appendFileSync(join(dir,"fixture-pids"),String(p.pid)+"\n");
 }else if(args[0]==="pane"&&args[1]==="list")console.log(JSON.stringify({result:{panes}}));

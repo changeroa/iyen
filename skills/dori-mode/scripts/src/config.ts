@@ -14,7 +14,7 @@ export type RuntimeConfig = {
 };
 export type IngressConfig = { id: string; command: string[]; owners: string[] };
 export type DoriConfig = {
-  schemaVersion: 2; stateDir: string; laneWorkspace: string; workspaces: readonly string[];
+  schemaVersion: 2; stateDir: string; leadWorkspace?: string; laneWorkspace: string; workspaces: readonly string[];
   ignorePanes: readonly string[]; leadPane: string; defaultCwd: string; runtime: RuntimeConfig;
   nudgeAfterMin: number; postAfterMin: number; closeAfterMin: number; workThresholdSec: number; heavySlots: number; heavyMaxLoad: number;
   guard: GuardThresholds; hooks: Hooks; ingress: IngressConfig[];
@@ -38,6 +38,7 @@ export const parseConfig = (raw: Record<string, any>, home = homedir()): DoriCon
     lead: { ...base.runtime.roles.lead, ...raw.runtime?.roles?.lead }, lane: { ...base.runtime.roles.lane, ...raw.runtime?.roles?.lane },
   } }, guard: { ...base.guard, ...raw.guard }, hooks: { ...base.hooks, ...raw.hooks } };
   if (cfg.runtime.kind !== "codex" || !cfg.runtime.binary || !/^\d+\.\d+\.\d+$/.test(cfg.runtime.requiredVersion)) throw new Error("A pinned Codex runtime is required");
+  if (cfg.leadWorkspace !== undefined && typeof cfg.leadWorkspace !== "string") throw new Error("leadWorkspace must be a string");
   if (!["read-only", "workspace-write", "danger-full-access"].includes(cfg.runtime.sandbox) || !["untrusted", "on-request", "never"].includes(cfg.runtime.approvalPolicy)) throw new Error("Invalid runtime policy");
   for (const [key, value] of Object.entries(cfg.runtime)) if (key.endsWith("Ms") && (!Number.isFinite(value) || Number(value) <= 0)) throw new Error(`Invalid ${key}`);
   if (cfg.runtime.heartbeatTimeoutMs <= cfg.runtime.heartbeatIntervalMs) throw new Error("heartbeat timeout must exceed interval");
@@ -58,4 +59,5 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   const f = Bun.file(path);
   return parseConfig(await f.exists() ? await f.json() : {}, home);
 };
+export const workspaceForRole = (config: DoriConfig, role = "lane"): string => role === "lead" ? config.leadWorkspace ?? config.laneWorkspace : config.laneWorkspace;
 export const fill = (template: ArgvTemplate, values: Readonly<Record<string, string>>): string[] => template.map(part => part.replace(/\{(\w+)\}/g, (whole, name: string) => values[name] ?? whole));

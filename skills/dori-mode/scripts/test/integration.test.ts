@@ -16,7 +16,7 @@ test("CLI daemon and isolated session-hosts launch, pause, resume, close and reo
  const state=withState();let daemon:ReturnType<typeof Bun.spawn>|undefined;
  try{
   const bin=join(state.dir,"bin");mkdirSync(bin);symlinkSync(join(import.meta.dir,"fixtures/herdr.ts"),join(bin,"herdr"));
-  const config={...defaultConfig(),stateDir:state.dir,defaultCwd:state.dir,closeAfterMin:0.01,guard:{...defaultConfig().guard,memFreeMinPct:0,diskFreeMinGb:0},runtime:{...defaultConfig().runtime,binary:join(import.meta.dir,"fixtures/codex.ts"),startupTimeoutMs:10000,rpcTimeoutMs:3000}};
+  const config={...defaultConfig(),stateDir:state.dir,defaultCwd:state.dir,leadWorkspace:"lead-space",laneWorkspace:"worker-space",closeAfterMin:0.01,guard:{...defaultConfig().guard,memFreeMinPct:0,diskFreeMinGb:0},runtime:{...defaultConfig().runtime,binary:join(import.meta.dir,"fixtures/codex.ts"),startupTimeoutMs:10000,rpcTimeoutMs:3000}};
   const cfgPath=join(state.dir,"config.json");atomicJson(cfgPath,config);await Bun.write(join(state.dir,"brief.md"),"fixture task");await Bun.write(join(state.dir,"ready.json"),'{"ready":true}');
   const env={PATH:`${bin}:${dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`,HOME:state.dir,DORI_CONFIG:cfgPath,DORI_STATE_DIR:state.dir};
   daemon=Bun.spawn([process.execPath,join(import.meta.dir,"../src/cli.ts"),"serve"],{env,stdout:"pipe",stderr:"pipe"});
@@ -46,6 +46,9 @@ test("CLI daemon and isolated session-hosts launch, pause, resume, close and reo
   expect((await new Response(missing.stderr).text()).trim()).toBe('no started work "00000000-0000-0000-0000-000000000000"');expect(await missing.exited).toBe(1);
   const launched=await call("launch",{key:"test-lane",title:"Test",brief:join(state.dir,"brief.md"),done:`file ${join(state.dir,"ready.json")} json:.ready=true`,cwd:state.dir,operationId:"launch-1"});
   expect(launched.startup).toStartWith("STARTUP_OK");const threadId=launched.lane.runtime.threadId;
+  const createdPanes=JSON.parse(readFileSync(join(state.dir,"fixture-panes.json"),"utf8"));
+  expect(createdPanes.find((p:any)=>p.pane_id===lead.lane.pane).workspace_id).toBe("lead-space");
+  expect(createdPanes.find((p:any)=>p.pane_id===launched.lane.pane).workspace_id).toBe("worker-space");
   expect(threadId).toBeTruthy();expect(threadId).not.toBe("distinct-session");
   const paneBefore=(await call("status",{key:"test-lane"})).pane;
   const tabCount=JSON.parse(readFileSync(join(state.dir,"fixture-panes.json"),"utf8")).length;
@@ -91,6 +94,7 @@ test("CLI daemon and isolated session-hosts launch, pause, resume, close and reo
   const reopened=await waitFor(()=>call("status",{key:"test-lane"}),v=>v.runtime.state!=="starting");
   await waitFor(()=>call("mail-list"),v=>v.inbox.find((m:any)=>m.id==="input-2")?.state==="sent");
   expect(reopened.runtime.threadId).toBe(threadId);expect(reopened.cycle).toBe(2);expect(reopened.claim).toBeUndefined();
+  expect(JSON.parse(readFileSync(join(state.dir,"fixture-panes.json"),"utf8")).find((p:any)=>p.pane_id===reopened.pane).workspace_id).toBe("worker-space");
   expect(existsSync(join(state.dir,".omo"))).toBe(false);
   daemon.kill("SIGTERM");await daemon.exited;
   expect(await errs).toBe("");expect(await logs).toContain("DORI_SERVICE_READY");

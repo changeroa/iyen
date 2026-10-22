@@ -16,7 +16,7 @@ bun install --frozen-lockfile
 bun link
 ```
 
-For a new installation, copy `skills/dori-mode/references/config.example.json` to `~/.dori/config.json`. Set `defaultCwd`, `laneWorkspace`, thread hooks and owner-filtered ingress. Existing config must be migrated, not overwritten.
+For a new installation, copy `skills/dori-mode/references/config.example.json` to `~/.dori/config.json`. Set `defaultCwd`, `laneWorkspace` for workers, optional `leadWorkspace` for the lead, thread hooks and owner-filtered ingress. When omitted, `leadWorkspace` falls back to `laneWorkspace`. Existing config must be migrated, not overwritten.
 
 ```sh
 dori doctor
