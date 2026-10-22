@@ -63,7 +63,11 @@ export class CodexSession {
     if (role.effort && chosen && !chosen.supportedReasoningEfforts.some(e => e.reasoningEffort === role.effort)) throw new Error("Unsupported model effort");
     const params: ThreadStartParams = { cwd, model: chosen?.model, modelProvider: "openai", sandbox: this.config.sandbox,
       approvalPolicy: this.config.approvalPolicy, developerInstructions: instructions,
-      config: { ...(this.context ? { "mcp_servers.dori_runtime": { command: process.execPath, args: [resolve(import.meta.dir, "../cli.ts"), "mcp-server"], env: { DORI_CONTEXT: this.context.file, DORI_CONFIG: this.context.configFile, DORI_STATE_DIR: this.context.stateDir }, enabled: true, required: true } } : {}), "features.multi_agent": false, "features.multi_agent_v2": false, "features.multi_agent_v2_dynamic_tools": false, ...(role.effort ? { model_reasoning_effort: role.effort } : {}) } };
+      config: { ...(this.context ? { "mcp_servers.dori_runtime": { command: process.execPath, args: [resolve(import.meta.dir, "../cli.ts"), "mcp-server"], env: { DORI_CONTEXT: this.context.file, DORI_CONFIG: this.context.configFile, DORI_STATE_DIR: this.context.stateDir }, enabled: true, required: true,
+        // This service-owned tool enforces lead/lane capabilities itself. Explicit
+        // approval applies only here; command and other MCP policies stay intact.
+        enabled_tools: ["control"], tools: { control: { approval_mode: "approve" } },
+      } } : {}), "features.multi_agent": false, "features.multi_agent_v2": false, "features.multi_agent_v2_dynamic_tools": false, ...(role.effort ? { model_reasoning_effort: role.effort } : {}) } };
     const response = await this.rpc.request<ThreadStartResponse>(threadId ? "thread/resume" : "thread/start", threadId ? { ...params, threadId, excludeTurns: true } : params);
     if (response.modelProvider !== "openai") throw new Error("Dori requires the OpenAI Codex provider");
     if (threadId && response.thread.id !== threadId) throw new Error("Resumed thread identity mismatch");
@@ -101,8 +105,8 @@ export class CodexSession {
     }
     const params: TurnStartParams = { threadId: this.threadId, clientUserMessageId: operationId, input };
     const { turn } = await this.rpc.request<TurnStartResponse>("turn/start", params);
-    // A completed event can arrive before the response. Inspect again rather than overwrite it.
-    await this.inspect();
+    // The mutation receipt is authoritative even if a later status read fails.
+    // Events own runtime state, including completion received before this response.
     return { turnId: turn.id };
   }
   async hold(origin: "user" | "automatic"): Promise<RuntimeSnapshot> {

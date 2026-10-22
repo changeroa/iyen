@@ -110,6 +110,10 @@ state/lanes includes the lead record as lead.json. state/journal is append-only 
 
 The default command sandbox can block Unix socket connections. Do not broaden network access for lifecycle operations: the required stdio MCP server calls the service with a lane-scoped capability. The local managed CLI wrapper is for operator tooling and supplies context from a private file even when parent shell filters remove variables.
 
+Each managed thread exposes only `dori_runtime.control` with `enabled_tools = ["control"]` and the tool-specific `tools.control.approval_mode = "approve"`. This service-owned channel handles already authorized Dori operations; service lead/lane permissions and owner-only approvals still apply. Command sandbox/approval policy, other MCP servers and managed/strict denials remain unchanged. The generic control tool is not marked read-only. These settings use the pinned Codex 0.163.0 [MCP tool policy](https://learn.chatgpt.com/docs/extend/mcp).
+
+A successful `turn/start` response is retained as a known input receipt. Later observational status failures cannot convert it to an unknown delivery or trigger a new start; runtime events preserve completion that arrives before the response.
+
 The socket directory is a private /tmp/dori-UID-HASH directory derived from stateDir. Control tokens are never command-line arguments. This is local-user isolation, not a security boundary against arbitrary code running as that same OS user.
 
 Host connection loss holds its goal and turn; failed stop confirmation terminates the owned Codex process. Reconnect does not silently resume a held lane. Inspect status/mail, then explicitly resume. For unknown external sends, inspect the actual messenger before marking sent or retrying through the original reply command.
