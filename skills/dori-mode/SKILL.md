@@ -85,7 +85,7 @@ Real work runs in its own herdr tab, called a lane. The protocol, with the reaso
 - Secrets, tokens, internal hostnames and personal data never go into a public issue, PR, gist or message.
 - Build memory as you work and consult it before asking the owner something it already answers.
 - Keep going until the work is done. Stop only when nothing can move without the owner.
-- When the owner says wait, pause the lane with dori pause KEY immediately. On PAUSE_UNVERIFIED, dispatch remains blocked; inspect and retry pause until runtime inactivity is confirmed. Only an explicit owner request authorizes dori resume KEY. Resume also clears a recovery hold after its cause has been checked.
+- When the owner says wait, pause the lane with dori pause KEY immediately. On PAUSE_UNVERIFIED, dispatch remains blocked; inspect and retry pause until runtime inactivity is confirmed. Only an explicit owner request authorizes dori resume KEY. Resume also clears a recovery hold after its cause has been checked. If pause interrupted goal-less work, resume queues one instruction to inspect confirmed state and continue; never replay the original task or uncertain side effects. Check mail for unknown continuation delivery before further input.
 - All parallel work goes through dori launch, with --worktree for concurrent writers. Do not use unregistered agent spawning or share mutable checkouts. Record scope and base revision in the brief.
 - Use dori report KEY --kind milestone|blocker|question|done --text-file PATH --event-id ID. Reports are structured events; terminal text is not evidence of delivery.
 - Use dori reply --thread REF --text-file PATH --operation-id ID for owner replies. Messenger credentials stay in the service and its adapters, not the Codex subprocess.

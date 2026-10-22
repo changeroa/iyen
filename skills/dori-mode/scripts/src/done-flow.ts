@@ -8,6 +8,7 @@ export type FlowDeps = {
   run: Runner; clock: Clock; registry: Registry; config: DoriConfig; runtime: RuntimeControl;
   exists?: (path: string) => boolean; signalIo?: SignalIo;
   post?: (id: string, hook: ArgvTemplate, values: Record<string, string>) => Promise<void>;
+  queueInput?: (key: string, text: string, operationId: string) => Promise<void>;
 };
 const signalIo = (deps: FlowDeps, lane: Lane): SignalIo => ({ cwd: lane.cwd ?? deps.config.defaultCwd, ...deps.signalIo });
 const windowMs = (deps: FlowDeps): number => deps.config.closeAfterMin * 60000;

@@ -53,6 +53,8 @@ export type Lane = {
   readonly pausedSeenWorking?: boolean;
   /** The status a paused lane had before it was paused; `resume` restores it. */
   readonly pausedFrom?: LaneStatus;
+  /** Owner pause interrupted a running turn with no native goal; consumed by explicit resume. */
+  readonly pausedContinuation?: { id: string; interruptedTurnId: string; at: string };
   readonly receipt?: unknown;
 };
 

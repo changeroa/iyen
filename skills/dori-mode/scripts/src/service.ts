@@ -59,7 +59,11 @@ export class DoriService {
       }),
       hold: (key, origin) => call(key, "hold", { origin }), release: (key, origin) => call(key, "release", { origin }), stop: key => call(key, "stop"),
     };
-    this.deps = { config, registry: this.registry, clock: realClock, run: runner, runtime, post: (id, hook, values) => postHook(this.outbox, runner, id, hook, values) };
+    this.deps = { config, registry: this.registry, clock: realClock, run: runner, runtime, post: (id, hook, values) => postHook(this.outbox, runner, id, hook, values),
+      queueInput: async (key, text, operationId) => {
+        const lane = await this.lane(key);
+        this.inbox.put({ id: operationId, target: key, text, thread: lane.thread, state: "queued", at: new Date().toISOString() });
+      } };
   }
   private async lane(key: string): Promise<Lane> { if (!key || !LANE_KEY.test(key)) throw new Error("Invalid lane key"); const lane = await this.registry.read(key); if (!lane) throw new Error("Unknown lane"); return lane; }
   private async assertHostStopped(lane: Lane): Promise<void> {

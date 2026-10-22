@@ -52,7 +52,7 @@ Managed Codex leads use `dori_runtime.control` actions `work-start` (`title,tags
 - input KEY --text-file FILE: structured input; active turns are steered. Paused inputs remain queued.
 - report KEY --kind KIND --text-file FILE --event-id ID: milestone/blocker/question/done event. A done report alone does not claim completion.
 - reply --thread REF --text-file FILE --operation-id ID: durable messenger hook send, available to lead/operator.
-- pause/resume/claim-done/object-done/close: lifecycle operations; see done-protocol.md.
+- pause/resume/claim-done/object-done/close: lifecycle operations; see done-protocol.md. Pausing a running turn without a native goal persists a continuation marker. Explicit resume queues one stable instruction to inspect confirmed state and continue unfinished work before clearing dispatch. Idle pauses and native-goal resumes do not start an extra turn; automatic releases do not enqueue continuation. Inspect mail for any unknown continuation outcome instead of replaying the original task.
 - recover KEY: create a replacement host only after the old process is gone. It reuses a known thread or imports a legacy handoff into a new one. A thread created before registration is recovered from the host checkpoint. If creation itself is ambiguous, inspect Codex history and use recover KEY --thread-id ID; an already-known identity cannot be replaced.
 - reopen KEY: new cycle on the same recorded thread, restoring an owned worktree when necessary.
 - sync [--write]: read runtime/pane drift; write refreshes verified runtime state, never replaces a conflicting identity.
