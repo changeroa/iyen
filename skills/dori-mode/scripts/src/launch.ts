@@ -10,10 +10,10 @@ import { workspaceForRole } from "./config.ts";
 export type LaunchInput = { key: string; title: string; brief: string; done: string; thread?: string; model?: string; cwd?: string; worktree?: boolean; role?: "lead" | "lane" };
 export class LaunchError extends Error { constructor(message: string, readonly exitCode = 2) { super(message); } }
 export const validateLaunch = async (deps: FlowDeps, input: LaunchInput): Promise<void> => {
-  if ((input.key === "lead") !== (input.role === "lead")) throw new LaunchError("lead is a reserved role/key pair");
+  if (input.key === "lead" || input.role === "lead") throw new LaunchError("Iyen lead must attach to the current session; use lead-attach");
   if (!LANE_KEY.test(input.key)) throw new LaunchError("Invalid lane key");
   if (await deps.registry.read(input.key)) throw new LaunchError(`lane ${input.key} already exists`);
-  if (input.role !== "lead") { const errors = doneSyntaxErrors(input.done); if (errors.length) throw new LaunchError(`Done line is not checkable: ${errors.join("; ")}`); }
+  const errors = doneSyntaxErrors(input.done); if (errors.length) throw new LaunchError(`Done line is not checkable: ${errors.join("; ")}`);
   if (input.model?.includes("/")) throw new LaunchError("Use a Codex model ID");
 };
 export const footer = (lane: Lane): string => `\n## Dori lane contract\nKey: ${lane.key}\nThread: ${lane.thread}\nDone = ${lane.done}\nUse dori report ${lane.key} --kind milestone --text-file PATH --event-id ID at milestones.\nUse dori claim-done ${lane.key} --evidence TEXT when complete, then stay idle. Dori verifies evidence and closes after five minutes without an objection. Do not delete worktrees or spawn unregistered agents.\n`;

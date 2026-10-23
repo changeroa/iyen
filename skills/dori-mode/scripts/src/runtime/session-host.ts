@@ -54,6 +54,7 @@ export const prepareBackend = (stateDir: string, boot: Bootstrap): { home: strin
 };
 export const startSessionHost = (stateDir: string, key: string): void => {
   const boot = readJson<Bootstrap>(bootstrapPath(stateDir, key));
+  if (key === "lead" || boot.role === "lead") throw new Error("Iyen lead must attach to the current session; use lead-attach");
   const child = spawn(process.execPath, [resolve(import.meta.dir, "../cli.ts"), "session-host", "--state-dir", stateDir, "--key", key],
     { detached: true, stdio: "ignore", cwd: boot.cwd, env: { ...safeEnvironment(process.env), ...(process.env.HERDR_SOCKET_PATH ? { HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH } : {}) } });
   if (!child.pid) throw new Error("Could not start runtime host");
@@ -61,6 +62,7 @@ export const startSessionHost = (stateDir: string, key: string): void => {
 };
 export const runSessionHost = async (stateDir: string, key: string): Promise<void> => {
   const boot = readJson<Bootstrap>(bootstrapPath(stateDir, key)), config = boot.config;
+  if (key === "lead" || boot.role === "lead") throw new Error("Iyen lead must attach to the current session; use lead-attach");
   const socket = hostSocket(stateDir, key), endpoint = backendSocket(stateDir, key);
   if (existsSync(socket)) {
     try { await ipc(socket, boot.hostToken, "inspect", {}, 1000); throw new Error("An existing session-host still owns this thread"); }

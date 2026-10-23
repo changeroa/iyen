@@ -7,7 +7,7 @@ export const deadPaneTick = async (run: Runner, config: DoriConfig, registry: Re
   const lines: string[] = [];
   for (const lane of await registry.open()) {
     if (lane.pane && !panes.has(lane.pane)) lines.push(`DEAD_PANE ${lane.key} ${lane.pane}`);
-    if (lane.runtime && now - Date.parse(lane.runtime.lastHeartbeatAt ?? lane.openedAt) > config.runtime.heartbeatTimeoutMs) lines.push(`RUNTIME_UNREACHABLE ${lane.key}`);
+    if (lane.runtime && lane.runtime.backend !== "external-current-session" && now - Date.parse(lane.runtime.lastHeartbeatAt ?? lane.openedAt) > config.runtime.heartbeatTimeoutMs) lines.push(`RUNTIME_UNREACHABLE ${lane.key}`);
   }
   return lines;
 };

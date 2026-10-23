@@ -1,6 +1,8 @@
 # Sessions (lanes)
 
-Every lane and the lead run a separate Codex app-server in a Herdr tab, managed by session-host. The service records the returned thread.id; it never inspects process environments or guesses session files.
+The lead attaches to the owner's existing Codex session and shared daemon. It is never created by session-host. Each worker lane runs a separate Codex app-server in a Herdr tab managed by session-host. The service verifies actual thread IDs; it never guesses session files.
+
+An attached lead is borrowed: detach revokes its scoped bridge and stops routing without closing its pane or daemon. Busy input remains queued. Identity loss holds dispatch; explicit activation revalidates the session. Pause/resume/close/recover of a managed session are worker operations; use lead-detach for the current-session lead.
 
 ## Launch
 

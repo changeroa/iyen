@@ -3,7 +3,9 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync } from "nod
 import { join, dirname } from "node:path";
 import { defaultConfig } from "../src/config.ts";
 import { atomicJson } from "../src/journal.ts";
-import { ipc, readJson, serviceSocket } from "../src/ipc.ts";
+import { ipc, readJson, serviceSocket, socketDir } from "../src/ipc.ts";
+import { connectObserver } from "../src/runtime/observer.ts";
+import { operationText } from "../src/runtime/herdr.ts";
 import { startCodex } from "../src/runtime/codex.ts";
 import { withState } from "./fakes.ts";
 const waitFor = async<T>(fn:()=>Promise<T>,accept:(value:T)=>boolean):Promise<T>=>{
@@ -25,39 +27,9 @@ test("CLI service and private backends manage visible Herdr agents with exact re
   const token=readJson<{token:string}>(join(state.dir,"control.json")).token;
   const call=(action:string,args:any={})=>ipc<any>(serviceSocket(state.dir),token,action,args,20000);
   await waitFor(()=>call("status"),Array.isArray);
-  const lead=await call("lead");
-  if(!lead.startup.startsWith("STARTUP_OK")) {
-    const debug=(path:string)=>existsSync(join(state.dir,path))?readJson(join(state.dir,path)):null;
-    throw new Error(JSON.stringify({startup:lead.startup,backendError:debug("fixture-backend-error.json"),phase:debug("hosts/lead.startup.json"),hostError:debug("hosts/lead.error.json")}));
-  }
-  expect(lead.startup).toStartWith("STARTUP_OK");
-  const leadWrapper = join(state.dir,"clients/lead/dori");
-  const leadMcp = async (action: string, args: any) => {
-    const child = Bun.spawn([leadWrapper,"mcp-server"],{env:{PATH:env.PATH,HOME:state.dir},stdin:"pipe",stdout:"pipe",stderr:"pipe"});
-    child.stdin.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"control",arguments:{action,args}}})+"\n");child.stdin.end();
-    const response=JSON.parse((await new Response(child.stdout).text()).trim());
-    expect(await child.exited).toBe(0);expect(response.result.isError).toBe(false);
-    return JSON.parse(response.result.content[0].text);
-  };
-  const workArgs={title:"Direct docs lookup",tags:["docs"],thread:"chat:docs",operationId:crypto.randomUUID()};
-  const timed=await leadMcp("work-start",workArgs);
-  expect(timed.work.id).toBe(workArgs.operationId);expect(timed.work.startedAt).toBeTruthy();
-  expect(await leadMcp("work-start",workArgs)).toEqual(timed);
-  const finished=await leadMcp("work-stop",{id:timed.work.id});
-  expect(finished.work.endedAt).toBeTruthy();expect(finished.work.elapsedSec).toBeGreaterThanOrEqual(0);
-  const history=Bun.spawn([process.execPath,join(import.meta.dir,"../src/cli.ts"),"work","similar","--tag","docs"],{env,stdout:"pipe",stderr:"pipe"});
-  expect(JSON.parse(await new Response(history.stdout).text()).matches[0].id).toBe(timed.work.id);expect(await history.exited).toBe(0);
-  const missing=Bun.spawn([process.execPath,join(import.meta.dir,"../src/cli.ts"),"work","stop","00000000-0000-0000-0000-000000000000"],{env,stdout:"pipe",stderr:"pipe"});
-  expect((await new Response(missing.stderr).text()).trim()).toBe('no started work "00000000-0000-0000-0000-000000000000"');expect(await missing.exited).toBe(1);
-  await call("input",{key:"lead",text:"fixture-fail-auth",thread:"chat:failure",operationId:"failure-input"});
-  const failedMail=await waitFor(()=>call("mail-list"),v=>v.outbox.some((m:any)=>m.target==="chat:failure"));
-  expect(failedMail.outbox.filter((m:any)=>m.target==="chat:failure")).toHaveLength(1);
-  expect(failedMail.outbox.find((m:any)=>m.target==="chat:failure").text).toContain("authentication");
-  expect((await call("status",{key:"lead"})).runtime.hostInstanceId).toBe(lead.lane.runtime.hostInstanceId);
   const launched=await call("launch",{key:"test-lane",title:"Test",brief:join(state.dir,"brief.md"),done:`file ${join(state.dir,"ready.json")} json:.ready=true`,cwd:state.dir,operationId:"launch-1"});
   expect(launched.startup).toStartWith("STARTUP_OK");const threadId=launched.lane.runtime.threadId;
   const createdPanes=JSON.parse(readFileSync(join(state.dir,"fixture-panes.json"),"utf8"));
-  expect(createdPanes.find((p:any)=>p.pane_id===lead.lane.pane).workspace_id).toBe("lead-space");
   expect(createdPanes.find((p:any)=>p.pane_id===launched.lane.pane).workspace_id).toBe("worker-space");
   expect(threadId).toBeTruthy();expect(threadId).not.toBe("distinct-session");
   const paneBefore=(await call("status",{key:"test-lane"})).pane;
@@ -118,4 +90,76 @@ test("CLI service and private backends manage visible Herdr agents with exact re
   if(existsSync(join(state.dir,"fixture-pids")))for(const raw of readFileSync(join(state.dir,"fixture-pids"),"utf8").trim().split("\n")){try{process.kill(Number(raw),"SIGTERM");}catch{}}
   await Bun.sleep(100);state.done();
  }
+},30000);
+
+test("current-session CLI attaches a busy existing lead, scopes controls, delivers ingress, restarts and detaches without terminating its daemon", async () => {
+ const state=withState();let daemon:ReturnType<typeof Bun.spawn>|undefined;
+ const threadId="11111111-1111-4111-8111-111111111111",socketPath=join(socketDir(state.dir),"shared.sock"),statePath=join(state.dir,"external-state.json");
+ const server=Bun.serve({unix:socketPath,fetch(req,s){if(s.upgrade(req))return;return new Response(null,{status:400});},websocket:{message(ws,raw){
+  const m=JSON.parse(String(raw));if(m.id===undefined)return;const snapshot=readJson<any>(statePath);
+  const result=m.method==="initialize"?{}:m.method==="thread/read"?{thread:snapshot.thread}:m.method==="thread/loaded/list"?{data:[threadId],nextCursor:null}:m.method==="thread/goal/get"?{goal:null}:m.method==="thread/turns/list"?{data:snapshot.turns,nextCursor:null}:undefined;
+  if(result===undefined)ws.send(JSON.stringify({id:m.id,error:{code:-1,message:"observer mutation prohibited"}}));else ws.send(JSON.stringify({id:m.id,result}));
+ }}});
+ try {
+  atomicJson(statePath,{socketPath,thread:{id:threadId,cwd:state.dir,model:"existing-model",reasoningEffort:"high",status:{type:"active",activeFlags:[]}},turns:[{id:"activation-turn",status:"inProgress",items:[]}]});
+  atomicJson(join(state.dir,"fixture-panes.json"),[{pane_id:"current:p",tab_id:"current:t",workspace_id:"current",agent:"codex",agent_status:"working",agent_session:{agent:"codex",kind:"id",value:threadId}}]);
+  const bin=join(state.dir,"bin");mkdirSync(bin);symlinkSync(join(import.meta.dir,"fixtures/herdr.ts"),join(bin,"herdr"));
+  const config={...defaultConfig(),stateDir:state.dir,defaultCwd:state.dir,runtime:{...defaultConfig().runtime,binary:join(import.meta.dir,"fixtures/external-codex.ts"),rpcTimeoutMs:2000}};
+  const cfgPath=join(state.dir,"config.json");atomicJson(cfgPath,config);
+  const env={PATH:`${bin}:${dirname(process.execPath)}:/usr/bin:/bin`,HOME:state.dir,DORI_STATE_DIR:state.dir,DORI_CONFIG:cfgPath};
+  const cli=join(import.meta.dir,"../src/cli.ts");
+  const start=async()=>{
+   daemon=Bun.spawn([process.execPath,cli,"serve"],{env,stdout:"pipe",stderr:"pipe"});
+   const out=new Response(daemon.stdout as ReadableStream).text(),err=new Response(daemon.stderr as ReadableStream).text();
+   await waitFor(async()=>existsSync(join(state.dir,"control.json")),Boolean);
+   await waitFor(()=>ipc(serviceSocket(state.dir),readJson<any>(join(state.dir,"control.json")).token,"status"),Array.isArray);
+   return {out,err};
+  };
+  const exec=async(argv:string[],extraEnv:Record<string,string>={})=>{
+   const p=Bun.spawn(argv,{env:{...env,...extraEnv},stdout:"pipe",stderr:"pipe"});
+   const [out,err,code]=await Promise.all([new Response(p.stdout).text(),new Response(p.stderr).text(),p.exited]);
+   return {out,err,code};
+  };
+  let logs=await start();
+  const attached=await exec([process.execPath,cli,"lead-attach","--thread-id",threadId,"--pane","current:p","--cwd",state.dir]);expect(attached.code).toBe(0);
+  const first=JSON.parse(attached.out),bridge=first.bridge;expect(first.lead).toMatchObject({identityVerified:true,readiness:"busy",runtime:{model:"existing-model",effort:"high",threadId}});
+  const scoped=await exec([bridge,"status","lead"]);expect(scoped.code).toBe(0);expect(JSON.parse(scoped.out).bridge).toBe(bridge);
+  const repeat=await exec([process.execPath,cli,"lead","--thread-id",threadId,"--pane","current:p","--cwd",state.dir]);expect(repeat.code).toBe(0);expect(JSON.parse(repeat.out)).toMatchObject({reused:true,bridge});
+  const saved=readJson<any>(join(state.dir,"attachments/lead.json")),token=readJson<any>(join(state.dir,"control.json")).token;
+  const call=(action:string,args:any={})=>ipc<any>(serviceSocket(state.dir),token,action,args,15000);
+  const workId=crypto.randomUUID(),work=await exec([bridge,"work","start","--title","Attached direct work","--tag","docs","--operation-id",workId]);expect(work.code).toBe(0);expect(JSON.parse(work.out).work.id).toBe(workId);
+  const stopped=await exec([bridge,"work","stop",workId]);expect(stopped.code).toBe(0);expect(JSON.parse(stopped.out).work.elapsedSec).toBeGreaterThanOrEqual(0);
+  const forged=join(state.dir,"forged.json");atomicJson(forged,{key:"lead",stateDir:state.dir});
+  expect((await exec([process.execPath,cli,"status"],{DORI_CONTEXT:forged})).code).toBe(1);
+  expect((await exec([bridge,"lead-attach","--thread-id",threadId,"--pane","current:p","--cwd",state.dir])).code).toBe(1);
+  await call("input",{key:"lead",text:"literal owner message",thread:"chat:owner",operationId:"ingress"});
+  expect((await call("mail-list")).inbox.find((m:any)=>m.id==="ingress").state).toBe("queued");
+  const snapshot=readJson<any>(statePath);snapshot.thread.status={type:"idle"};snapshot.turns[0].status="completed";atomicJson(statePath,snapshot);
+  const mail=await waitFor(()=>call("mail-list"),v=>v.inbox.find((m:any)=>m.id==="ingress")?.state==="sent");
+  const delivered=mail.inbox.find((m:any)=>m.id==="ingress");expect(delivered.turnId).toBeTruthy();
+  expect(readJson<any>(statePath).turns.find((t:any)=>t.id===delivered.turnId).items[0].content[0].text).toBe(operationText("literal owner message","ingress"));
+  daemon!.kill("SIGTERM");await daemon!.exited;expect(await logs.err).toBe("");expect(await logs.out).toContain("DORI_SERVICE_READY");
+  logs=await start();expect(JSON.parse((await exec([bridge,"status","lead"])).out)).toMatchObject({identityVerified:true,readiness:"ready",bridge});
+  await call("input",{key:"lead",text:"fixture-fail-auth",thread:"chat:failure",operationId:"failed-owner-input"});
+  const failedMail=await waitFor(()=>call("mail-list"),v=>v.outbox.some((m:any)=>m.target==="chat:failure"));
+  expect(failedMail.outbox.filter((m:any)=>m.target==="chat:failure")).toHaveLength(1);expect(failedMail.outbox.find((m:any)=>m.target==="chat:failure").text).toContain("Check Codex authentication");
+  expect(failedMail.failures.filter((m:any)=>m.turnId===failedMail.inbox.find((m:any)=>m.id==="failed-owner-input").turnId)).toHaveLength(1);
+  expect(JSON.stringify(failedMail.failures)).not.toContain("fixture-secret");
+  const stop=await exec([bridge,"lead-detach","--thread-id",threadId]);expect(stop.code).toBe(0);expect(JSON.parse(stop.out)).toMatchObject({detached:true});
+  expect((await exec([bridge,"status"])).code).toBe(1);await expect(ipc(serviceSocket(state.dir),saved.token,"status")).rejects.toThrow("Forbidden");
+  const deniedMarker=join(state.dir,"denied-local-command");
+  for(const args of [["heavy","denied","--",process.execPath,"-e",`await Bun.write(${JSON.stringify(deniedMarker)},"executed")`],
+    ["session-host","--state-dir",state.dir,"--key","denied-worker"],["session-host-start","--state-dir",state.dir,"--key","denied-worker"],["migrate","--apply"],["serve"],["transcribe","fixture.wav"],["send","slack","--to","fixture","--text","no send"]]){
+   const denied=await exec([bridge,...args]);expect(denied.code).toBe(1);expect(denied.err).toContain(`Scoped context cannot invoke local command ${args[0]}`);
+  }
+  expect(existsSync(deniedMarker)).toBe(false);expect(existsSync(join(state.dir,"hosts/denied-worker.error.json"))).toBe(false);expect(existsSync(join(state.dir,"heavy"))).toBe(false);
+  const scopedHelp=await exec([bridge,"help"]);expect(scopedHelp.code).toBe(0);expect(scopedHelp.out).toContain("lead-detach");expect(scopedHelp.out).not.toContain("migrate");
+  const second=JSON.parse((await exec([process.execPath,cli,"lead-attach","--thread-id",threadId,"--pane","current:p","--cwd",state.dir])).out);expect(second.bridge).not.toBe(bridge);expect((await exec([bridge,"status"])).code).toBe(1);
+  await call("lead-detach",{threadId});
+  const observer=await connectObserver(socketPath,500);try{expect((await observer.read<any>("thread/read",{threadId})).thread.id).toBe(threadId);}finally{observer.close();}
+  const calls=readFileSync(join(state.dir,"external-codex-calls.jsonl"),"utf8").trim().split("\n").map(l=>JSON.parse(l));
+  expect(calls.filter(a=>a[0]==="queue")).toHaveLength(2);expect(calls.every(a=>a.join(" ")==="app-server daemon version"||a[0]==="queue")).toBe(true);
+  const herdrCalls=readFileSync(join(state.dir,"fixture-herdr-calls.jsonl"),"utf8").trim().split("\n").map(l=>JSON.parse(l));expect(herdrCalls.every(a=>a[0]==="agent"&&a[1]==="get")).toBe(true);
+  daemon!.kill("SIGTERM");await daemon!.exited;expect(await logs.err).toBe("");
+ }finally{daemon?.kill();if(daemon)await daemon.exited;server.stop(true);state.done();}
 },30000);

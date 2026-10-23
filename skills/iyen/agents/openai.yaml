@@ -1,0 +1,4 @@
+interface:
+  display_name: "이연 모드"
+  short_description: "지금 열린 Codex 대화를 이연으로 연결하고 모드를 시작하거나 종료"
+  default_prompt: "$iyen 지금 이 대화에서 이연 모드를 시작해줘."

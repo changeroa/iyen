@@ -2,9 +2,9 @@
 
 # Dori — Codex runtime
 
-Dori is an always-on messenger lead that delegates work into independent Codex sessions in Herdr tabs. The owner still talks to one bot; the lead keeps messenger threads, lane identity, progress and verified completion together.
+Iyen mode turns the current Codex conversation into the messenger lead. Ask “이연 모드 시작” with the `iyen` skill installed: the same session receives owner messages and delegates work into independent worker sessions. No separate lead session is created.
 
-The lead and every lane now run a **real interactive Codex TUI in Herdr**, connected to a dedicated app-server endpoint. `dori serve` owns monitors and durable state; Codex owns reasoning, tools, turns and native goals; Herdr owns TUI start/resume, prompts, controls and exit. A read-only observer verifies exact persisted operation markers and turn/goal state; idle status is never a delivery receipt. Managed agents call a scoped stdio MCP tool, preserving the command sandbox. OMO is not required.
+Activation requires the current Herdr session to be loaded in the running local Codex shared daemon; an unobservable standalone session is refused. The lead uses that existing session and daemon. Each worker lane runs a **real interactive Codex TUI in Herdr** connected to its own app-server endpoint. `dori serve` owns monitors and durable state; Codex owns reasoning, tools, turns and native goals; Herdr owns TUI start/resume, prompts, controls and exit. A read-only observer verifies exact persisted operation markers and turn/goal state; idle status is never a delivery receipt. Workers call a scoped stdio MCP tool. The existing lead uses a generation-scoped command bridge without changing its sandbox or loading a new MCP server. OMO is not required.
 
 ## Install and start
 
@@ -16,14 +16,17 @@ bun install --frozen-lockfile
 bun link
 ```
 
-For a new installation, copy `skills/dori-mode/references/config.example.json` to `~/.dori/config.json`. Set `defaultCwd`, `laneWorkspace` for workers, optional `leadWorkspace` for the lead, thread hooks and owner-filtered ingress. When omitted, `leadWorkspace` falls back to `laneWorkspace`. Existing config must be migrated, not overwritten.
+For a new installation, copy `skills/dori-mode/references/config.example.json` to `~/.dori-codex/config.json`. Set `defaultCwd`, an existing `laneWorkspace` for workers, thread hooks and owner-filtered ingress. Existing config must be migrated, not overwritten.
 
 ```sh
+export DORI_CONFIG="$HOME/.dori-codex/config.json"
 dori doctor
 dori serve
-# In another terminal:
-dori lead
+# In the current Codex session, with its verified UUID and Herdr pane:
+python3 /path/to/iyen/skills/iyen/scripts/activate.py start --session UUID --pane PANE
 ```
+
+Install the activation skill by linking `/path/to/iyen/skills/iyen` into `~/.codex/skills/iyen`. The helper returns a scoped executable; lead commands use that path rather than an old `dori` from PATH. `stop --session UUID` detaches routing while leaving the Codex conversation open. The service holds delivery while the session is busy or unavailable.
 
 Doctor checks the pinned runtime, protocol, authentication metadata and models without calling a model. A local Codex login is used normally; secrets stay out of config and logs. No default model replacement occurs on failure.
 

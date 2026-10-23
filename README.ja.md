@@ -2,7 +2,7 @@
 
 # Dori — Codex ランタイム
 
-リードとすべての作業レーンを Codex app-server で実行します。Herdr のタブ、メッセンジャーのスレッド、進捗報告、5 分間の完了確認は維持します。OMO のインストールは不要です。
+Iyen モードは現在の Codex 会話をリードとして接続します。「이연 모드 시작」で開始し、別のリードは起動しません。独立した Codex セッションは委任するワーカーだけに使用します。
 
 Codex CLI **0.163.0**, Bun 1.3+, Herdr, git, gh.
 
@@ -10,11 +10,12 @@ Codex CLI **0.163.0**, Bun 1.3+, Herdr, git, gh.
 cd skills/dori-mode/scripts
 bun install --frozen-lockfile
 bun link
-# Configure ~/.dori/config.json from references/config.example.json
+# Configure ~/.dori-codex/config.json from references/config.example.json
+export DORI_CONFIG="$HOME/.dori-codex/config.json"
 dori doctor
 dori serve
-# Another terminal:
-dori lead
+# In the existing Codex session:
+python3 /path/to/iyen/skills/iyen/scripts/activate.py start --session UUID --pane PANE
 ```
 
 既存設定を上書きせず、旧ワーカーを停止してから migrate を実行してください。進行中のレーンには停止確認と引き継ぎ文書が必要です。旧セッション ID は Codex thread ID に変換しません。実際のメッセンジャーには ACK 後にカーソルを進める ingress アダプターが必要です。
@@ -32,6 +33,6 @@ bun run typecheck
 - [Sessions](skills/dori-mode/references/sessions.md)
 - [Technical specification](docs/specs/codex-runtime-migration.md)
 
-依頼の振り分け前に `dori work similar --title "作業"` で履歴を確認し、類似作業が `workThresholdSec`（既定120秒）以上ならレーンへ委任します。小さな直接作業は `dori work start --title "作業"` / `dori work stop ID` で計測し、最終報告に開始・終了時刻と所要秒数を含めます。複雑な作業は範囲と完了条件を明示したレーンへ分割し、統合後に検証します。CodexリードはMCPの `work-similar`、`work-start`、`work-stop` を使います。
+依頼の振り分け前に `dori work similar --title "作業"` で履歴を確認し、類似作業が `workThresholdSec`（既定120秒）以上ならレーンへ委任します。小さな直接作業は `dori work start --title "作業"` / `dori work stop ID` で計測し、最終報告に開始・終了時刻と所要秒数を含めます。複雑な作業は範囲と完了条件を明示したレーンへ分割し、統合後に検証します。リードは起動時に返される専用 bridge の `work similar`、`work start`、`work stop` を使います。
 
 MIT.

@@ -1,6 +1,6 @@
 ---
 name: dori-mode
-description: Turns a coding agent into a "Dori", an always-on messenger agent that takes requests from its owner over Telegram or Discord, runs the real work in herdr sessions it launches and tracks, and reports back in threads. Use when the user says "Dori mode", "<name> mode", "be my Dori", asks to set up an always-on messenger agent, or asks to launch, track, adopt or close agent sessions (lanes) with a session registry and a 5-minute done-claim rule.
+description: Operate Dori worker lanes and messenger service controls for an attached Iyen lead. Use for launching, reporting, verifying or closing registered work lanes. Use the iyen skill to activate the current conversation as the lead.
 ---
 
 # Dori mode
@@ -11,17 +11,17 @@ This file is the operating contract. Setup steps, the session protocol and the s
 
 ## First: your name
 
-Before anything else, ask the owner what to call you. Plain "Dori" is fine, and so is a name ending in Dori (ShipDori, WorkDori), so several Doris can run side by side. Use that name everywhere: the bot's display name, your sign-off, and the mode itself, which you remember as "<name> mode" so the owner can switch it on again in one line.
+Reuse the existing owner-selected identity. For a genuinely new installation without an identity, ask the owner what to call you. Plain "Dori" is fine, and so is a name ending in Dori (ShipDori, WorkDori), so several Doris can run side by side. Use that name everywhere: the bot's display name, your sign-off, and the mode itself, which you remember as "<name> mode" so the owner can switch it on again in one line.
 
 ## Setup
 
-Run once, in order. Details and commands: `references/setup.md`.
+These are new-installation steps only. An assigned worker executes its brief and does not onboard the owner, start a service, or activate a lead. Existing installations keep their identity and messenger configuration. Details: `references/setup.md`.
 
-1. Use Codex CLI 0.163.0 and herdr. The lead and every lane are real interactive Codex TUIs, started and controlled through Herdr. Each TUI connects to its own protected app-server endpoint; an off-pane host observes it read-only and supervises its lifetime.
+1. Use Codex CLI 0.163.0 and Herdr. Start Iyen in the existing conversation with the `iyen` activation skill. A separate lead session is never created. Worker lanes use their own managed Codex TUIs and protected app-server endpoints.
 2. Install agent-messenger, ask the owner which platform (Telegram, Discord, Slack, ...), and wait for the answer. If it is Slack, also ask: user token (a real member with a paid seat the owner pays for, sees everything that member sees, can show online) or bot token (an app, no seat cost, only invited channels and its scopes). Give that trade-off in one short list and wait.
 3. Finish every login in the browser, create the bot, give it its avatar (default `assets/dori-avatar.png`; the owner may swap it), and greet the owner through it before doing anything else.
 4. Install the scripts in `scripts/` (one command, see `references/setup.md`) and write `~/.dori/config.json` from `references/config.example.json`.
-5. Run dori doctor, then dori serve and dori lead. Configure an owner-filtered ingress adapter and thread hooks. The service supervises monitors independently of the lead turn. Transcribe voice with dori transcribe before delivering it through ingress.
+5. Run dori doctor and dori serve, then activate the current verified session with `iyen`. Configure an owner-filtered ingress adapter and thread hooks. The service supervises monitors independently of the lead turn. Transcribe voice with dori transcribe before delivering it through ingress.
 6. Run onboarding (below), unless it has been done before.
 
 ## Onboarding
@@ -95,7 +95,7 @@ Real work runs in its own herdr tab, called a lane. The protocol, with the reaso
 
 ## Runtime tool
 
-In a managed Codex session, use the required dori_runtime MCP control tool. CLI examples in this skill correspond to action plus args: text is supplied directly instead of text-file, and eventId/operationId remain stable. The lead uses `work-similar` with `{title,tags}` at intake, `work-start` with `{title,tags,thread,operationId}` before direct work, and `work-stop` with `{id}` before the final reply. Keep a stable UUID `operationId` for `work-start`; it is also the timer id and makes a repeated start safe. Results contain `workThresholdSec` and a `work` record (or `matches` for similarity). Work timer actions are lead/operator-only. The tool carries your scoped capability. Do not invoke the CLI through the sandbox or broaden network access to reach the service. Operators can use the CLI normally.
+The attached lead uses the absolute scoped bridge returned by activation. In a managed worker Codex session, use the required dori_runtime MCP control tool. CLI examples in this skill correspond to action plus args: text is supplied directly instead of text-file, and eventId/operationId remain stable. The equivalent MCP timer actions are `work-similar` with `{title,tags}` at intake, `work-start` with `{title,tags,thread,operationId}` before direct work, and `work-stop` with `{id}` before the final reply. Keep a stable UUID `operationId` for `work-start`; it is also the timer id and makes a repeated start safe. Results contain `workThresholdSec` and a `work` record (or `matches` for similarity). Work timer actions are lead/operator-only. The tool carries your scoped capability. Do not invoke the CLI through the sandbox or broaden network access to reach the service. Operators can use the CLI normally.
 
 ## Scripts
 
@@ -104,7 +104,7 @@ In a managed Codex session, use the required dori_runtime MCP control tool. CLI 
 | Command | Does |
 |---|---|
 | `dori work start` / `stop` / `similar` | direct-task timestamps and duration evidence for routing |
-| `dori serve` / `dori lead` | supervise monitors and open the Codex lead |
+| `dori serve` / `dori lead-attach` | supervise monitors and attach the existing Codex conversation |
 | `dori launch` / `dori adopt` | launch a Codex lane or explicitly transfer a recorded thread |
 | `dori input` / `dori report` / `dori reply` | send input, report milestones, reply in messenger threads |
 | `dori sync [--write]` | inspect identity and pane drift |

@@ -12,7 +12,9 @@ import { atomicJson } from "./journal.ts";
 import { join } from "node:path";
 const help = `dori — Codex-only messenger lead and lanes
 
-  doctor | serve | lead | status [key]
+  doctor | serve | status [key]
+  lead-attach --thread-id UUID --pane ID --cwd DIR
+  lead-detach --thread-id UUID
   launch KEY --title T --brief FILE --done SIGNALS [--thread REF] [--cwd DIR] [--model M] [--worktree]
   input KEY --text-file FILE [--operation-id ID]
   report KEY --kind milestone|blocker|question|done --text-file FILE --event-id ID
@@ -35,6 +37,29 @@ const help = `dori — Codex-only messenger lead and lanes
 Always start dori serve before lifecycle commands. Operations with unknown delivery are not replayed.
 Use --operation-id to repeat a request safely; status/mail list show durable outcomes.`;
 const [command = "", ...rest] = process.argv.slice(2);
+const scopedInvocation = ["DORI_CONTEXT", "DORI_LANE_KEY", "DORI_LANE_TOKEN"].some(name => process.env[name] !== undefined);
+// Scoped executables are service clients, never entrypoints to local lifecycle,
+// migration or messenger utilities. Apply this gate before any local handler,
+// even when the context is missing, malformed or already revoked.
+const scopedCommands = new Set(["", "help", "status", "can-launch", "launch", "adopt", "input", "reply", "report", "claim-done", "object-done", "pause", "resume", "close", "reopen", "recover", "sync", "approval", "mail", "work", "lead-detach", "watch", "freshness", "dead-panes", "guard", "mcp-server"]);
+const scopedHelp = `iyen — scoped service commands
+
+  help | status [key] | can-launch
+  lead-detach --thread-id UUID
+  launch KEY --title T --brief FILE --done SIGNALS [--thread REF] [--cwd DIR] [--model M] [--worktree]
+  input KEY --text-file FILE [--operation-id ID]
+  reply --thread REF --text-file FILE [--operation-id ID]
+  report KEY --kind milestone|blocker|question|done --text-file FILE --event-id ID
+  claim-done KEY --evidence TEXT | object-done KEY --reason TEXT
+  pause KEY | resume KEY | close KEY [--note TEXT]
+  recover KEY | reopen KEY [--text-file FILE]
+  adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS --transfer-confirmed
+  sync [--write] | approval list | mail list
+  work start --title T [--tag TAG ...] [--thread REF] [--operation-id UUID]
+  work stop ID | work similar [--title T] [--tag TAG ...]
+
+Service authorization applies to every operation. Attached lead lifecycle uses lead-detach.
+Unknown deliveries are never automatically replayed.`;
 const flags = parseArgs({ args: rest, allowPositionals: true, strict: true, options: Object.fromEntries([
   ...["title", "brief", "done", "thread", "model", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "response-file", "state-dir", "handoff-file", "key", "box", "state"].map(k => [k, { type: "string" }]),
   ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help", "new-session"].map(k => [k, { type: "boolean" }]),
@@ -46,7 +71,8 @@ const opt = (name: string): string | undefined => typeof values[name] === "strin
 const need = (name: string): string => { const value = opt(name); if (!value) throw new Error(`--${name} required`); return value; };
 const output = (value: unknown) => console.log(typeof value === "string" ? value : JSON.stringify(value, null, 2));
 try {
-  if (!command || values.help || command === "help") { console.log(help); process.exit(0); }
+  if (scopedInvocation && !scopedCommands.has(command)) throw new Error(`Scoped context cannot invoke local command ${command || "help"}; use service commands only`);
+  if (!command || values.help || command === "help") { console.log(scopedInvocation ? scopedHelp : help); process.exit(0); }
   if (command === "migrate") { output(await migrate(Boolean(values.apply), undefined, opt("handoff-file") ? await Bun.file(need("handoff-file")).json() : undefined)); process.exit(0); }
   if (command === "session-host") {
     const stateDir = opt("state-dir") ?? process.env.DORI_STATE_DIR ?? defaultConfig().stateDir;
@@ -60,12 +86,14 @@ try {
   if (command === "serve") { await serve(config); process.exit(0); }
   if (command === "doctor") { const result = await doctor(config); output(result); process.exit(result.ok ? 0 : 2); }
   const key = flags.positionals[0] ?? process.env.DORI_LANE_KEY;
-  if (await utilities(command, key, rest, config, opt)) process.exit(process.exitCode ?? 0);
+  if (!scopedInvocation && await utilities(command, key, rest, config, opt)) process.exit(process.exitCode ?? 0);
   const call = serviceClient(config);
   const text = opt("text-file") ? await Bun.file(need("text-file")).text() : opt("text");
   const operationId = opt("operation-id") ?? crypto.randomUUID();
   let result: any;
   switch (command) {
+    case "lead": case "lead-attach": result = await call("lead-attach", { threadId: need("thread-id"), pane: need("pane"), cwd: need("cwd") }); break;
+    case "lead-detach": result = await call(command, { threadId: need("thread-id") }); break;
     case "work":
       if (key === "start") result = await call("work-start", { title: need("title"), tags: values.tag ?? [], thread: opt("thread"), operationId });
       else if (key === "stop") result = await call("work-stop", { id: flags.positionals[1] ?? (() => { throw new Error("work stop needs a work id"); })() });
@@ -80,7 +108,7 @@ try {
     case "object-done": result = await call(command, { key, reasons: values.reason }); break;
     case "pause": case "resume": case "close": result = await call(command, { key, note: opt("note") }); break;
     case "reopen": case "recover": result = await call(command, { key, text, operationId, threadId: opt("thread-id"), newSession: Boolean(values["new-session"]), handoff: opt("handoff-file") ? await Bun.file(need("handoff-file")).text() : undefined }); break;
-    case "status": case "lead": case "can-launch": result = await call(command, { key }); break;
+    case "status": case "can-launch": result = await call(command, { key }); break;
     case "sync": result = await call(command, { write: Boolean(values.write) }); break;
     case "approval":
       result = key === "list" ? await call("approval-list") : key === "respond" ? await call("approval-respond", { id: flags.positionals[1], response: await Bun.file(need("response-file")).json() }) : (() => { throw new Error("approval list|respond required"); })(); break;
