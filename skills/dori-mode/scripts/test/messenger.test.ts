@@ -19,6 +19,7 @@ const fakeHttp = (script: Script) => {
   return { http, seen };
 };
 const ok = (body: unknown, status = 200, headers: Record<string, string> = {}): HttpResponse => ({ status, headers, body: JSON.stringify(body) });
+const apiMethod = (req: HttpRequest): string => new URL(req.url).pathname.split("/").pop() ?? "";
 const sleeps = () => {
   const waited: number[] = [];
   const clock = { ...fakeClock(0), sleep: async (ms: number) => { waited.push(ms); } };
@@ -35,7 +36,7 @@ const fakeTimers = () => {
 
 test("a Slack post that hits the rate limit waits retry-after seconds, retries, and lands in the thread", async () => {
   const { http, seen } = fakeHttp((req, n) => {
-    if (req.url.endsWith("conversations.replies")) return ok({ ok: true, messages: [{ ts: "100.1" }] });
+    if (apiMethod(req) === "conversations.replies") return ok({ ok: true, messages: [{ ts: "100.1" }] });
     return n === 2 ? ok({ ok: false, error: "ratelimited" }, 429, { "retry-after": "3" }) : ok({ ok: true, channel: "C1", ts: "111.222" });
   });
   const { clock, waited } = sleeps();
@@ -46,74 +47,95 @@ test("a Slack post that hits the rate limit waits retry-after seconds, retries, 
 });
 
 test("a Slack thread is checked in the target channel before posting", async () => {
-  const { http, seen } = fakeHttp((req) => req.url.endsWith("conversations.replies")
+  const { http, seen } = fakeHttp((req) => apiMethod(req) === "conversations.replies"
     ? ok({ ok: true, messages: [{ ts: "100.1" }] })
     : ok({ ok: true, channel: "C1", ts: "111.222" }));
   const posted = await new Slack(http, sleeps().clock, { token: "t" }).post("C1", "reply", "100.1");
   expect(posted).toEqual({ channel: "C1", ts: "111.222" });
-  expect(seen.map((req) => req.url.split("/").pop())).toEqual(["conversations.replies", "chat.postMessage"]);
-  expect(JSON.parse(String(seen[0]?.body))).toEqual({ channel: "C1", ts: "100.1", limit: 1 });
+  expect(seen.map((req) => apiMethod(req))).toEqual(["conversations.replies", "chat.postMessage"]);
+  expect(seen[0]?.method).toBe("GET");
+  expect(Object.fromEntries(new URL(seen[0]!.url).searchParams)).toEqual({ channel: "C1", ts: "100.1", limit: "1" });
+  expect(seen[0]?.body).toBeUndefined();
+  expect(seen[1]?.method).toBe("POST");
+  expect(seen[1]?.headers?.["Content-Type"]).toBe("application/json; charset=utf-8");
   expect(JSON.parse(String(seen[1]?.body))).toEqual({ channel: "C1", text: "reply", thread_ts: "100.1" });
 });
 
-for (const reason of ["thread_not_found", "channel_not_found", "missing_scope"]) {
+test("Slack replies use encoded GET query parameters with exact timestamps and header-only credentials", async () => {
+  const { http, seen } = fakeHttp(() => ok({ ok: true, messages: [] }));
+  await new Slack(http, sleeps().clock, { token: "test-token", cookie: "test-cookie" }, "https://slack.test/api").call("conversations.replies", {
+    channel: "D1", ts: "1792714991.072059", oldest: "1792714991.072058", inclusive: false, limit: 50, cursor: "next +/=&?",
+  });
+  expect(seen).toHaveLength(1);
+  const req = seen[0]!;
+  expect(req.method).toBe("GET");
+  expect(new URL(req.url).origin).toBe("https://slack.test");
+  expect(new URL(req.url).pathname).toBe("/api/conversations.replies");
+  expect(Object.fromEntries(new URL(req.url).searchParams)).toEqual({
+    channel: "D1", ts: "1792714991.072059", oldest: "1792714991.072058", inclusive: "false", limit: "50", cursor: "next +/=&?",
+  });
+  expect(req.headers).toEqual({ Authorization: "Bearer test-token", Cookie: "d=test-cookie" });
+  expect(req.body).toBeUndefined();
+});
+
+for (const reason of ["thread_not_found", "channel_not_found", "missing_scope", "invalid_arguments"]) {
   test(`a Slack thread check returning ${reason} refuses the post`, async () => {
-    const { http, seen } = fakeHttp((req) => req.url.endsWith("conversations.replies")
+    const { http, seen } = fakeHttp((req) => apiMethod(req) === "conversations.replies"
       ? ok({ ok: false, error: reason })
       : ok({ ok: true, channel: "C1", ts: "111.222" }));
     await expect(new Slack(http, sleeps().clock, { token: "t" }).post("C1", "reply", "100.1")).rejects.toThrow(`THREAD_NOT_IN_CHANNEL C1 100.1: ${reason}`);
-    expect(seen.map((req) => req.url.split("/").pop())).toEqual(["conversations.replies"]);
+    expect(seen.map((req) => apiMethod(req))).toEqual(["conversations.replies"]);
   });
 }
 
-for (const messages of [[{ ts: "99.9" }], [], undefined, [null], [{ text: "missing timestamp" }]]) {
+for (const messages of [[{ ts: "99.9" }], [{ ts: "99.9" }, { ts: "100.1" }], [{ ts: 100.1 }], [], undefined, [null], [{ text: "missing timestamp" }]]) {
   test(`a Slack thread check with an absent or different first root refuses the post: ${JSON.stringify(messages)}`, async () => {
-    const { http, seen } = fakeHttp((req) => req.url.endsWith("conversations.replies")
+    const { http, seen } = fakeHttp((req) => apiMethod(req) === "conversations.replies"
       ? ok({ ok: true, messages })
       : ok({ ok: true, channel: "C1", ts: "111.222" }));
     await expect(new Slack(http, sleeps().clock, { token: "t" }).post("C1", "reply", "100.1")).rejects.toThrow("THREAD_NOT_IN_CHANNEL C1 100.1: root_mismatch");
-    expect(seen.map((req) => req.url.split("/").pop())).toEqual(["conversations.replies"]);
+    expect(seen.map((req) => apiMethod(req))).toEqual(["conversations.replies"]);
   });
 }
 
 test("a Slack thread check transport failure refuses the post with a single-line reason", async () => {
   const { http, seen } = fakeHttp(() => { throw new TypeError("network\nunavailable"); });
   await expect(new Slack(http, sleeps().clock, { token: "t" }).post("C1", "reply", "100.1")).rejects.toThrow("THREAD_NOT_IN_CHANNEL C1 100.1: network unavailable");
-  expect(seen.map((req) => req.url.split("/").pop())).toEqual(["conversations.replies"]);
+  expect(seen.map((req) => apiMethod(req))).toEqual(["conversations.replies"]);
 });
 
 test("a Slack thread check retries rate limits with the existing backoff before posting", async () => {
   const { http, seen } = fakeHttp((req, n) => {
     if (n === 1) return ok({ ok: false, error: "ratelimited" }, 429, { "retry-after": "3" });
-    return req.url.endsWith("conversations.replies")
+    return apiMethod(req) === "conversations.replies"
       ? ok({ ok: true, messages: [{ ts: "100.1" }] })
       : ok({ ok: true, channel: "C1", ts: "111.222" });
   });
   const { clock, waited } = sleeps();
   expect(await new Slack(http, clock, { token: "t" }).post("C1", "reply", "100.1")).toEqual({ channel: "C1", ts: "111.222" });
   expect(waited).toEqual([3000]);
-  expect(seen.map((req) => req.url.split("/").pop())).toEqual(["conversations.replies", "conversations.replies", "chat.postMessage"]);
+  expect(seen.map((req) => apiMethod(req))).toEqual(["conversations.replies", "conversations.replies", "chat.postMessage"]);
 });
 
 test("a Slack thread check exhausted by server errors refuses the post", async () => {
   const { http, seen } = fakeHttp(() => ok({ ok: false, error: "service_unavailable" }, 503));
   const { clock, waited } = sleeps();
   await expect(new Slack(http, clock, { token: "t" }).post("C1", "reply", "100.1")).rejects.toThrow("THREAD_NOT_IN_CHANNEL C1 100.1: service_unavailable");
-  expect(seen.map((req) => req.url.split("/").pop())).toEqual(Array(5).fill("conversations.replies"));
+  expect(seen.map((req) => apiMethod(req))).toEqual(Array(5).fill("conversations.replies"));
   expect(waited).toEqual([1000, 2000, 4000, 8000]);
 });
 
 test("a Slack post without a thread makes only the original post request", async () => {
   const { http, seen } = fakeHttp(() => ok({ ok: true, channel: "C1", ts: "111.222" }));
   expect(await new Slack(http, sleeps().clock, { token: "t" }).post("C1", "hello")).toEqual({ channel: "C1", ts: "111.222" });
-  expect(seen.map((req) => req.url.split("/").pop())).toEqual(["chat.postMessage"]);
+  expect(seen.map((req) => apiMethod(req))).toEqual(["chat.postMessage"]);
   expect(JSON.parse(String(seen[0]?.body))).toEqual({ channel: "C1", text: "hello" });
 });
 
 test("a Slack edit makes only the original update request", async () => {
   const { http, seen } = fakeHttp(() => ok({ ok: true }));
   await new Slack(http, sleeps().clock, { token: "t" }).edit("C1", "111.222", "updated");
-  expect(seen.map((req) => req.url.split("/").pop())).toEqual(["chat.update"]);
+  expect(seen.map((req) => apiMethod(req))).toEqual(["chat.update"]);
   expect(JSON.parse(String(seen[0]?.body))).toEqual({ channel: "C1", ts: "111.222", text: "updated" });
 });
 

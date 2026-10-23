@@ -23,7 +23,17 @@ export class Slack {
   }
 
   async call(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const res = await withBackoff(this.http, this.clock, { method: "POST", url: `${this.base}/${method}`, headers: this.headers(true), body: JSON.stringify(params) });
+    const url = new URL(`${this.base}/${method}`);
+    // conversations.replies expects query parameters; a JSON POST can lose its required arguments.
+    const read = method === "conversations.replies";
+    if (read) {
+      for (const [key, value] of Object.entries(params)) {
+        if (value !== undefined) url.searchParams.set(key, String(value));
+      }
+    }
+    const res = await withBackoff(this.http, this.clock, read
+      ? { method: "GET", url: url.toString(), headers: this.headers(false) }
+      : { method: "POST", url: url.toString(), headers: this.headers(true), body: JSON.stringify(params) });
     const body = JSON.parse(res.body || "{}") as Record<string, unknown>;
     if (res.status !== 200 || body.ok !== true) throw new MessengerError(`slack ${method}: ${String(body.error ?? res.status)}`, res.status, String(body.error ?? ""));
     if (this.ledger && method === "chat.postMessage" && typeof body.ts === "string") {
