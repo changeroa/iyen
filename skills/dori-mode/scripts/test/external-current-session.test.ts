@@ -11,8 +11,8 @@ import { deadPaneTick } from "../src/dead-panes.ts";
 import { withState } from "./fakes.ts";
 import type { Runner } from "../src/run.ts";
 
-const threadId = "01a166ff-9c30-74c0-a458-32c6abf5c54d";
-const otherId = "01a166ff-9c30-74c0-a458-32c6abf5c54e";
+const threadId = "11111111-1111-4111-8111-111111111111";
+const otherId = "22222222-2222-4222-8222-222222222222";
 let h: ReturnType<typeof fixture>;
 function fixture() {
   const state = withState(), socketPath = join(socketDir(state.dir), "shared.sock"), calls: string[][] = [], reads: string[] = [];

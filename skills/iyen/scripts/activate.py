@@ -55,6 +55,8 @@ def verify_lead(lead, session, pane):
         raise ActivationError("Service lead does not match this attached session")
     if (lead.get("dispatchBlocked") or runtime.get("held")
             or lead.get("status") != "working"
+            or lead.get("identityVerified") is not True
+            or lead.get("readiness") not in ("ready", "busy")
             or runtime.get("state") not in ("idle", "running")):
         raise ActivationError("The attached lead is not ready; inspect service status")
 
@@ -114,7 +116,7 @@ def main(argv=None):
         print(json.dumps(activate(args), ensure_ascii=False))
         return 0
     except (ActivationError, OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
-        print(json.dumps({"status": "not_active", "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        print(json.dumps({"status": "unconfirmed", "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 1
 
 

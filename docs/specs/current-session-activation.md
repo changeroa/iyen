@@ -56,6 +56,5 @@ observed identity. This implementation must not weaken that managed guard to
 attach an ordinary session.
 
 Validate and review the change, merge the PR into `main`, then install the merged
-source and verify the deployed SHA. The canonical source remains
-`/Users/victor/projects/iyen`; temporary writer worktrees must be removed after
-their changes are integrated and preserved.
+source and verify the deployed SHA. Keep the canonical checkout recoverable; temporary writer worktrees must be
+removed after their changes are integrated and preserved.

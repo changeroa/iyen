@@ -9,6 +9,10 @@ description: Start or stop Iyen (이연) mode in the current Codex session. Use 
 lead. Keep the same conversation, pane, model, permissions and working directory.
 Separate sessions are for delegated workers, not another Iyen lead.
 
+The session must be visible in Herdr and loaded in the running local Codex shared
+daemon. A standalone session without that observable connection is refused; do
+not silently replace or restart it to work around the refusal.
+
 ## Start
 
 1. Identify this session's UUID from its verified runtime context and match it to

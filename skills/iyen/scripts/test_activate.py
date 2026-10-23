@@ -8,8 +8,8 @@ from unittest.mock import patch
 
 import activate
 
-SESSION = "01a166ff-9c30-74c0-a458-32c6abf5c54d"
-PANE = "w1M:pM"
+SESSION = "11111111-1111-4111-8111-111111111111"
+PANE = "w1:p1"
 
 
 class ActivationTests(unittest.TestCase):
@@ -28,6 +28,7 @@ class ActivationTests(unittest.TestCase):
                       "agent_session": {"agent": "codex", "kind": "id", "value": SESSION}}
         self.lead = {"key": "lead", "role": "lead", "pane": PANE, "status": "working",
                      "bridge": str(self.bridge), "dispatchBlocked": False,
+                     "identityVerified": True, "readiness": "busy",
                      "runtime": {"backend": "external-current-session", "threadId": SESSION,
                                  "state": "running", "held": False}}
         self.calls = []
@@ -63,7 +64,7 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 3)
 
     def test_other_pane_never_reaches_mutating_command(self):
-        self.args.pane = "w1M:pZ"
+        self.args.pane = "w1:p9"
         with self.assertRaisesRegex(activate.ActivationError, "different session"):
             self.run_helper()
         self.assertEqual(len(self.calls), 1)
@@ -78,7 +79,7 @@ class ActivationTests(unittest.TestCase):
         def drift(argv, env=None, timeout=30):
             result = original(argv, env, timeout)
             if argv[0] == str(self.bridge):
-                result["runtime"]["threadId"] = "01a16705-7293-7110-96ec-f6f912bd2628"
+                result["runtime"]["threadId"] = "22222222-2222-4222-8222-222222222222"
             return result
         with patch.dict(os.environ, {}, clear=True), patch.object(activate.shutil, "which", return_value="/usr/bin/bun"), patch.object(activate, "command", side_effect=drift):
             with self.assertRaisesRegex(activate.ActivationError, "does not match"):
@@ -100,6 +101,11 @@ class ActivationTests(unittest.TestCase):
         self.args.action = "status"
         self.assertEqual(self.run_helper()["status"], "active")
         self.assertFalse(any("lead-attach" in argv for argv, _ in self.calls))
+
+    def test_unverified_public_status_cannot_report_active(self):
+        self.lead["identityVerified"] = False
+        with self.assertRaisesRegex(activate.ActivationError, "not ready"):
+            self.run_helper()
 
 
 if __name__ == "__main__":
