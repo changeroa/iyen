@@ -54,3 +54,10 @@ test("lead workspace is independent and falls back to lane workspace for existin
   expect(workspaceForRole({...config, leadWorkspace: "lead"}, "lane")).toBe("workers");
   expect(() => parseConfig({leadWorkspace: 5})).toThrow("leadWorkspace must be a string");
 });
+
+
+test("external binary selection is optional and validated independently of the managed pin", () => {
+  expect(parseConfig({}).runtime.externalBinary).toBeUndefined();
+  expect(parseConfig({ runtime: { externalBinary: "/external/codex-164" } }).runtime).toMatchObject({ binary: "codex", requiredVersion: "0.163.0", externalBinary: "/external/codex-164" });
+  for (const externalBinary of ["", " ", null, 7, {}]) expect(() => parseConfig({ runtime: { externalBinary } })).toThrow("externalBinary must be a nonempty");
+});

@@ -4,7 +4,7 @@
 
 Iyen 模式将当前 Codex 对话连接为主代理。请求“이연 모드 시작”即可启动，不创建另一个主代理。只有委派的工作任务使用独立 Codex 会话。
 
-Codex CLI **0.163.0**, Bun 1.3+, Herdr, git, gh.
+需要 Bun 1.3+、Herdr、git、gh 和 Codex CLI。连接的主代理支持 CLI 与守护进程版本相同的 **0.163.0** 或 **0.164.0**。托管工作进程继续使用配置中固定的版本（默认 **0.163.0**）。
 
 ```sh
 cd skills/dori-mode/scripts

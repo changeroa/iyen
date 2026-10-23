@@ -58,3 +58,22 @@ attach an ordinary session.
 Validate and review the change, merge the PR into `main`, then install the merged
 source and verify the deployed SHA. Keep the canonical checkout recoverable; temporary writer worktrees must be
 removed after their changes are integrated and preserved.
+
+## Shared daemon update recovery
+
+An owner message was acknowledged but remained queued after the shared daemon
+updated from 0.163.0 to 0.164.0. The attachment still used the 0.163.0 client and
+the external observer reused the managed-worker version pin. The resulting hold
+was invisible in the acknowledgment. Read-only inspection confirmed that the
+same session remained loaded and that the required 0.164.0 read protocol and
+queue arguments were compatible.
+
+External attachment supports explicitly tested matching client/daemon pairs,
+independently of managed worker version configuration. An explicit attachment
+request may rebind the same thread, pane, canonical cwd and socket to a supported
+binary after identity verification. It preserves the generation, capability and
+historical inbox exclusions. Pending eligible messages remain pending; uncertain
+deliveries never replay. Rebinding must fence stale observations and remain
+retryable after an interrupted persistence operation. Status exposes a sanitized
+hold reason; an acknowledgment during a hold must describe saved input waiting
+for reconnection rather than imply that processing started.

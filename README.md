@@ -8,7 +8,7 @@ Activation requires the current Herdr session to be loaded in the running local 
 
 ## Install and start
 
-Requirements: Bun 1.3+, Codex CLI **0.163.0**, Herdr, git; gh for GitHub Done signals and npm for published-package signals. Use the existing messenger integration or an ACK/replay adapter described below.
+Requirements: Bun 1.3+, Herdr, git, and Codex CLI. Attached leads support matching CLI/daemon versions **0.163.0** or **0.164.0**; managed workers retain their configured version pin (default **0.163.0**). Use gh for GitHub Done signals and npm for published-package signals. Use the existing messenger integration or an ACK/replay adapter described below.
 
 ```sh
 cd skills/dori-mode/scripts

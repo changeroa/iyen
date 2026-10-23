@@ -18,7 +18,7 @@ import type { RuntimeControl, RuntimeRef, RuntimeSnapshot } from "./runtime/type
 import { WorkTimers } from "./work.ts";
 import { turnFailure } from "./turn-failure.ts";
 import { DeliveryDeferred, Mailbox, postHook } from "./mailbox.ts";
-import { ExternalCurrentSession, observeExternal, sharedDaemon, THREAD_UUID, type Attachment } from "./runtime/external-current-session.ts";
+import { ExternalCurrentSession, ExternalSessionError, observeExternal, sharedDaemon, THREAD_UUID, type Attachment } from "./runtime/external-current-session.ts";
 import { connectObserver, receiptInTurns } from "./runtime/observer.ts";
 import { operationText } from "./runtime/herdr.ts";
 import type { Turn } from "./runtime/generated/v2/Turn.ts";
@@ -53,7 +53,7 @@ export class DoriService {
       return result;
     };
     const runtime: RuntimeControl = {
-      inspect: key => call(key, "inspect"),
+      inspect: key => this.dispatchQueue.run(key, () => call(key, "inspect")),
       input: (key, text, operationId) => this.dispatchQueue.run(key, async () => {
         const lane = await this.registry.read(key);
         if (!lane || lane.dispatchBlocked || statusOf(lane) === "closed") throw new Error("Lane dispatch is blocked");
@@ -85,11 +85,15 @@ export class DoriService {
     const saved = readJson<Attachment>(this.attachmentPath());
     if (lane.key !== "lead" || lane.runtime?.backend !== "external-current-session" || lane.runtime.external?.detachedAt || lane.runtime.state === "stopped" ||
         saved.instance !== lane.runtime.hostInstanceId || saved.generation !== lane.runtime.generation || saved.threadId !== lane.runtime.threadId || saved.pane !== lane.pane || saved.cwd !== lane.cwd ||
-        saved.socketPath !== lane.runtime.external?.socketPath || saved.binary !== lane.runtime.external.binary || saved.bridge !== lane.runtime.external.bridge) throw new Error("Stale or detached lead attachment");
+        saved.socketPath !== lane.runtime.external?.socketPath || saved.bridge !== lane.runtime.external.bridge ||
+        (saved.binary !== lane.runtime.external.binary || (saved.binaryVersion && saved.binaryVersion !== lane.runtime.binaryVersion)) &&
+          !(lane.runtime.external.rebind?.binary === saved.binary && lane.runtime.external.rebind.binaryVersion === saved.binaryVersion)) throw new Error("Stale or detached lead attachment");
     return saved;
   }
-  private async holdExternal(instance: string): Promise<void> {
-    await this.registry.update("lead", lane => lane.runtime?.hostInstanceId !== instance || lane.runtime.external?.detachedAt || lane.runtime.state === "stopped" ? lane : ({ ...lane, dispatchBlocked: true, holdReason: "recovery", runtime: { ...lane.runtime, held: true, state: "recovering", activeTurnId: undefined } }));
+  private async holdExternal(instance: string, error: unknown = new ExternalSessionError("identity-unverified", "Attached session identity unavailable; explicit attachment required.")): Promise<void> {
+    const reason = error instanceof ExternalSessionError ? error : new ExternalSessionError("identity-unverified", "Attached session could not be verified; delivery is waiting for reconnection.");
+    await this.registry.update("lead", lane => lane.runtime?.hostInstanceId !== instance || lane.runtime.external?.detachedAt || lane.runtime.state === "stopped" ? lane : ({ ...lane, dispatchBlocked: true, holdReason: "recovery", runtime: { ...lane.runtime, held: true, state: "recovering", activeTurnId: undefined,
+      external: { ...lane.runtime.external!, holdReason: lane.runtime.external?.holdReason ?? { code: reason.code, message: reason.message, at: new Date().toISOString() } } } }));
   }
   private async recordExternalFailures(saved: Attachment, turns: Turn[]): Promise<void> {
     const current = await this.registry.read("lead");
@@ -113,27 +117,32 @@ export class DoriService {
     if (!["inspect", "input"].includes(action)) throw new Error(`External current-session ${action} is unsupported; use lead-detach`);
     let saved: Attachment;
     try { saved = this.attachment(lane); }
-    catch (error) { await this.holdExternal(lane.runtime!.hostInstanceId); throw error; }
+    catch (error) { await this.holdExternal(lane.runtime!.hostInstanceId, new ExternalSessionError("attachment-inconsistent", "Attached session records are inconsistent; explicit attachment required.")); throw error; }
+    if (lane.runtime?.external?.rebind) {
+      await this.holdExternal(saved.instance, new ExternalSessionError("rebind-interrupted", "Attached runtime rebind incomplete; explicitly reattach to finish reconnection."));
+      throw new DeliveryDeferred("Attached runtime rebind incomplete; dispatch held");
+    }
     if (action === "input" && lane.dispatchBlocked) throw new DeliveryDeferred("Attached lead dispatch is held");
     let connected = false;
     try {
-      return await observeExternal(this.runner, this.config.runtime, saved, async observer => {
+      return await observeExternal(this.runner, this.config.runtime, { ...saved, binaryVersion: saved.binaryVersion ?? lane.runtime?.binaryVersion }, async observer => {
         connected = true;
         const session = new ExternalCurrentSession(observer, this.runner, this.config.runtime, saved, saved.binary, realClock, turns => this.recordExternalFailures(saved, turns));
-        if (action === "input") return session.input(args.text, args.operationId, () => this.holdExternal(saved.instance));
+        if (action === "input") return session.input(args.text, args.operationId, error => this.holdExternal(saved.instance, error));
         const snap = await session.inspect();
-        if (snap.state === "failed") await this.holdExternal(saved.instance);
+        if (snap.state === "failed") await this.holdExternal(saved.instance, new ExternalSessionError("runtime-failed", "Attached Codex session reports a runtime failure; explicit attachment required."));
         await this.registry.update(lane.key, current => current.runtime?.hostInstanceId !== saved.instance || current.runtime.external?.detachedAt ? current : ({ ...current,
           model: snap.model, runtime: { ...current.runtime, model: snap.model, effort: snap.effort, state: current.dispatchBlocked ? "recovering" : snap.state, activeTurnId: snap.activeTurnId } }));
         return snap;
       });
     } catch (error) {
-      if (!(error instanceof DeliveryDeferred)) await this.holdExternal(saved.instance);
+      if (!(error instanceof DeliveryDeferred)) await this.holdExternal(saved.instance, error);
       if (action === "input" && !connected) throw new DeliveryDeferred("Attached observer unavailable before submission; input remains queued");
       throw error;
     }
   }
-  private async publicLane(lane: Lane): Promise<any> {
+  private async publicLane(lane: Lane, dispatchLocked = false): Promise<any> {
+    if (lane.runtime?.backend === "external-current-session" && !dispatchLocked) return this.dispatchQueue.run(lane.key, async () => this.publicLane(await this.lane(lane.key), true));
     if (lane.runtime?.backend !== "external-current-session") return lane;
     const attached = !lane.runtime.external?.detachedAt && lane.runtime.state !== "stopped";
     const snap = attached ? await this.externalCall(lane, "inspect", {}).catch(() => null) as RuntimeSnapshot | null : null;
@@ -149,20 +158,39 @@ export class DoriService {
     const cwd = realpathSync(args.cwd), previous = await this.registry.read("lead");
     const same = previous?.runtime?.backend === "external-current-session" && !previous.runtime.external?.detachedAt && previous.runtime.state !== "stopped" && previous.runtime.threadId === args.threadId && previous.pane === args.pane && previous.cwd === cwd;
     if (previous?.runtime?.backend === "external-current-session" && !previous.runtime.external?.detachedAt && previous.runtime.state !== "stopped" && !same) throw new Error("A different lead is attached; explicitly detach it first");
-    const binary = resolveCodexBinary(this.config.runtime.binary);
-    const daemon = await sharedDaemon(this.runner, binary, this.config.runtime);
-    const observer = await connectObserver(daemon.socketPath, this.config.runtime.rpcTimeoutMs);
-    let snap: Awaited<ReturnType<ExternalCurrentSession["inspect"]>>;
+    // Matching identity may keep its existing capability across a binary upgrade.
+    // This also accepts either side of a previously interrupted, recorded rebind.
+    const saved = same ? this.attachment(previous) : undefined;
     try {
-      snap = await new ExternalCurrentSession(observer, this.runner, this.config.runtime, { threadId: args.threadId, pane: args.pane, cwd }, binary).inspect();
-    } finally { observer.close(); }
-    if (snap.state === "failed") throw new Error("Current Codex session reports a runtime failure; resolve it before attaching");
-    if (same) {
-      const saved = this.attachment(previous);
-      if (saved.socketPath !== daemon.socketPath || saved.binary !== binary) throw new Error("Attached daemon affinity changed; detach before reattaching");
-      await this.registry.update("lead", lane => ({ ...lane, dispatchBlocked: false, holdReason: undefined, runtime: { ...lane.runtime!, held: false, state: snap.state, activeTurnId: snap.activeTurnId } }));
-      return { attached: true, bridge: saved.bridge, lead: await this.publicLane(await this.lane("lead")), reused: true };
+      const binary = resolveCodexBinary(this.config.runtime.externalBinary ?? this.config.runtime.binary);
+      const daemon = await sharedDaemon(this.runner, binary, this.config.runtime);
+      if (saved && saved.socketPath !== daemon.socketPath) throw new ExternalSessionError("identity-unverified", "Attached daemon affinity changed; detach before attaching a different daemon.");
+      const observer = await connectObserver(daemon.socketPath, this.config.runtime.rpcTimeoutMs).catch(() => { throw new ExternalSessionError("runtime-unavailable", "Shared Codex observer unavailable; delivery is waiting for reconnection."); });
+      let snap: Awaited<ReturnType<ExternalCurrentSession["inspect"]>>;
+      try {
+        snap = await new ExternalCurrentSession(observer, this.runner, this.config.runtime, { threadId: args.threadId, pane: args.pane, cwd }, binary).inspect();
+      } finally { observer.close(); }
+      if (snap.state === "failed") throw new ExternalSessionError("runtime-failed", "Current Codex session reports a runtime failure; resolve it before attaching.");
+      if (saved) {
+        // Both writes follow a durable hold/intent. A crash between either write
+        // leaves dispatch held, while preserving this exact session's capability.
+        await this.registry.update("lead", lane => ({ ...lane, dispatchBlocked: true, holdReason: "recovery", runtime: { ...lane.runtime!, held: true, state: "recovering",
+          external: { ...lane.runtime!.external!, rebind: { binary, binaryVersion: daemon.binaryVersion },
+            holdReason: lane.runtime!.external?.holdReason ?? { code: "rebind-interrupted", message: "Attached runtime rebind incomplete; explicitly reattach to finish reconnection.", at: new Date().toISOString() } } } }));
+        atomicJson(this.attachmentPath(), { ...saved, binary, binaryVersion: daemon.binaryVersion, model: snap.model, effort: snap.effort });
+        await this.registry.update("lead", lane => ({ ...lane, model: snap.model, dispatchBlocked: false, holdReason: undefined, runtime: { ...lane.runtime!, binaryVersion: daemon.binaryVersion,
+          model: snap.model, effort: snap.effort, held: false, state: snap.state, activeTurnId: snap.activeTurnId,
+          external: { ...lane.runtime!.external!, binary, holdReason: undefined, rebind: undefined } } }));
+        return { attached: true, bridge: saved.bridge, lead: await this.publicLane(await this.lane("lead"), true), reused: true };
+      }
+      return await this.createAttachment(args, cwd, previous, binary, daemon, snap);
+    } catch (error) {
+      if (saved) await this.holdExternal(saved.instance, error);
+      throw error;
     }
+  }
+  private async createAttachment(args: any, cwd: string, previous: Lane | null, binary: string,
+    daemon: Awaited<ReturnType<typeof sharedDaemon>>, snap: Awaited<ReturnType<ExternalCurrentSession["inspect"]>>): Promise<any> {
     if (previous && previous.runtime?.backend !== "external-current-session") {
       await this.assertHostStopped(previous);
       if (existsSync(backendSocket(this.config.stateDir, "lead"))) {
@@ -194,12 +222,12 @@ export class DoriService {
       openedAt: new Date().toISOString(), status: "working", dispatchBlocked: false, revision: previous?.revision,
       runtimeHistory: [...(previous?.runtimeHistory ?? []), ...(previous?.runtime ? [previous.runtime] : [])],
       runtime: { kind: "codex", backend: "external-current-session", threadId: args.threadId, state: snap.state, activeTurnId: snap.activeTurnId,
-        hostInstanceId: instance, generation, binaryVersion: this.config.runtime.requiredVersion, model: snap.model, effort: snap.effort, external: { ...daemon, binary, bridge } } };
+        hostInstanceId: instance, generation, binaryVersion: daemon.binaryVersion, model: snap.model, effort: snap.effort, external: { socketPath: daemon.socketPath, binary, bridge } } };
     await this.registry.write(lead);
     // Publish the credential only after the registry commit succeeds. A revision
     // conflict must not revoke a previously valid attachment's capability.
     atomicJson(this.attachmentPath(), saved);
-    return { attached: true, bridge, lead: await this.publicLane(await this.lane("lead")) };
+    return { attached: true, bridge, lead: await this.publicLane(await this.lane("lead"), true) };
   }
   private async lane(key: string): Promise<Lane> { if (!key || !LANE_KEY.test(key)) throw new Error("Invalid lane key"); const lane = await this.registry.read(key); if (!lane) throw new Error("Unknown lane"); return lane; }
   private async assertHostStopped(lane: Lane): Promise<void> {
@@ -542,7 +570,20 @@ export class DoriService {
     }
     const target = known && statusOf(known) !== "closed" ? known.key : "lead";
     this.inbox.put({ id, target, thread: event.thread, text: `Owner message in ${event.thread}${known && statusOf(known) === "closed" ? ` (closed lane ${known.key}; reopen if appropriate)` : ""}:\n${event.text}`, source, state: "queued", at: new Date().toISOString() });
-    if (this.config.hooks.threadReply) await this.deps.post!(`ack:${id}`, this.config.hooks.threadReply, { key: target, thread: event.thread, text: "Received. I’ll check the request and continue here." }).catch(() => { /* inbox acceptance does not depend on outbound delivery */ });
+    if (this.config.hooks.threadReply) {
+      let waiting = false;
+      if (target === "lead") {
+        const lead = await this.registry.read("lead");
+        // Intake is already durable. Observer failure chooses an honest waiting
+        // ACK; neither acceptance nor ACK requires successful observation.
+        if (lead?.runtime?.backend === "external-current-session" && !lead.dispatchBlocked && !lead.runtime.external?.detachedAt && lead.runtime.state !== "stopped")
+          await this.deps.runtime.inspect("lead").catch(() => { waiting = true; });
+        const current = await this.registry.read("lead");
+        waiting ||= !current || Boolean(current.dispatchBlocked || current.runtime?.held || current.runtime?.external?.detachedAt) || !current.runtime || ["failed", "recovering", "stopped", "starting"].includes(current.runtime.state);
+      }
+      await this.deps.post!(`ack:${id}`, this.config.hooks.threadReply, { key: target, thread: event.thread,
+        text: waiting ? "Received and saved. Delivery is waiting for the lead to reconnect." : "Received. I’ll check the request and continue here." }).catch(() => { /* inbox acceptance does not depend on outbound delivery */ });
+    }
   }
   async tick(): Promise<void> {
     const once = async (name: string, fn: () => Promise<unknown>) => {
@@ -554,7 +595,7 @@ export class DoriService {
     await Promise.all([
       once("external-observation", async () => {
         const lead = await this.registry.read("lead");
-        if (lead?.runtime?.backend === "external-current-session" && lead.runtime.state !== "stopped" && !lead.runtime.external?.detachedAt) await this.externalCall(lead, "inspect", {}).catch(() => {});
+        if (lead?.runtime?.backend === "external-current-session" && lead.runtime.state !== "stopped" && !lead.runtime.external?.detachedAt) await this.deps.runtime.inspect(lead.key).catch(() => {});
       }),
       once("failures", () => this.notifyFailures()),
       once("done", () => watchTick(this.deps).then(lines => lines.forEach(l => console.log(l)))),

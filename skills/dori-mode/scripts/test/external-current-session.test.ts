@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, readFileSync, realpathSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { defaultConfig } from "../src/config.ts";
 import { atomicJson } from "../src/journal.ts";
 import { hostSocket, readJson, socketDir } from "../src/ipc.ts";
 import { DoriService } from "../src/service.ts";
 import { operationText } from "../src/runtime/herdr.ts";
-import { backendSocket, runSessionHost, startSessionHost } from "../src/runtime/session-host.ts";
+import { backendSocket, prepareBackend, runSessionHost, startSessionHost } from "../src/runtime/session-host.ts";
+import { sharedDaemon } from "../src/runtime/external-current-session.ts";
 import { deadPaneTick } from "../src/dead-panes.ts";
 import { withState } from "./fakes.ts";
 import type { Runner } from "../src/run.ts";
@@ -18,6 +19,7 @@ function fixture() {
   const state = withState(), socketPath = join(socketDir(state.dir), "shared.sock"), calls: string[][] = [], reads: string[] = [];
   const config = { ...defaultConfig(), stateDir: state.dir, defaultCwd: state.dir, hooks: { threadReply: ["notify", "{thread}", "{text}"] }, ingress: [{ id: "test", command: ["fixture"], owners: ["owner"] }], runtime: { ...defaultConfig().runtime, binary: process.execPath, rpcTimeoutMs: 80 } };
   const thread: any = { id: threadId, cwd: realpathSync(state.dir), model: "retained-model", reasoningEffort: "high", status: { type: "idle" } };
+  let cliVersion = "0.163.0", serverVersion = "0.163.0", reportedSocket = socketPath, unavailable = false;
   let turns: any[] = [], loaded = true, accept = true, queueCode = 0, queueThrows = false, loseOnQueue = false, getCount = 0, driftAtGet = Infinity, failQueuedTurn = false;
   const agent: any = { agent: "codex", pane_id: "w:p1", agent_status: "idle", agent_session: { agent: "codex", kind: "id", value: threadId } };
   const server = Bun.serve({ unix: socketPath, fetch(request, server) { if (server.upgrade(request)) return; return new Response(null, { status: 400 }); }, websocket: { message(ws, raw) {
@@ -34,7 +36,7 @@ function fixture() {
       if (argv[1] === "agent" && argv[2] === "list") return ok({ result: { agents: [agent] } });
       if (argv[1] === "pane" && argv[2] === "list") return ok({ result: { panes: [agent] } });
     }
-    if (argv.slice(1).join(" ") === "app-server daemon version") return ok({ status: "running", cliVersion: "0.163.0", appServerVersion: "0.163.0", socketPath });
+    if (argv.slice(1).join(" ") === "app-server daemon version") { if (unavailable) throw new Error("Bearer private-token /private/socket"); return ok({ status: "running", cliVersion, appServerVersion: serverVersion, socketPath: reportedSocket }); }
     if (argv[1] === "queue") {
       if (accept) turns.push({ id: "real-turn-id", status: failQueuedTurn ? "failed" : "completed", items: [{ type: "userMessage", content: [{ type: "text", text: argv[5] }] }],
         error: failQueuedTurn ? { codexErrorInfo: "unauthorized", message: "Authorization: Bearer secret-token\nprivate command dump" } : null });
@@ -45,7 +47,9 @@ function fixture() {
     throw new Error(`Unexpected mutation: ${argv.join(" ")}`);
   };
   const s = new DoriService(config, run), args = { threadId, pane: agent.pane_id, cwd: state.dir };
-  return { state, s, args, config, run, calls, reads, thread, agent, server, setTurns: (v: any[]) => turns = v, getTurns: () => turns, failQueuedTurn: () => failQueuedTurn = true,
+  return { state, s, args, config, run, calls, reads, thread, agent, server,
+    versions(client: string, daemon = client) { cliVersion = client; serverVersion = daemon; },
+    socket(value: string) { reportedSocket = value; }, unavailable() { unavailable = true; }, setTurns: (v: any[]) => turns = v, getTurns: () => turns, failQueuedTurn: () => failQueuedTurn = true,
     busy() { thread.status = { type: "active", activeFlags: [] }; turns = [{ id: "owner-turn", status: "inProgress", items: [] }]; },
     idle() { thread.status = { type: "idle" }; turns = turns.map(t => ({ ...t, status: "completed" })); },
     unloaded() { loaded = false; thread.status = { type: "notLoaded" }; }, noReceipt() { accept = false; },
@@ -283,4 +287,188 @@ test("a failure tied to unknown input remains pending without notice or input re
   h.setTurns([{ id: "unknown-turn", status: "failed", items: [{ type: "userMessage", content: [{ type: "text", text: operationText("uncertain", "unknown-input") }] }], error: { codexErrorInfo: "unauthorized" } }]);
   const restarted = new DoriService(h.config, h.run); await restarted.tick(); await restarted.notifyFailures();
   expect(restarted.failures.list()).toHaveLength(1); expect(restarted.failures.list()[0]?.state).toBe("queued"); expect(restarted.outbox.list()).toHaveLength(0); expect(restarted.inbox.get("unknown-input")?.state).toBe("unknown"); expect(queueCalls()).toHaveLength(0);
+});
+
+
+test("external support is an explicit pair table independent of the managed version pin", async () => {
+  const pin = h.config.runtime.requiredVersion;
+  for (const version of ["0.163.0", "0.164.0"]) {
+    h.versions(version);
+    expect(await sharedDaemon(h.run, process.execPath, h.config.runtime)).toEqual({ socketPath: join(socketDir(h.state.dir), "shared.sock"), binaryVersion: version });
+  }
+  for (const [client, server, code] of [["0.163.0", "0.164.0", "runtime-version-changed"], ["0.164.0", "0.163.0", "runtime-version-changed"], ["0.165.0", "0.165.0", "runtime-version-unsupported"], ["0.164.1", "0.164.1", "runtime-version-unsupported"]]) {
+    h.versions(client!, server);
+    await expect(sharedDaemon(h.run, process.execPath, h.config.runtime)).rejects.toMatchObject({ code });
+    await expect(attach()).rejects.toThrow(/version/);
+  }
+  expect(h.config.runtime.requiredVersion).toBe(pin); expect(pin).toBe("0.163.0");
+  expect(await h.s.registry.read("lead")).toBeNull(); expect(existsSync(join(h.state.dir, "attachments/lead.json"))).toBe(false);
+});
+
+test("same-session 163 to 164 reattach preserves accepted mail, capability and historical exclusions", async () => {
+  h.s.inbox.put({ id: "history", target: "lead", text: "old", state: "queued", at: "2020-01-01" });
+  h.busy(); await attach();
+  const path = join(h.state.dir, "attachments/lead.json"), saved = readJson<any>(path);
+  // Represent the resolved release executable changing without a live daemon.
+  saved.binary = "/fixture/codex-163"; atomicJson(path, saved);
+  await h.s.registry.update("lead", l => ({ ...l, runtime: { ...l.runtime!, external: { ...l.runtime!.external!, binary: saved.binary } } }));
+  const event = { id: "accepted", user: "owner", thread: "chat:owner", text: "continue" };
+  await h.s.receive("test", event);
+  const id = "inbound:test:chat:owner:accepted", queued = { ...h.s.inbox.get(id)! };
+  for (const state of ["unknown", "sending", "queued"] as const) h.s.inbox.put({ id: state, target: "lead", text: state, state, at: "2020-01-02", attachmentInstance: state === "queued" ? "previous-instance" : saved.instance });
+  const before = structuredClone(h.s.inbox.list());
+  h.versions("0.163.0", "0.164.0");
+  expect(await h.s.handle("status", { key: "lead" }, { role: "admin" })).toMatchObject({ readiness: "held", runtime: { external: { holdReason: { code: "runtime-version-changed", message: expect.stringContaining("client 0.163.0, server 0.164.0") } } } });
+  const fault = (await h.s.registry.read("lead"))!.runtime!.external!.holdReason;
+  // Later generic identity faults must preserve the initial version diagnosis.
+  h.versions("0.163.0"); h.agent.agent_session.value = otherId;
+  await h.s.deps.runtime.inspect("lead").catch(() => {});
+  expect((await h.s.registry.read("lead"))!.runtime!.external!.holdReason).toEqual(fault);
+  h.agent.agent_session.value = threadId; h.versions("0.164.0");
+  const rebound = await attach(), actual = readJson<any>(path);
+  expect(rebound).toMatchObject({ reused: true, bridge: saved.bridge, lead: { readiness: "busy", runtime: { binaryVersion: "0.164.0", held: false } } });
+  for (const key of ["instance", "generation", "token", "bridge", "excludedInboxIds", "socketPath", "threadId", "pane", "cwd"]) expect(actual[key]).toEqual(saved[key]);
+  expect(actual.binary).toBe(realpathSync(process.execPath)); expect(actual.binaryVersion).toBe("0.164.0");
+  expect(rebound.lead.runtime.external.holdReason).toBeUndefined(); expect(rebound.lead.runtime.external.rebind).toBeUndefined();
+  expect(await h.s.authorize(saved.token)).toMatchObject({ instance: saved.instance });
+  expect(h.s.inbox.list()).toEqual(before); expect(h.s.inbox.get(id)).toEqual(queued);
+  await h.s.tick(); expect(queueCalls()).toHaveLength(0); expect(h.s.inbox.get("sending")?.state).toBe("sending");
+  h.idle(); const restarted = new DoriService(h.config, h.run); await restarted.tick();
+  expect(restarted.inbox.get(id)).toMatchObject({ ...queued, attachmentInstance: saved.instance, state: "sent", turnId: "real-turn-id" });
+  expect(queueCalls()).toHaveLength(1);
+  expect(restarted.inbox.get("history")?.state).toBe("queued"); expect(restarted.inbox.get("queued")?.state).toBe("queued"); expect(restarted.inbox.get("unknown")?.state).toBe("unknown");
+  // Existing sending recovery remains unknown; reattach never resets it.
+  expect(restarted.inbox.get("sending")?.state).toBe("unknown");
+  const twice = new DoriService(h.config, h.run); await twice.tick(); expect(queueCalls()).toHaveLength(1);
+  expect(h.config.runtime.requiredVersion).toBe("0.163.0");
+});
+
+test("changed socket, pane, cwd or thread cannot rebind an attached lead", async () => {
+  await attach(); const path = join(h.state.dir, "attachments/lead.json"), before = readJson<any>(path);
+  for (const args of [{ ...h.args, threadId: otherId }, { ...h.args, pane: "other:pane" }, { ...h.args, cwd: realpathSync("/tmp") }])
+    await expect(h.s.handle("lead-attach", args, { role: "admin" })).rejects.toThrow("different lead");
+  h.versions("0.164.0"); h.socket("/fixture/other.sock");
+  await expect(attach()).rejects.toThrow("affinity changed"); expect(readJson<any>(path)).toEqual(before);
+  expect(await h.s.authorize(before.token)).toMatchObject({ instance: before.instance });
+  expect(await h.s.registry.read("lead")).toMatchObject({ dispatchBlocked: true }); expect(queueCalls()).toHaveLength(0);
+});
+
+test("restart revalidates saved observed version and never auto-rebinds a held attachment", async () => {
+  await attach(); h.versions("0.164.0");
+  const restarted = new DoriService(h.config, h.run); await restarted.tick();
+  expect(await restarted.handle("status", { key: "lead" }, { role: "admin" })).toMatchObject({ readiness: "held", runtime: { binaryVersion: "0.163.0", external: { holdReason: { code: "runtime-version-changed" } } } });
+  await restarted.handle("lead-attach", h.args, { role: "admin" });
+  expect(await restarted.handle("status", { key: "lead" }, { role: "admin" })).toMatchObject({ readiness: "ready", runtime: { binaryVersion: "0.164.0" } });
+  expect(queueCalls()).toHaveLength(0);
+});
+
+test("held, detached, missing and unavailable lead ACKs promise saved intake and waiting reconnection", async () => {
+  const receive = (id: string) => h.s.receive("test", { id, user: "owner", thread: "chat:owner", text: "continue" });
+  const ack = (id: string) => h.s.outbox.get(`ack:inbound:test:chat:owner:${id}`)?.text;
+  await receive("missing"); expect(ack("missing")).toBe("Received and saved. Delivery is waiting for the lead to reconnect.");
+  await attach(); await receive("active"); expect(ack("active")).toBe("Received. I’ll check the request and continue here.");
+  h.versions("0.163.0", "0.164.0"); await receive("held"); expect(ack("held")).toBe(ack("missing"));
+  const status = await h.s.handle("status", { key: "lead" }, { role: "admin" });
+  expect(status.runtime.external.holdReason).toMatchObject({ code: "runtime-version-changed", at: expect.any(String) });
+  await h.s.handle("lead-detach", { threadId }, { role: "admin" }); await receive("detached"); expect(ack("detached")).toBe(ack("missing"));
+  h.versions("0.164.0"); await attach(); h.unavailable(); await receive("unavailable"); expect(ack("unavailable")).toBe(ack("missing"));
+  expect(h.s.inbox.get("inbound:test:chat:owner:unavailable")?.state).toBe("queued");
+  expect(await h.s.handle("status", { key: "lead" }, { role: "admin" })).toMatchObject({ readiness: "held", runtime: { external: { holdReason: { code: "runtime-unavailable" } } } });
+  expect(JSON.stringify(h.s.outbox.list())).not.toMatch(/private-token|private\/socket|Bearer/); expect(queueCalls()).toHaveLength(0);
+});
+
+
+test("external binary selects the borrowed client without changing managed binary/version", async () => {
+  h.versions("0.164.0");
+  const config = { ...h.config, runtime: { ...h.config.runtime, binary: "/managed/codex-163", externalBinary: process.execPath } };
+  const service = new DoriService(config, h.run);
+  const first = await service.handle("lead-attach", h.args, { role: "admin" });
+  expect(first.lead.runtime.binaryVersion).toBe("0.164.0");
+  expect(first.lead.runtime.external.binary).toBe(realpathSync(process.execPath));
+  expect(h.calls.filter(a => a[1] === "app-server").every(a => a[0] === realpathSync(process.execPath))).toBe(true);
+  expect(config.runtime.binary).toBe("/managed/codex-163"); expect(config.runtime.requiredVersion).toBe("0.163.0");
+  // Actual managed preparation still chooses binary, even with externalBinary set.
+  const managed = { ...config, runtime: { ...config.runtime, binary: process.execPath, externalBinary: "/unavailable/external", roles: { ...config.runtime.roles, lane: { model: "test", effort: "high" } } } };
+  mkdirSync(join(h.state.dir, "clients/worker"), { recursive: true });
+  expect(prepareBackend(h.state.dir, { key: "worker", role: "lane", instance: "host", generation: 1, hostToken: "host", laneToken: "lane", cwd: h.state.dir, pane: "worker:p", blocked: false, config: managed }).binary).toBe(realpathSync(process.execPath));
+});
+
+test("old in-flight observation settles before rebind and cannot re-hold the continuing instance", async () => {
+  await attach(); h.versions("0.163.0", "0.164.0");
+  let release!: () => void, started!: () => void;
+  const paused = new Promise<void>(resolve => release = resolve), entered = new Promise<void>(resolve => started = resolve);
+  let delay = true;
+  const run: Runner = async (argv, options) => {
+    if (delay && argv[1] === "app-server") { delay = false; const old = await h.run(argv, options); started(); await paused; return old; }
+    return h.run(argv, options);
+  };
+  const service = new DoriService(h.config, run);
+  const observation = service.handle("status", { key: "lead" }, { role: "admin" });
+  await entered; h.versions("0.164.0");
+  const rebinding = service.handle("lead-attach", h.args, { role: "admin" });
+  // The candidate inspect cannot pass the serialized old observation.
+  await Promise.resolve(); expect((await service.registry.read("lead"))!.runtime!.binaryVersion).toBe("0.163.0");
+  release(); expect(await observation).toMatchObject({ readiness: "held" });
+  expect(await rebinding).toMatchObject({ reused: true, lead: { readiness: "ready", runtime: { binaryVersion: "0.164.0" } } });
+  expect((await service.registry.read("lead"))!.runtime!.external!.holdReason).toBeUndefined();
+  await service.tick(); expect((await service.registry.read("lead"))!.dispatchBlocked).toBe(false); expect(queueCalls()).toHaveLength(0);
+});
+
+for (const boundary of ["intent", "attachment"] as const) test(`interrupted rebind after ${boundary} is held, keeps capability and repairs on explicit retry`, async () => {
+  h.s.inbox.put({ id: "historic-rebind", target: "lead", text: "history", state: "queued", at: "2020-01-01" });
+  h.busy(); await attach();
+  const path = join(h.state.dir, "attachments/lead.json"), saved = readJson<any>(path);
+  await input("eligible-rebind"); const before = structuredClone(h.s.inbox.list());
+  h.versions("0.164.0");
+  const update = h.s.registry.update.bind(h.s.registry); let armed = true;
+  h.s.registry.update = async (key, fn) => {
+    const result = await update(key, lane => {
+      const next = fn(lane);
+      if (armed && boundary === "attachment" && lane.runtime?.external?.rebind && !next.runtime?.external?.rebind) { armed = false; throw new Error("injected commit failure after attachment"); }
+      return next;
+    });
+    if (armed && boundary === "intent" && result.runtime?.external?.rebind) { armed = false; throw new Error("injected failure after intent"); }
+    return result;
+  };
+  await expect(attach()).rejects.toThrow("injected");
+  expect(await h.s.authorize(saved.token)).toMatchObject({ instance: saved.instance });
+  expect(h.s.inbox.list()).toEqual(before); expect(queueCalls()).toHaveLength(0);
+  const restarted = new DoriService(h.config, h.run); await restarted.tick();
+  expect(await restarted.handle("status", { key: "lead" }, { role: "admin" })).toMatchObject({ readiness: "held", runtime: { external: { holdReason: { code: "rebind-interrupted" } } } });
+  expect(await restarted.authorize(saved.token)).toMatchObject({ instance: saved.instance });
+  expect(queueCalls()).toHaveLength(0);
+  const rebound = await restarted.handle("lead-attach", h.args, { role: "admin" });
+  expect(rebound).toMatchObject({ reused: true, bridge: saved.bridge, lead: { readiness: "busy", runtime: { binaryVersion: "0.164.0" } } });
+  const actual = readJson<any>(path);
+  for (const key of ["instance", "generation", "token", "bridge", "excludedInboxIds"]) expect(actual[key]).toEqual(saved[key]);
+  expect(restarted.inbox.list()).toEqual(before); expect(queueCalls()).toHaveLength(0);
+  h.idle(); const ready = new DoriService(h.config, h.run); await ready.tick();
+  expect(ready.inbox.get("eligible-rebind")).toMatchObject({ state: "sent", turnId: "real-turn-id" });
+  expect(ready.inbox.get("historic-rebind")?.state).toBe("queued"); expect(queueCalls()).toHaveLength(1);
+});
+
+
+test("candidate rebind requires every identity read to succeed before changing persistent binding", async () => {
+  await attach(); const path = join(h.state.dir, "attachments/lead.json"), saved = readJson<any>(path);
+  h.versions("0.164.0");
+  h.thread.cwd = "/"; await expect(attach()).rejects.toThrow("identity mismatch"); h.thread.cwd = saved.cwd;
+  h.thread.status = { type: "systemError" }; await expect(attach()).rejects.toThrow("runtime failure");
+  h.thread.status = { type: "active", activeFlags: [] }; h.setTurns([{ id: "a", status: "inProgress", items: [] }, { id: "b", status: "inProgress", items: [] }]);
+  await expect(attach()).rejects.toThrow("Ambiguous");
+  h.unloaded(); await expect(attach()).rejects.toThrow("identity mismatch");
+  expect(readJson<any>(path)).toEqual(saved); expect(await h.s.authorize(saved.token)).toMatchObject({ instance: saved.instance });
+  expect((await h.s.registry.read("lead"))!.runtime!.binaryVersion).toBe("0.163.0"); expect(queueCalls()).toHaveLength(0);
+});
+
+test("untrusted version output and observer connection failure leave sanitized holds and saved ACKs", async () => {
+  await attach(); h.versions("Bearer private-token /private/socket");
+  const unsupported = await h.s.handle("status", { key: "lead" }, { role: "admin" });
+  expect(unsupported.runtime.external.holdReason).toMatchObject({ code: "runtime-version-unsupported", message: expect.stringContaining("unrecognized") });
+  expect(JSON.stringify(unsupported.runtime.external.holdReason)).not.toMatch(/private-token|private\/socket|Bearer/);
+  h.versions("0.163.0"); await attach(); h.server.stop(true);
+  await h.s.receive("test", { id: "offline", user: "owner", thread: "chat:owner", text: "save while unavailable" });
+  expect(h.s.inbox.get("inbound:test:chat:owner:offline")?.state).toBe("queued");
+  expect(h.s.outbox.get("ack:inbound:test:chat:owner:offline")?.text).toContain("Delivery is waiting");
+  expect(await h.s.handle("status", { key: "lead" }, { role: "admin" })).toMatchObject({ readiness: "held", runtime: { external: { holdReason: { code: "runtime-unavailable" } } } });
+  expect(queueCalls()).toHaveLength(0);
 });

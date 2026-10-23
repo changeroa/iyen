@@ -1,6 +1,6 @@
 # Codex setup
 
-Keep the owner's bot name, messenger account, memory and onboarding consent. Both the lead and all work lanes use Codex CLI **0.163.0**. A different version is rejected until its generated protocol and tests are updated.
+Keep the owner's bot name, messenger account, memory and onboarding consent. Managed work lanes use the configured Codex version pin (default **0.163.0**). Attached leads support matching CLI/daemon pairs **0.163.0/0.163.0** and **0.164.0/0.164.0**, validated against the local protocol and attachment tests. Other pairs remain held. Use `runtime.externalBinary` for the shared daemon CLI when managed `runtime.binary` points to a pinned release. Changing externalBinary does not alter managed startup. After a supported daemon update, explicitly attach the same session again; do not detach first, because eligible pending input belongs to the existing attachment.
 
 ## Install
 

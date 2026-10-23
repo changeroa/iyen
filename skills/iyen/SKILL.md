@@ -70,6 +70,13 @@ session and shared Codex daemon; the service does not restart or kill them. If t
 session is closed or its identity changes, delivery is held until an explicit
 verified activation. Do not describe a held delivery queue as a paused Codex task.
 
+After a supported Codex daemon update, run `start` again with this same verified
+session and pane. Explicit reattachment validates the new client/daemon pair and
+preserves the existing attachment and its eligible queued messages. Do not detach
+first: a new attachment excludes old inbox entries. Inspect
+`runtime.external.holdReason` when status is held. A receipt acknowledgment from
+the messenger confirms inbox storage, not delivery to this conversation.
+
 ## Status and stop
 
 Use the same helper and explicit session UUID:
