@@ -17,6 +17,7 @@ Use ~/.dori/config.json or DORI_CONFIG. DORI_STATE_DIR overrides state placement
 | Field | Default / meaning |
 |---|---|
 | runtime.kind / binary / requiredVersion | codex / codex / 0.163.0 |
+| runtime.externalBinary | optional CLI path for the borrowed shared daemon; defaults to runtime.binary |
 | runtime.roles.lead / lane | explicit available model ID and reasoning effort required for launch |
 | runtime.sandbox / approvalPolicy | workspace-write / on-request |
 | runtime.startupTimeoutMs / rpcTimeoutMs | 30000 / 15000 |
