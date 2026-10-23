@@ -581,8 +581,8 @@ export class DoriService {
         const current = await this.registry.read("lead");
         waiting ||= !current || Boolean(current.dispatchBlocked || current.runtime?.held || current.runtime?.external?.detachedAt) || !current.runtime || ["failed", "recovering", "stopped", "starting"].includes(current.runtime.state);
       }
-      await this.deps.post!(`ack:${id}`, this.config.hooks.threadReply, { key: target, thread: event.thread,
-        text: waiting ? "Received and saved. Delivery is waiting for the lead to reconnect." : "Received. I’ll check the request and continue here." }).catch(() => { /* inbox acceptance does not depend on outbound delivery */ });
+      if (waiting) await this.deps.post!(`ack:${id}`, this.config.hooks.threadReply, { key: target, thread: event.thread,
+        text: "Received and saved. Delivery is waiting for the lead to reconnect." }).catch(() => { /* inbox acceptance does not depend on outbound delivery */ });
     }
   }
   async tick(): Promise<void> {

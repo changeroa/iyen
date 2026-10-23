@@ -366,7 +366,7 @@ test("held, detached, missing and unavailable lead ACKs promise saved intake and
   const receive = (id: string) => h.s.receive("test", { id, user: "owner", thread: "chat:owner", text: "continue" });
   const ack = (id: string) => h.s.outbox.get(`ack:inbound:test:chat:owner:${id}`)?.text;
   await receive("missing"); expect(ack("missing")).toBe("Received and saved. Delivery is waiting for the lead to reconnect.");
-  await attach(); await receive("active"); expect(ack("active")).toBe("Received. I’ll check the request and continue here.");
+  await attach(); await receive("active"); expect(ack("active")).toBeUndefined();
   h.versions("0.163.0", "0.164.0"); await receive("held"); expect(ack("held")).toBe(ack("missing"));
   const status = await h.s.handle("status", { key: "lead" }, { role: "admin" });
   expect(status.runtime.external.holdReason).toMatchObject({ code: "runtime-version-changed", at: expect.any(String) });
