@@ -12,7 +12,9 @@ import { atomicJson } from "./journal.ts";
 import { join } from "node:path";
 const help = `dori — Codex-only messenger lead and lanes
 
-  doctor | serve | lead | status [key]
+  doctor | serve | status [key]
+  lead-attach --thread-id UUID --pane ID --cwd DIR
+  lead-detach --thread-id UUID
   launch KEY --title T --brief FILE --done SIGNALS [--thread REF] [--cwd DIR] [--model M] [--worktree]
   input KEY --text-file FILE [--operation-id ID]
   report KEY --kind milestone|blocker|question|done --text-file FILE --event-id ID
@@ -66,6 +68,8 @@ try {
   const operationId = opt("operation-id") ?? crypto.randomUUID();
   let result: any;
   switch (command) {
+    case "lead": case "lead-attach": result = await call("lead-attach", { threadId: need("thread-id"), pane: need("pane"), cwd: need("cwd") }); break;
+    case "lead-detach": result = await call(command, { threadId: need("thread-id") }); break;
     case "work":
       if (key === "start") result = await call("work-start", { title: need("title"), tags: values.tag ?? [], thread: opt("thread"), operationId });
       else if (key === "stop") result = await call("work-stop", { id: flags.positionals[1] ?? (() => { throw new Error("work stop needs a work id"); })() });
@@ -80,7 +84,7 @@ try {
     case "object-done": result = await call(command, { key, reasons: values.reason }); break;
     case "pause": case "resume": case "close": result = await call(command, { key, note: opt("note") }); break;
     case "reopen": case "recover": result = await call(command, { key, text, operationId, threadId: opt("thread-id"), newSession: Boolean(values["new-session"]), handoff: opt("handoff-file") ? await Bun.file(need("handoff-file")).text() : undefined }); break;
-    case "status": case "lead": case "can-launch": result = await call(command, { key }); break;
+    case "status": case "can-launch": result = await call(command, { key }); break;
     case "sync": result = await call(command, { write: Boolean(values.write) }); break;
     case "approval":
       result = key === "list" ? await call("approval-list") : key === "respond" ? await call("approval-respond", { id: flags.positionals[1], response: await Bun.file(need("response-file")).json() }) : (() => { throw new Error("approval list|respond required"); })(); break;

@@ -46,9 +46,10 @@ export const readLoadedThreads = async (observer: Observer): Promise<string[]> =
   return threads;
 };
 export const receipt = async (observer: Observer, threadId: string, text: string): Promise<string | undefined> => {
-  const matches = (await readTurns(observer, threadId)).filter(turn => turn.items.some(item => item.type === "userMessage" &&
-    item.content.filter(part => part.type === "text").map(part => part.text).join("\n") === text));
+  const matches = (await readTurns(observer, threadId)).flatMap(turn => turn.items.filter(item => item.type === "userMessage" &&
+    item.content.every(part => part.type === "text") && item.content.map(part => part.type === "text" ? part.text : "").join("\n") === text).map(() => turn));
   if (matches.length > 1) throw new Error("Duplicate operation receipts; reconcile before continuing");
+  if (matches[0] && (typeof matches[0].id !== "string" || !matches[0].id.trim())) throw new Error("Missing turn receipt identity");
   return matches[0]?.id;
 };
 export const readGoal = (observer: Observer, threadId: string): Promise<{ goal: Goal | null }> => observer.read("thread/goal/get", { threadId });

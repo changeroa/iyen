@@ -1,5 +1,5 @@
-import { chmodSync, existsSync, mkdirSync, unlinkSync, openSync, closeSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { chmodSync, existsSync, mkdirSync, unlinkSync, openSync, closeSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 import { workspaceForRole, type DoriConfig } from "./config.ts";
 import { atomicJson, SerialQueue } from "./journal.ts";
 import { ipc, serviceSocket, hostSocket, readJson } from "./ipc.ts";
@@ -13,13 +13,15 @@ import { syncRegistry } from "./sync.ts";
 import { sampleHost, guardTick } from "./host-guard.ts";
 import { canLaunch } from "./routing.ts";
 import { run, realClock, type Runner } from "./run.ts";
-import { bootstrapPath, type Bootstrap } from "./runtime/session-host.ts";
+import { backendSocket, bootstrapPath, resolveCodexBinary, type Bootstrap } from "./runtime/session-host.ts";
 import type { RuntimeControl, RuntimeRef, RuntimeSnapshot } from "./runtime/types.ts";
 import { WorkTimers } from "./work.ts";
 import { turnFailure } from "./turn-failure.ts";
-import { Mailbox, postHook } from "./mailbox.ts";
+import { DeliveryDeferred, Mailbox, postHook } from "./mailbox.ts";
+import { ExternalCurrentSession, observeExternal, sharedDaemon, THREAD_UUID, type Attachment } from "./runtime/external-current-session.ts";
+import { connectObserver } from "./runtime/observer.ts";
 
-export type Caller = { role: "admin" | "lead" | "lane" | "host"; key?: string };
+export type Caller = { role: "admin" | "lead" | "lane" | "host"; key?: string; instance?: string };
 export class DoriService {
   readonly registry: Registry;
   readonly inbox: Mailbox;
@@ -41,6 +43,7 @@ export class DoriService {
     const call = async <T>(key: string, action: string, args: any = {}): Promise<T> => {
       const lane = await this.registry.read(key);
       if (!lane?.runtime?.threadId) throw new Error("Runtime is not registered");
+      if (lane.runtime.backend === "external-current-session") return this.externalCall(lane, action, args) as Promise<T>;
       if (action === "stop" && lane.runtime.state === "stopped") return undefined as T;
       const boot = readJson<Bootstrap>(bootstrapPath(config.stateDir, key));
       const result = await ipc<T>(hostSocket(config.stateDir, key), boot.hostToken, action, args, config.runtime.rpcTimeoutMs * 3);
@@ -53,7 +56,16 @@ export class DoriService {
         const lane = await this.registry.read(key);
         if (!lane || lane.dispatchBlocked || statusOf(lane) === "closed") throw new Error("Lane dispatch is blocked");
         const mail = this.inbox.put({ id: operationId, target: key, text, thread: lane.thread, state: "queued", at: new Date().toISOString() });
-        const delivered = await this.inbox.deliver(mail.id, row => call<{ turnId: string }>(key, "input", { text: row.text, operationId: row.id }));
+        if (lane.runtime?.backend === "external-current-session") {
+          if (mail.attachmentInstance && mail.attachmentInstance !== lane.runtime.hostInstanceId) throw new DeliveryDeferred("Mail belongs to a previous lead attachment");
+          if (this.attachment(lane).excludedInboxIds.includes(mail.id)) throw new DeliveryDeferred("Historical mail is held for explicit reconciliation");
+          if (mail.state === "queued" && (await call<RuntimeSnapshot>(key, "inspect")).state !== "idle") throw new DeliveryDeferred("Attached session busy; input remains queued");
+        }
+        const delivered = await this.inbox.deliver(mail.id, async row => {
+          const result = await call<{ turnId: string }>(key, "input", { text: row.text, operationId: row.id });
+          if (typeof result?.turnId !== "string" || !result.turnId.trim()) throw new Error("Missing turn receipt");
+          return result;
+        });
         if (!delivered.turnId) throw new Error("Missing turn receipt");
         return { turnId: delivered.turnId };
       }),
@@ -65,6 +77,109 @@ export class DoriService {
         this.inbox.put({ id: operationId, target: key, text, thread: lane.thread, state: "queued", at: new Date().toISOString() });
       } };
   }
+  private attachmentPath(): string { return join(this.config.stateDir, "attachments", "lead.json"); }
+  private attachment(lane: Lane): Attachment {
+    const saved = readJson<Attachment>(this.attachmentPath());
+    if (lane.key !== "lead" || lane.runtime?.backend !== "external-current-session" || lane.runtime.external?.detachedAt || lane.runtime.state === "stopped" ||
+        saved.instance !== lane.runtime.hostInstanceId || saved.generation !== lane.runtime.generation || saved.threadId !== lane.runtime.threadId || saved.pane !== lane.pane || saved.cwd !== lane.cwd ||
+        saved.socketPath !== lane.runtime.external?.socketPath || saved.binary !== lane.runtime.external.binary || saved.bridge !== lane.runtime.external.bridge) throw new Error("Stale or detached lead attachment");
+    return saved;
+  }
+  private async holdExternal(instance: string): Promise<void> {
+    await this.registry.update("lead", lane => lane.runtime?.hostInstanceId !== instance || lane.runtime.external?.detachedAt || lane.runtime.state === "stopped" ? lane : ({ ...lane, dispatchBlocked: true, holdReason: "recovery", runtime: { ...lane.runtime, held: true, state: "recovering", activeTurnId: undefined } }));
+  }
+  private async externalCall(lane: Lane, action: string, args: any): Promise<unknown> {
+    if (!["inspect", "input"].includes(action)) throw new Error(`External current-session ${action} is unsupported; use lead-detach`);
+    let saved: Attachment;
+    try { saved = this.attachment(lane); }
+    catch (error) { await this.holdExternal(lane.runtime!.hostInstanceId); throw error; }
+    if (action === "input" && lane.dispatchBlocked) throw new DeliveryDeferred("Attached lead dispatch is held");
+    let connected = false;
+    try {
+      return await observeExternal(this.runner, this.config.runtime, saved, async observer => {
+        connected = true;
+        const session = new ExternalCurrentSession(observer, this.runner, this.config.runtime, saved, saved.binary);
+        if (action === "input") return session.input(args.text, args.operationId, () => this.holdExternal(saved.instance));
+        const snap = await session.inspect();
+        if (snap.state === "failed") await this.holdExternal(saved.instance);
+        await this.registry.update(lane.key, current => current.runtime?.hostInstanceId !== saved.instance || current.runtime.external?.detachedAt ? current : ({ ...current,
+          model: snap.model, runtime: { ...current.runtime, model: snap.model, effort: snap.effort, state: current.dispatchBlocked ? "recovering" : snap.state, activeTurnId: snap.activeTurnId } }));
+        return snap;
+      });
+    } catch (error) {
+      if (!(error instanceof DeliveryDeferred)) await this.holdExternal(saved.instance);
+      if (action === "input" && !connected) throw new DeliveryDeferred("Attached observer unavailable before submission; input remains queued");
+      throw error;
+    }
+  }
+  private async publicLane(lane: Lane): Promise<any> {
+    if (lane.runtime?.backend !== "external-current-session") return lane;
+    const attached = !lane.runtime.external?.detachedAt && lane.runtime.state !== "stopped";
+    const snap = attached ? await this.externalCall(lane, "inspect", {}).catch(() => null) as RuntimeSnapshot | null : null;
+    const current = await this.lane(lane.key);
+    const stillAttached = !current.runtime?.external?.detachedAt && current.runtime?.state !== "stopped";
+    const identityVerified = Boolean(snap) && stillAttached && current.runtime?.hostInstanceId === lane.runtime.hostInstanceId;
+    return { ...current, mode: "external-current-session", bridge: current.runtime?.external?.bridge, identityVerified,
+      verifiedIdentity: identityVerified ? { threadId: current.runtime?.threadId, pane: current.pane, cwd: current.cwd, model: current.runtime?.model, effort: current.runtime?.effort } : null,
+      readiness: !stillAttached ? "detached" : !identityVerified || current.dispatchBlocked ? "held" : snap?.state === "idle" ? "ready" : "busy" };
+  }
+  private async attachLead(args: any): Promise<any> {
+    if (typeof args.threadId !== "string" || !THREAD_UUID.test(args.threadId) || typeof args.pane !== "string" || !args.pane.trim() || typeof args.cwd !== "string" || !isAbsolute(args.cwd)) throw new Error("lead-attach requires UUID thread-id, pane and absolute cwd");
+    const cwd = realpathSync(args.cwd), previous = await this.registry.read("lead");
+    const same = previous?.runtime?.backend === "external-current-session" && !previous.runtime.external?.detachedAt && previous.runtime.state !== "stopped" && previous.runtime.threadId === args.threadId && previous.pane === args.pane && previous.cwd === cwd;
+    if (previous?.runtime?.backend === "external-current-session" && !previous.runtime.external?.detachedAt && previous.runtime.state !== "stopped" && !same) throw new Error("A different lead is attached; explicitly detach it first");
+    const binary = resolveCodexBinary(this.config.runtime.binary);
+    const daemon = await sharedDaemon(this.runner, binary, this.config.runtime);
+    const observer = await connectObserver(daemon.socketPath, this.config.runtime.rpcTimeoutMs);
+    let snap: Awaited<ReturnType<ExternalCurrentSession["inspect"]>>;
+    try {
+      snap = await new ExternalCurrentSession(observer, this.runner, this.config.runtime, { threadId: args.threadId, pane: args.pane, cwd }, binary).inspect();
+    } finally { observer.close(); }
+    if (snap.state === "failed") throw new Error("Current Codex session reports a runtime failure; resolve it before attaching");
+    if (same) {
+      const saved = this.attachment(previous);
+      if (saved.socketPath !== daemon.socketPath || saved.binary !== binary) throw new Error("Attached daemon affinity changed; detach before reattaching");
+      await this.registry.update("lead", lane => ({ ...lane, dispatchBlocked: false, holdReason: undefined, runtime: { ...lane.runtime!, held: false, state: snap.state, activeTurnId: snap.activeTurnId } }));
+      return { attached: true, bridge: saved.bridge, lead: await this.publicLane(await this.lane("lead")), reused: true };
+    }
+    if (previous && previous.runtime?.backend !== "external-current-session") {
+      await this.assertHostStopped(previous);
+      if (existsSync(backendSocket(this.config.stateDir, "lead"))) {
+        let oldObserver;
+        try { oldObserver = await connectObserver(backendSocket(this.config.stateDir, "lead"), this.config.runtime.rpcTimeoutMs); } catch { /* stale socket; PID and TUI checks above still apply */ }
+        if (oldObserver) { oldObserver.close(); throw new Error("Prior lead backend still live; attachment refused"); }
+      }
+    }
+    // Preserve all failed managed intent and credentials as history. Authentication
+    // below never considers these old credentials for an external attachment.
+    if (previous) {
+      const history = join(this.config.stateDir, "attachments", "history", crypto.randomUUID());
+      atomicJson(join(history, "lane.json"), previous);
+      for (const suffix of [".json", ".runtime.json", ".pid.json", ".backend.json"]) {
+        const file = join(this.config.stateDir, "hosts", `lead${suffix}`);
+        if (existsSync(file)) writeFileSync(join(history, `lead${suffix}`), readFileSync(file), { mode: 0o600 });
+      }
+      if (existsSync(this.attachmentPath())) writeFileSync(join(history, "attachment.json"), readFileSync(this.attachmentPath()), { mode: 0o600 });
+    }
+    const instance = crypto.randomUUID(), generation = (previous?.runtime?.generation ?? 0) + 1;
+    const clientDir = resolve(this.config.stateDir, "clients", "attached-lead", instance), bridge = join(clientDir, "iyen");
+    mkdirSync(clientDir, { recursive: true, mode: 0o700 });
+    const saved: Attachment = { threadId: args.threadId, pane: args.pane, cwd, model: snap.model, effort: snap.effort, instance, generation, token: crypto.randomUUID(), ...daemon, binary, bridge,
+      excludedInboxIds: this.inbox.list().filter(row => row.target === "lead").map(row => row.id) };
+    atomicJson(join(clientDir, "context.json"), { token: saved.token, key: "lead", stateDir: this.config.stateDir });
+    atomicJson(join(clientDir, "config.json"), this.config);
+    writeFileSync(bridge, `#!/bin/sh\nDORI_CONTEXT=${quoteForPane(join(clientDir, "context.json"))} DORI_STATE_DIR=${quoteForPane(this.config.stateDir)} DORI_CONFIG=${quoteForPane(join(clientDir, "config.json"))} DORI_LANE_KEY=lead exec ${quoteForPane(process.execPath)} ${quoteForPane(resolve(import.meta.dir, "cli.ts"))} "$@"\n`, { mode: 0o700 });
+    const lead: Lane = { key: "lead", title: "Iyen current-session lead", role: "lead", thread: "none", brief: "", done: "", pane: args.pane, cwd, model: snap.model,
+      openedAt: new Date().toISOString(), status: "working", dispatchBlocked: false, revision: previous?.revision,
+      runtimeHistory: [...(previous?.runtimeHistory ?? []), ...(previous?.runtime ? [previous.runtime] : [])],
+      runtime: { kind: "codex", backend: "external-current-session", threadId: args.threadId, state: snap.state, activeTurnId: snap.activeTurnId,
+        hostInstanceId: instance, generation, binaryVersion: this.config.runtime.requiredVersion, model: snap.model, effort: snap.effort, external: { ...daemon, binary, bridge } } };
+    await this.registry.write(lead);
+    // Publish the credential only after the registry commit succeeds. A revision
+    // conflict must not revoke a previously valid attachment's capability.
+    atomicJson(this.attachmentPath(), saved);
+    return { attached: true, bridge, lead: await this.publicLane(await this.lane("lead")) };
+  }
   private async lane(key: string): Promise<Lane> { if (!key || !LANE_KEY.test(key)) throw new Error("Invalid lane key"); const lane = await this.registry.read(key); if (!lane) throw new Error("Unknown lane"); return lane; }
   private async assertHostStopped(lane: Lane): Promise<void> {
     const path = bootstrapPath(this.config.stateDir, lane.key);
@@ -72,9 +187,9 @@ export class DoriService {
       const prior = readJson<Bootstrap>(path);
       try { await ipc(hostSocket(this.config.stateDir, lane.key), prior.hostToken, "inspect", {}, 1000); throw new Error("Host already alive"); }
       catch (error) { if (!(error instanceof TypeError) && !(error instanceof DOMException)) throw error; }
-      const pidFile = join(this.config.stateDir, "hosts", `${lane.key}.pid.json`);
-      if (existsSync(pidFile)) { const { pid } = readJson<{ pid: number }>(pidFile); try { process.kill(pid, 0); throw new Error("Prior host process still exists; refuse second writer"); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e; } }
     }
+    const pidFile = join(this.config.stateDir, "hosts", `${lane.key}.pid.json`);
+    if (existsSync(pidFile)) { const { pid } = readJson<{ pid: number }>(pidFile); try { process.kill(pid, 0); throw new Error("Prior host process still exists; refuse second writer"); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e; } }
     const backend = join(this.config.stateDir, "hosts", `${lane.key}.backend.json`);
     if (existsSync(backend)) {
       const { pid } = readJson<{ pid: number }>(backend);
@@ -87,6 +202,8 @@ export class DoriService {
     if (agents.some(a => a.pane_id === lane.pane || (lane.runtime?.threadId && a.agent_session?.value === lane.runtime.threadId))) throw new Error("A live TUI already owns this pane or thread");
   }
   async boot(lane: Lane): Promise<void> {
+    if (lane.key === "lead" || lane.role === "lead") throw new Error("Iyen lead must attach to the current session; use lead-attach");
+    if (lane.runtime?.backend === "external-current-session") throw new Error("External current-session boot is unsupported; use lead-attach");
     if (!lane.pane) throw new Error("A Herdr pane is required");
     const pane = lane.pane;
     await this.assertHostStopped(lane);
@@ -117,6 +234,15 @@ export class DoriService {
     const control = readJson<{ token: string }>(join(this.config.stateDir, "control.json"));
     if (token === control.token) return { role: "admin" };
     for (const lane of await this.registry.open()) {
+      if (lane.runtime?.backend === "external-current-session") {
+        if (!lane.runtime.external?.detachedAt && lane.runtime.state !== "stopped") {
+          let saved: Attachment;
+          try { saved = this.attachment(lane); } catch { continue; }
+          if (token === saved.token) return { role: "lead", key: lane.key, instance: saved.instance };
+        }
+        continue;
+      }
+      if (lane.key === "lead" || lane.role === "lead") continue;
       const path = bootstrapPath(this.config.stateDir, lane.key);
       if (!existsSync(path)) continue;
       const boot = readJson<Bootstrap>(path);
@@ -128,9 +254,30 @@ export class DoriService {
   async handle(action: string, args: any, caller: Caller): Promise<any> {
     if (!args || typeof args !== "object") throw new Error("Expected args object");
     if (this.stopping) throw new Error("Service stopping");
+    if (caller.instance) {
+      const lead = await this.lane("lead");
+      if (caller.role !== "lead" || caller.key !== "lead" || this.attachment(lead).instance !== caller.instance) throw new Error("Stale lead capability");
+    }
+    if (action === "lead-attach" || action === "lead") {
+      if (caller.role !== "admin") throw new Error("lead-attach requires operator capability");
+      if (action === "lead" && (!args.threadId || !args.pane || !args.cwd)) throw new Error("Start Iyen in this session with lead-attach --thread-id UUID --pane ID --cwd DIR");
+      return this.launchQueue.run("lead", () => this.dispatchQueue.run("lead", () => this.attachLead(args)));
+    }
+    if (action === "lead-detach") {
+      if (caller.role !== "admin" && !(caller.role === "lead" && caller.key === "lead" && caller.instance)) throw new Error("lead-detach requires operator or current attached lead capability");
+      if (typeof args.threadId !== "string" || !THREAD_UUID.test(args.threadId)) throw new Error("lead-detach requires expected UUID thread-id");
+      return this.launchQueue.run("lead", () => this.dispatchQueue.run("lead", async () => {
+        const lane = await this.lane("lead");
+        if (lane.runtime?.backend !== "external-current-session" || lane.runtime.threadId !== args.threadId || (caller.instance && caller.instance !== lane.runtime.hostInstanceId)) throw new Error("lead-detach expected session mismatch");
+        await this.registry.update("lead", current => ({ ...current, dispatchBlocked: true, runtime: { ...current.runtime!, held: true, state: "stopped", activeTurnId: undefined,
+          external: { ...current.runtime!.external!, detachedAt: current.runtime!.external?.detachedAt ?? new Date().toISOString() } } }));
+        return { detached: true, threadId: args.threadId };
+      }));
+    }
     if (action.startsWith("host-")) {
       if (caller.role !== "host" || caller.key !== args.key) throw new Error("Forbidden host identity");
       const lane = await this.lane(args.key);
+      if (lane.runtime?.backend === "external-current-session") throw new Error("External current-session cannot register a managed host");
       if (!lane.runtime || lane.runtime.hostInstanceId !== args.instance || args.runtime?.hostInstanceId !== args.instance || args.runtime?.generation !== lane.runtime.generation) throw new Error("Stale host generation");
       if (lane.runtime.threadId && lane.runtime.threadId !== args.runtime.threadId) throw new Error("Thread identity mismatch");
       if (!args.runtime.threadId || args.runtime.kind !== "codex") throw new Error("Invalid runtime identity");
@@ -165,6 +312,7 @@ export class DoriService {
     if (caller.role === "host") throw new Error("Host cannot issue user commands");
     const key = args.key ?? caller.key;
     if (caller.role === "lane" && (!(["report", "claim-done", "status"].includes(action)) || key !== caller.key)) throw new Error("Lane capability does not authorize this command");
+    if (["pause", "resume", "close", "recover", "reopen", "claim-done", "object-done"].includes(action) && (await this.registry.read(key))?.runtime?.backend === "external-current-session") throw new Error(`External current-session ${action} is unsupported; use lead-detach`);
     if (["work-start", "work-stop", "work-similar"].includes(action)) {
       if (caller.role !== "lead" && caller.role !== "admin") throw new Error("Work timers require lead or operator");
       const timers = new WorkTimers(this.config.stateDir, this.deps.clock);
@@ -181,12 +329,14 @@ export class DoriService {
       if (typeof args.id !== "string") throw new Error("work id required");
       return this.workQueue.run(args.id, async () => ({ workThresholdSec, work: await timers.stop(args.id) }));
     }
-    if (action === "status") return key ? this.lane(key) : this.registry.list();
+    if (action === "status") return key ? this.publicLane(await this.lane(key)) : Promise.all((await this.registry.list()).map(lane => this.publicLane(lane)));
     if (action === "can-launch") return canLaunch(await sampleHost(this.runner), this.config.guard);
     if (action === "launch") {
+      if (key === "lead" || args.role === "lead") throw new Error("Iyen lead must attach to the current session; use lead-attach");
       const id = args.operationId;
       if (!id || typeof id !== "string") throw new Error("operationId required");
       return this.launchQueue.run(key, async () => {
+        if ((await this.registry.read(key))?.runtime?.backend === "external-current-session") throw new Error("Attached lead cannot be launched; use lead-attach");
         const mail = this.operations.put({ id, target: key, text: JSON.stringify(args), state: "queued", at: new Date().toISOString() });
         if (mail.state === "sent") return { lane: await this.lane(key), startup: `STARTUP_OK ${key} (recorded)` };
         if (mail.state !== "queued") throw new Error("Launch outcome unknown; inspect status, do not replay");
@@ -199,12 +349,6 @@ export class DoriService {
           this.operations.mark(id, { state: "unknown" }); throw error;
         }
       });
-    }
-    if (action === "lead") {
-      if (await this.registry.read("lead")) return this.lane("lead");
-      const brief = join(this.config.stateDir, "lead-brief.md");
-      await Bun.write(brief, "Read the dori-mode skill. You are the Dori lead. Wait for owner input. Do not launch work or send messages until an owner request arrives.");
-      return this.handle("launch", { key: "lead", title: "Dori lead", brief, done: "", role: "lead", cwd: this.config.defaultCwd, operationId: "lead:initial" }, caller);
     }
     if (action === "adopt") {
       if (!args.threadId || args.transferConfirmed !== true) throw new Error("adopt requires thread-id and confirmed exclusive ownership transfer");
@@ -226,8 +370,18 @@ export class DoriService {
     if (action === "input") {
       if (!args.text || !args.operationId) throw new Error("text and operationId required");
       const lane = await this.lane(key);
-      const mail = this.inbox.put({ id: args.operationId, target: key, text: args.text, thread: args.thread ?? lane.thread, state: "queued", at: new Date().toISOString() });
+      const mail = this.inbox.put({ id: args.operationId, target: key, text: args.text, thread: args.thread ?? lane.thread, state: "queued", at: new Date().toISOString(),
+        attachmentInstance: lane.runtime?.backend === "external-current-session" ? caller.instance ?? lane.runtime.hostInstanceId : undefined });
+      if (mail.state === "unknown" || mail.state === "sending") throw new Error("Delivery unknown; reconcile before retry");
+      if (mail.state === "sent") {
+        if (!mail.turnId) throw new Error("Missing turn receipt");
+        return { turnId: mail.turnId };
+      }
       if (lane.dispatchBlocked) return { queued: true, operationId: mail.id };
+      if (lane.runtime?.backend === "external-current-session") {
+        try { return await this.deps.runtime.input(key, args.text, args.operationId); }
+        catch (error) { if (error instanceof DeliveryDeferred) return { queued: true, operationId: mail.id }; throw error; }
+      }
       return this.deps.runtime.input(key, args.text, args.operationId);
     }
     if (action === "report") {
@@ -263,6 +417,7 @@ export class DoriService {
       return box.mark(args.id, { state: args.state, source: `reconciled: ${args.evidence}` });
     }
     if (action === "reopen" || action === "recover") {
+      if (key === "lead" || (await this.registry.read(key))?.role === "lead") throw new Error("Managed lead recovery is unsupported; use lead-attach for the current session");
       return this.launchQueue.run(key, async () => {
         let lane = await this.lane(key);
         if (action === "reopen" && statusOf(lane) !== "closed") throw new Error("Lane is not closed");
@@ -310,7 +465,7 @@ export class DoriService {
   async approvals(): Promise<{ id: string; key: string; requestId: string; request: unknown }[]> {
     const result: { id: string; key: string; requestId: string; request: unknown }[] = [];
     for (const lane of await this.registry.open()) {
-      if (!lane.runtime?.threadId) continue;
+      if (!lane.runtime?.threadId || lane.runtime.backend === "external-current-session") continue;
       try {
         const boot = readJson<Bootstrap>(bootstrapPath(this.config.stateDir, lane.key));
         const requests = await ipc<{ id: string; request: unknown }[]>(hostSocket(this.config.stateDir, lane.key), boot.hostToken, "approvals", {}, 1000);
@@ -380,6 +535,7 @@ export class DoriService {
       once("runtime-health", async () => {
         for (const lane of await this.registry.open()) {
           if (!lane.runtime || lane.runtime.state === "stopped" || lane.cleanupFence) continue;
+          if (lane.runtime.backend === "external-current-session") { await this.externalCall(lane, "inspect", {}).catch(() => {}); continue; }
           const age = Date.now() - Date.parse(lane.runtime.lastHeartbeatAt ?? lane.openedAt);
           if (age <= this.config.runtime.heartbeatTimeoutMs || lane.holdReason === "recovery") continue;
           await this.registry.update(lane.key, l => ({ ...l, dispatchBlocked: true, holdReason: l.holdReason ?? "recovery", runtime: l.runtime && { ...l.runtime, state: "recovering" } }));
@@ -389,6 +545,8 @@ export class DoriService {
       once("launch-queue", async () => {
         for (const row of this.operations.list().filter(r => r.state === "queued")) {
           const args = JSON.parse(row.text);
+          if (row.target === "lead" || args.role === "lead") continue;
+          if ((await this.registry.read(row.target))?.runtime?.backend === "external-current-session") continue;
           if (args.operationId) await this.handle("launch", args, { role: "admin" }).catch(() => {});
         }
       }),
@@ -396,8 +554,11 @@ export class DoriService {
         for (const row of this.inbox.list().filter(r => r.state === "queued")) {
           const lane = await this.registry.read(row.target);
           if (!lane || lane.dispatchBlocked || statusOf(lane) === "closed") continue;
+          if (lane.runtime?.backend === "external-current-session" && row.attachmentInstance && row.attachmentInstance !== lane.runtime.hostInstanceId) continue;
+          if (lane.runtime?.backend === "external-current-session" && this.attachment(lane).excludedInboxIds.includes(row.id)) continue;
           const snapshot = await this.deps.runtime.inspect(lane.key).catch(() => null);
           if (!snapshot || !["idle", "running"].includes(snapshot.state)) continue;
+          if (lane.runtime?.backend === "external-current-session" && snapshot.state !== "idle") continue;
           await this.deps.runtime.input(lane.key, row.text, row.id).catch(() => {});
         }
       }),
@@ -420,6 +581,7 @@ export const serve = async (config: DoriConfig): Promise<void> => {
   if (!existsSync(controlPath)) atomicJson(controlPath, { token: crypto.randomUUID() });
   if (existsSync(socket)) unlinkSync(socket);
   const service = new DoriService(config);
+  for (const lane of await service.registry.open()) if (lane.runtime?.backend === "external-current-session" && lane.runtime.state !== "stopped") await service.deps.runtime.inspect(lane.key).catch(() => {});
   const server = Bun.serve({ unix: socket, async fetch(request) {
     try {
       if (request.method !== "POST") return new Response(null, { status: 405 });
@@ -465,7 +627,7 @@ export const serve = async (config: DoriConfig): Promise<void> => {
   });
   clearInterval(timer); clearInterval(monitor);
   for (const child of children) child.kill();
-  for (const lane of await service.registry.open()) await service.deps.runtime.hold(lane.key, "automatic").catch(() => {});
+  for (const lane of await service.registry.open()) if (lane.runtime?.backend !== "external-current-session") await service.deps.runtime.hold(lane.key, "automatic").catch(() => {});
   service.stop(); server.stop(true);
   if (existsSync(socket)) unlinkSync(socket);
   if (readJson<{ instance: string }>(lockPath).instance === instance) unlinkSync(lockPath);

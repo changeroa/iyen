@@ -4,7 +4,10 @@ import { atomicJson, SerialQueue } from "./journal.ts";
 import { readJson } from "./ipc.ts";
 import { fill, type ArgvTemplate } from "./config.ts";
 import type { Runner } from "./run.ts";
-export type Mail = { id: string; target: string; text: string; state: "queued" | "sending" | "sent" | "unknown"; turnId?: string; thread?: string; source?: string; at: string };
+export type Mail = { id: string; target: string; text: string; state: "queued" | "sending" | "sent" | "unknown"; turnId?: string; thread?: string; source?: string; at: string; attachmentInstance?: string };
+// Only a pre-submission refusal can return mail to queued. Any attempted send
+// remains unknown until reconciled, even if the transport reports failure.
+export class DeliveryDeferred extends Error {}
 export class Mailbox {
   private rows: Record<string, Mail>;
   private queue = new SerialQueue();
@@ -35,7 +38,7 @@ export class Mailbox {
       if (row.state !== "queued") throw new Error("Delivery unknown; reconcile before retry");
       this.mark(id, { state: "sending" });
       try { const result = await action(row); return this.mark(id, { state: "sent", ...result }); }
-      catch (error) { this.mark(id, { state: "unknown" }); throw error; }
+      catch (error) { this.mark(id, { state: error instanceof DeliveryDeferred ? "queued" : "unknown" }); throw error; }
     });
   }
 }

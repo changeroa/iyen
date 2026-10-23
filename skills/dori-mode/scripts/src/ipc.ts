@@ -17,6 +17,7 @@ export const ipc = async <T = any>(socket: string, token: string, action: string
 };
 export const serviceClient = (config: DoriConfig) => {
   const scoped = process.env.DORI_CONTEXT ? readJson<{ token: string; key: string; stateDir: string }>(process.env.DORI_CONTEXT) : undefined;
+  if (process.env.DORI_CONTEXT && (!scoped || typeof scoped.token !== "string" || !scoped.token || typeof scoped.key !== "string" || !scoped.key)) throw new Error("Invalid scoped context; admin fallback prohibited");
   if (scoped && scoped.stateDir !== config.stateDir) throw new Error("Scoped context state mismatch");
   if (process.env.DORI_LANE_KEY && !scoped && !process.env.DORI_LANE_TOKEN) throw new Error("Lane capability missing; use the managed dori executable");
   const token = scoped?.token ?? process.env.DORI_LANE_TOKEN ?? readJson<{ token: string }>(join(config.stateDir, "control.json")).token;
