@@ -6,6 +6,7 @@ import { realClock, type Clock, type Runner } from "../run.ts";
 import { operationText, type Agent } from "./herdr.ts";
 import { connectObserver, readGoal, readLoadedThreads, readTurns, receipt, type Observer } from "./observer.ts";
 import type { Thread } from "./generated/v2/Thread.ts";
+import type { Turn } from "./generated/v2/Turn.ts";
 import type { RuntimeSnapshot } from "./types.ts";
 
 export const THREAD_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -25,7 +26,8 @@ export const sharedDaemon = async (run: Runner, binary: string, config: RuntimeC
 
 export class ExternalCurrentSession {
   constructor(readonly observer: Observer, readonly run: Runner, readonly config: RuntimeConfig,
-    readonly identity: ExternalIdentity, readonly binary: string, readonly clock: Clock = realClock) {}
+    readonly identity: ExternalIdentity, readonly binary: string, readonly clock: Clock = realClock,
+    readonly onObservedTurns: (turns: Turn[]) => Promise<void> = async () => {}) {}
 
   async inspect(): Promise<RuntimeSnapshot & { model?: string; effort?: string }> {
     const { threadId, pane, cwd } = this.identity;
@@ -45,6 +47,7 @@ export class ExternalCurrentSession {
     const state = flags.includes("waitingOnApproval") ? "waiting_approval" : flags.includes("waitingOnUserInput") || agent.agent_status === "blocked" ? "waiting_input" :
       thread.status.type === "systemError" ? "failed" : thread.status.type === "active" || active.length ? "running" : "idle";
     if (state === "running" && !active[0]) throw new Error("Attached active turn identity unknown");
+    await this.onObservedTurns(turns);
     // The user owns /model and effort choices. Observe them without changing or
     // pinning them as part of the pane/thread/cwd identity contract.
     return { threadId, state, activeTurnId: active[0]?.id, goal, model: thread.model ?? undefined, effort: thread.reasoningEffort ?? undefined };

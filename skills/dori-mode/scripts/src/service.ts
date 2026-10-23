@@ -19,7 +19,9 @@ import { WorkTimers } from "./work.ts";
 import { turnFailure } from "./turn-failure.ts";
 import { DeliveryDeferred, Mailbox, postHook } from "./mailbox.ts";
 import { ExternalCurrentSession, observeExternal, sharedDaemon, THREAD_UUID, type Attachment } from "./runtime/external-current-session.ts";
-import { connectObserver } from "./runtime/observer.ts";
+import { connectObserver, receiptInTurns } from "./runtime/observer.ts";
+import { operationText } from "./runtime/herdr.ts";
+import type { Turn } from "./runtime/generated/v2/Turn.ts";
 
 export type Caller = { role: "admin" | "lead" | "lane" | "host"; key?: string; instance?: string };
 export class DoriService {
@@ -60,6 +62,7 @@ export class DoriService {
           if (mail.attachmentInstance && mail.attachmentInstance !== lane.runtime.hostInstanceId) throw new DeliveryDeferred("Mail belongs to a previous lead attachment");
           if (this.attachment(lane).excludedInboxIds.includes(mail.id)) throw new DeliveryDeferred("Historical mail is held for explicit reconciliation");
           if (mail.state === "queued" && (await call<RuntimeSnapshot>(key, "inspect")).state !== "idle") throw new DeliveryDeferred("Attached session busy; input remains queued");
+          if (mail.state === "queued") this.inbox.mark(mail.id, { attachmentInstance: lane.runtime.hostInstanceId });
         }
         const delivered = await this.inbox.deliver(mail.id, async row => {
           const result = await call<{ turnId: string }>(key, "input", { text: row.text, operationId: row.id });
@@ -88,6 +91,24 @@ export class DoriService {
   private async holdExternal(instance: string): Promise<void> {
     await this.registry.update("lead", lane => lane.runtime?.hostInstanceId !== instance || lane.runtime.external?.detachedAt || lane.runtime.state === "stopped" ? lane : ({ ...lane, dispatchBlocked: true, holdReason: "recovery", runtime: { ...lane.runtime, held: true, state: "recovering", activeTurnId: undefined } }));
   }
+  private async recordExternalFailures(saved: Attachment, turns: Turn[]): Promise<void> {
+    const current = await this.registry.read("lead");
+    if (current?.runtime?.backend !== "external-current-session" || current.runtime.hostInstanceId !== saved.instance || current.runtime.external?.detachedAt) return;
+    const failed = new Map(turns.filter(turn => turn.status === "failed").map(turn => [turn.id, turn]));
+    if (!failed.size) return;
+    for (const mail of this.inbox.list()) {
+      if (mail.target !== "lead" || mail.attachmentInstance !== saved.instance || saved.excludedInboxIds.includes(mail.id) || !["sending", "sent", "unknown"].includes(mail.state)) continue;
+      const turnId = receiptInTurns(turns, operationText(mail.text, mail.id));
+      if (!turnId || (mail.state === "sent" && mail.turnId !== turnId)) continue;
+      const turn = failed.get(turnId);
+      if (!turn) continue;
+      const id = `failed-turn:lead:${saved.instance}:${turnId}`;
+      // Preserve first observation and resolution across repeated polling and
+      // restarts; never replace a durable failure's metadata or state.
+      if (!this.failures.get(id)) this.failures.put({ id, target: "lead", turnId, source: saved.instance, attachmentInstance: saved.instance,
+        text: JSON.stringify(turnFailure(turn.error)), state: "queued", at: new Date().toISOString() });
+    }
+  }
   private async externalCall(lane: Lane, action: string, args: any): Promise<unknown> {
     if (!["inspect", "input"].includes(action)) throw new Error(`External current-session ${action} is unsupported; use lead-detach`);
     let saved: Attachment;
@@ -98,7 +119,7 @@ export class DoriService {
     try {
       return await observeExternal(this.runner, this.config.runtime, saved, async observer => {
         connected = true;
-        const session = new ExternalCurrentSession(observer, this.runner, this.config.runtime, saved, saved.binary);
+        const session = new ExternalCurrentSession(observer, this.runner, this.config.runtime, saved, saved.binary, realClock, turns => this.recordExternalFailures(saved, turns));
         if (action === "input") return session.input(args.text, args.operationId, () => this.holdExternal(saved.instance));
         const snap = await session.inspect();
         if (snap.state === "failed") await this.holdExternal(saved.instance);
@@ -479,6 +500,7 @@ export class DoriService {
       await this.failureQueue.run(failure.id, async () => {
         if (this.failures.get(failure.id)?.state !== "queued") return;
         const lane = await this.lane(failure.target);
+        if (failure.attachmentInstance && (lane.runtime?.backend !== "external-current-session" || lane.runtime.hostInstanceId !== failure.attachmentInstance)) return;
         const metadata = JSON.parse(failure.text) as ReturnType<typeof turnFailure>;
         const text = `Codex task failed (${metadata.category}). ${metadata.guidance} The task was not automatically retried.`;
         if (lane.role !== "lead") {
@@ -486,7 +508,8 @@ export class DoriService {
         } else {
           // Completion notifications can precede the input RPC receipt. Keep the failure
           // pending until a sent receipt associates that turn with its owner thread.
-          const threads = [...new Set(this.inbox.list().filter(row => row.target === lane.key && row.state === "sent" && row.turnId === failure.turnId).map(row => row.thread).filter((thread): thread is string => Boolean(thread && thread !== "none")))];
+          const threads = [...new Set(this.inbox.list().filter(row => row.target === lane.key && row.state === "sent" && row.turnId === failure.turnId &&
+            (!failure.attachmentInstance || row.attachmentInstance === failure.attachmentInstance)).map(row => row.thread).filter((thread): thread is string => Boolean(thread && thread !== "none")))];
           if (!threads.length) return;
           for (const thread of threads) {
             const id = `notice:${failure.id}:${thread}`;
@@ -523,19 +546,23 @@ export class DoriService {
   }
   async tick(): Promise<void> {
     const once = async (name: string, fn: () => Promise<unknown>) => {
-      const interval = name === "inbox" || name === "failures" ? 1000 : name === "done" ? 30000 : name === "launch-queue" ? 10000 : 60000;
+      const interval = name === "inbox" || name === "failures" || name === "external-observation" ? 1000 : name === "done" ? 30000 : name === "launch-queue" ? 10000 : 60000;
       if (this.ticks.has(name) || Date.now() - (this.lastTick.get(name) ?? 0) < interval) return;
       this.lastTick.set(name, Date.now()); this.ticks.add(name);
       try { await fn(); } catch { console.error(`MONITOR_ERROR ${name}`); } finally { this.ticks.delete(name); }
     };
     await Promise.all([
+      once("external-observation", async () => {
+        const lead = await this.registry.read("lead");
+        if (lead?.runtime?.backend === "external-current-session" && lead.runtime.state !== "stopped" && !lead.runtime.external?.detachedAt) await this.externalCall(lead, "inspect", {}).catch(() => {});
+      }),
       once("failures", () => this.notifyFailures()),
       once("done", () => watchTick(this.deps).then(lines => lines.forEach(l => console.log(l)))),
       once("freshness", () => freshnessTick(this.deps, process.env.HOME ?? "")),
       once("runtime-health", async () => {
         for (const lane of await this.registry.open()) {
           if (!lane.runtime || lane.runtime.state === "stopped" || lane.cleanupFence) continue;
-          if (lane.runtime.backend === "external-current-session") { await this.externalCall(lane, "inspect", {}).catch(() => {}); continue; }
+          if (lane.runtime.backend === "external-current-session") continue;
           const age = Date.now() - Date.parse(lane.runtime.lastHeartbeatAt ?? lane.openedAt);
           if (age <= this.config.runtime.heartbeatTimeoutMs || lane.holdReason === "recovery") continue;
           await this.registry.update(lane.key, l => ({ ...l, dispatchBlocked: true, holdReason: l.holdReason ?? "recovery", runtime: l.runtime && { ...l.runtime, state: "recovering" } }));

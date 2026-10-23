@@ -94,7 +94,7 @@ test("CLI service and private backends manage visible Herdr agents with exact re
 
 test("current-session CLI attaches a busy existing lead, scopes controls, delivers ingress, restarts and detaches without terminating its daemon", async () => {
  const state=withState();let daemon:ReturnType<typeof Bun.spawn>|undefined;
- const threadId="01a166ff-9c30-74c0-a458-32c6abf5c54d",socketPath=join(socketDir(state.dir),"shared.sock"),statePath=join(state.dir,"external-state.json");
+ const threadId="11111111-1111-4111-8111-111111111111",socketPath=join(socketDir(state.dir),"shared.sock"),statePath=join(state.dir,"external-state.json");
  const server=Bun.serve({unix:socketPath,fetch(req,s){if(s.upgrade(req))return;return new Response(null,{status:400});},websocket:{message(ws,raw){
   const m=JSON.parse(String(raw));if(m.id===undefined)return;const snapshot=readJson<any>(statePath);
   const result=m.method==="initialize"?{}:m.method==="thread/read"?{thread:snapshot.thread}:m.method==="thread/loaded/list"?{data:[threadId],nextCursor:null}:m.method==="thread/goal/get"?{goal:null}:m.method==="thread/turns/list"?{data:snapshot.turns,nextCursor:null}:undefined;
@@ -140,13 +140,25 @@ test("current-session CLI attaches a busy existing lead, scopes controls, delive
   expect(readJson<any>(statePath).turns.find((t:any)=>t.id===delivered.turnId).items[0].content[0].text).toBe(operationText("literal owner message","ingress"));
   daemon!.kill("SIGTERM");await daemon!.exited;expect(await logs.err).toBe("");expect(await logs.out).toContain("DORI_SERVICE_READY");
   logs=await start();expect(JSON.parse((await exec([bridge,"status","lead"])).out)).toMatchObject({identityVerified:true,readiness:"ready",bridge});
+  await call("input",{key:"lead",text:"fixture-fail-auth",thread:"chat:failure",operationId:"failed-owner-input"});
+  const failedMail=await waitFor(()=>call("mail-list"),v=>v.outbox.some((m:any)=>m.target==="chat:failure"));
+  expect(failedMail.outbox.filter((m:any)=>m.target==="chat:failure")).toHaveLength(1);expect(failedMail.outbox.find((m:any)=>m.target==="chat:failure").text).toContain("Check Codex authentication");
+  expect(failedMail.failures.filter((m:any)=>m.turnId===failedMail.inbox.find((m:any)=>m.id==="failed-owner-input").turnId)).toHaveLength(1);
+  expect(JSON.stringify(failedMail.failures)).not.toContain("fixture-secret");
   const stop=await exec([bridge,"lead-detach","--thread-id",threadId]);expect(stop.code).toBe(0);expect(JSON.parse(stop.out)).toMatchObject({detached:true});
   expect((await exec([bridge,"status"])).code).toBe(1);await expect(ipc(serviceSocket(state.dir),saved.token,"status")).rejects.toThrow("Forbidden");
+  const deniedMarker=join(state.dir,"denied-local-command");
+  for(const args of [["heavy","denied","--",process.execPath,"-e",`await Bun.write(${JSON.stringify(deniedMarker)},"executed")`],
+    ["session-host","--state-dir",state.dir,"--key","denied-worker"],["session-host-start","--state-dir",state.dir,"--key","denied-worker"],["migrate","--apply"],["serve"],["transcribe","fixture.wav"],["send","slack","--to","fixture","--text","no send"]]){
+   const denied=await exec([bridge,...args]);expect(denied.code).toBe(1);expect(denied.err).toContain(`Scoped context cannot invoke local command ${args[0]}`);
+  }
+  expect(existsSync(deniedMarker)).toBe(false);expect(existsSync(join(state.dir,"hosts/denied-worker.error.json"))).toBe(false);expect(existsSync(join(state.dir,"heavy"))).toBe(false);
+  const scopedHelp=await exec([bridge,"help"]);expect(scopedHelp.code).toBe(0);expect(scopedHelp.out).toContain("lead-detach");expect(scopedHelp.out).not.toContain("migrate");
   const second=JSON.parse((await exec([process.execPath,cli,"lead-attach","--thread-id",threadId,"--pane","current:p","--cwd",state.dir])).out);expect(second.bridge).not.toBe(bridge);expect((await exec([bridge,"status"])).code).toBe(1);
   await call("lead-detach",{threadId});
   const observer=await connectObserver(socketPath,500);try{expect((await observer.read<any>("thread/read",{threadId})).thread.id).toBe(threadId);}finally{observer.close();}
   const calls=readFileSync(join(state.dir,"external-codex-calls.jsonl"),"utf8").trim().split("\n").map(l=>JSON.parse(l));
-  expect(calls.filter(a=>a[0]==="queue")).toHaveLength(1);expect(calls.every(a=>a.join(" ")==="app-server daemon version"||a[0]==="queue")).toBe(true);
+  expect(calls.filter(a=>a[0]==="queue")).toHaveLength(2);expect(calls.every(a=>a.join(" ")==="app-server daemon version"||a[0]==="queue")).toBe(true);
   const herdrCalls=readFileSync(join(state.dir,"fixture-herdr-calls.jsonl"),"utf8").trim().split("\n").map(l=>JSON.parse(l));expect(herdrCalls.every(a=>a[0]==="agent"&&a[1]==="get")).toBe(true);
   daemon!.kill("SIGTERM");await daemon!.exited;expect(await logs.err).toBe("");
  }finally{daemon?.kill();if(daemon)await daemon.exited;server.stop(true);state.done();}

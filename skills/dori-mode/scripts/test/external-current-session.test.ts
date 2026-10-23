@@ -16,9 +16,9 @@ const otherId = "22222222-2222-4222-8222-222222222222";
 let h: ReturnType<typeof fixture>;
 function fixture() {
   const state = withState(), socketPath = join(socketDir(state.dir), "shared.sock"), calls: string[][] = [], reads: string[] = [];
-  const config = { ...defaultConfig(), stateDir: state.dir, defaultCwd: state.dir, ingress: [{ id: "test", command: ["fixture"], owners: ["owner"] }], runtime: { ...defaultConfig().runtime, binary: process.execPath, rpcTimeoutMs: 80 } };
+  const config = { ...defaultConfig(), stateDir: state.dir, defaultCwd: state.dir, hooks: { threadReply: ["notify", "{thread}", "{text}"] }, ingress: [{ id: "test", command: ["fixture"], owners: ["owner"] }], runtime: { ...defaultConfig().runtime, binary: process.execPath, rpcTimeoutMs: 80 } };
   const thread: any = { id: threadId, cwd: realpathSync(state.dir), model: "retained-model", reasoningEffort: "high", status: { type: "idle" } };
-  let turns: any[] = [], loaded = true, accept = true, queueCode = 0, queueThrows = false, loseOnQueue = false, getCount = 0, driftAtGet = Infinity;
+  let turns: any[] = [], loaded = true, accept = true, queueCode = 0, queueThrows = false, loseOnQueue = false, getCount = 0, driftAtGet = Infinity, failQueuedTurn = false;
   const agent: any = { agent: "codex", pane_id: "w:p1", agent_status: "idle", agent_session: { agent: "codex", kind: "id", value: threadId } };
   const server = Bun.serve({ unix: socketPath, fetch(request, server) { if (server.upgrade(request)) return; return new Response(null, { status: 400 }); }, websocket: { message(ws, raw) {
     const m = JSON.parse(String(raw)); reads.push(m.method); if (m.id === undefined) return;
@@ -28,6 +28,7 @@ function fixture() {
   } } });
   const run: Runner = async argv => {
     calls.push([...argv]); const ok = (result: unknown) => ({ code: 0, err: "", out: JSON.stringify(result) });
+    if (argv[0] === "notify") return ok({});
     if (argv[0] === "herdr") {
       if (argv[1] === "agent" && argv[2] === "get") { if (++getCount >= driftAtGet) agent.agent_session.value = otherId; return ok({ result: { agent } }); }
       if (argv[1] === "agent" && argv[2] === "list") return ok({ result: { agents: [agent] } });
@@ -35,7 +36,8 @@ function fixture() {
     }
     if (argv.slice(1).join(" ") === "app-server daemon version") return ok({ status: "running", cliVersion: "0.163.0", appServerVersion: "0.163.0", socketPath });
     if (argv[1] === "queue") {
-      if (accept) turns.push({ id: "real-turn-id", status: "completed", items: [{ type: "userMessage", content: [{ type: "text", text: argv[5] }] }] });
+      if (accept) turns.push({ id: "real-turn-id", status: failQueuedTurn ? "failed" : "completed", items: [{ type: "userMessage", content: [{ type: "text", text: argv[5] }] }],
+        error: failQueuedTurn ? { codexErrorInfo: "unauthorized", message: "Authorization: Bearer secret-token\nprivate command dump" } : null });
       if (loseOnQueue) agent.agent_session.value = otherId;
       if (queueThrows) throw new Error("transport disconnect");
       return { code: queueCode, err: "", out: "submitted" };
@@ -43,7 +45,7 @@ function fixture() {
     throw new Error(`Unexpected mutation: ${argv.join(" ")}`);
   };
   const s = new DoriService(config, run), args = { threadId, pane: agent.pane_id, cwd: state.dir };
-  return { state, s, args, config, run, calls, reads, thread, agent, server, setTurns: (v: any[]) => turns = v,
+  return { state, s, args, config, run, calls, reads, thread, agent, server, setTurns: (v: any[]) => turns = v, getTurns: () => turns, failQueuedTurn: () => failQueuedTurn = true,
     busy() { thread.status = { type: "active", activeFlags: [] }; turns = [{ id: "owner-turn", status: "inProgress", items: [] }]; },
     idle() { thread.status = { type: "idle" }; turns = turns.map(t => ({ ...t, status: "completed" })); },
     unloaded() { loaded = false; thread.status = { type: "notLoaded" }; }, noReceipt() { accept = false; },
@@ -228,4 +230,57 @@ test("managed missing turn receipt stays unknown because validation runs inside 
   const host = Bun.serve({ unix: hostSocket(h.state.dir, key), fetch() { return Response.json({ result: {} }); } });
   try { await expect(h.s.handle("input", { key, text: "task", operationId: "missing-receipt" }, { role: "admin" })).rejects.toThrow("Missing turn receipt"); expect(h.s.inbox.get("missing-receipt")?.state).toBe("unknown"); }
   finally { host.stop(true); }
+});
+
+test("attached failure observed before receipt ACK waits for sent input, then notifies the exact owner once", async () => {
+  await attach(); const saved = readJson<any>(join(h.state.dir, "attachments/lead.json"));
+  const operationId = "early-failure", text = "owner task", turnId = "early-failed-turn";
+  h.s.inbox.put({ id: operationId, target: "lead", thread: "slack:owner", text, state: "sending", attachmentInstance: saved.instance, at: new Date().toISOString() });
+  h.setTurns([{ id: turnId, status: "failed", items: [{ type: "userMessage", content: [{ type: "text", text: operationText(text, operationId) }] }], error: { codexErrorInfo: "unauthorized", message: "Bearer secret-token\nprivate command dump" } }]);
+  await h.s.deps.runtime.inspect("lead"); await h.s.notifyFailures();
+  expect(h.s.failures.list()).toHaveLength(1); expect(h.s.failures.list()[0]).toMatchObject({ state: "queued", source: saved.instance, turnId }); expect(h.s.outbox.list()).toHaveLength(0);
+  h.s.inbox.mark(operationId, { state: "sent", turnId });
+  await Promise.all([h.s.notifyFailures(), h.s.notifyFailures()]);
+  expect(h.s.outbox.list()).toHaveLength(1); expect(h.s.outbox.list()[0]).toMatchObject({ target: "slack:owner", state: "sent" }); expect(h.s.outbox.list()[0]?.text).toContain("Check Codex authentication");
+  const restarted = new DoriService(h.config, h.run); await restarted.deps.runtime.inspect("lead"); await restarted.notifyFailures();
+  expect(restarted.failures.list()).toHaveLength(1); expect(restarted.failures.list()[0]?.state).toBe("sent"); expect(h.calls.filter(a => a[0] === "notify")).toHaveLength(1); expect(queueCalls()).toHaveLength(0);
+  expect(JSON.stringify({ failures: restarted.failures.list(), notices: restarted.outbox.list() })).not.toMatch(/secret-token|private command|Bearer/);
+});
+
+test("immediate failed attached input records durable failure while sending and preserves owner notices", async () => {
+  await attach(); h.failQueuedTurn();
+  const mark = h.s.inbox.mark.bind(h.s.inbox); let recordedBeforeAck = false;
+  h.s.inbox.mark = (id, patch) => {
+    if (id === "immediate-failure" && patch.state === "sent") { recordedBeforeAck = true; expect(h.s.failures.list()).toHaveLength(1); expect(h.s.outbox.list()).toHaveLength(0); }
+    return mark(id, patch);
+  };
+  await h.s.handle("input", { key: "lead", text: "owner task", operationId: "immediate-failure", thread: "slack:immediate" }, { role: "admin" });
+  expect(recordedBeforeAck).toBe(true); await h.s.notifyFailures(); expect(h.s.outbox.list()[0]).toMatchObject({ target: "slack:immediate", state: "sent" }); expect(queueCalls()).toHaveLength(1);
+});
+
+test("later terminal failure is observed by the regular sweep and deduplicates across restart", async () => {
+  await attach(); await h.s.handle("input", { key: "lead", text: "owner task", operationId: "late-failure", thread: "slack:late" }, { role: "admin" });
+  expect(h.s.failures.list()).toHaveLength(0); const turn = h.getTurns()[0]; turn.status = "failed"; turn.error = { codexErrorInfo: "usageLimitExceeded" };
+  await h.s.tick(); await h.s.notifyFailures(); expect(h.s.failures.list()).toHaveLength(1); expect(h.s.outbox.list()[0]).toMatchObject({ target: "slack:late", state: "sent" }); expect(h.s.outbox.list()[0]?.text).toContain("limits or quota");
+  const restarted = new DoriService(h.config, h.run); await restarted.tick(); await restarted.notifyFailures();
+  expect(restarted.outbox.list()).toHaveLength(1); expect(h.calls.filter(a => a[0] === "notify")).toHaveLength(1); expect(queueCalls()).toHaveLength(1);
+});
+
+test("historical, manual, unattempted and previous-generation failed turns cannot notify this attachment", async () => {
+  const historicText = operationText("history", "historic");
+  h.s.inbox.put({ id: "historic", target: "lead", text: "history", thread: "slack:old", state: "sent", turnId: "old-turn", attachmentInstance: "old-generation", at: "2020-01-01" });
+  h.setTurns([{ id: "old-turn", status: "failed", items: [{ type: "userMessage", content: [{ type: "text", text: historicText }] }], error: { codexErrorInfo: "unauthorized" } }]);
+  await attach(); const saved = readJson<any>(join(h.state.dir, "attachments/lead.json"));
+  h.s.inbox.put({ id: "queued", target: "lead", text: "unattempted", thread: "slack:queued", state: "queued", attachmentInstance: saved.instance, at: new Date().toISOString() });
+  h.getTurns().push({ id: "manual-turn", status: "failed", items: [{ type: "userMessage", content: [{ type: "text", text: "manual session input" }] }], error: { codexErrorInfo: "unauthorized" } },
+    { id: "unattempted-turn", status: "failed", items: [{ type: "userMessage", content: [{ type: "text", text: operationText("unattempted", "queued") }] }] });
+  await h.s.deps.runtime.inspect("lead"); await h.s.notifyFailures(); expect(h.s.failures.list()).toHaveLength(0); expect(h.s.outbox.list()).toHaveLength(0);
+});
+
+test("a failure tied to unknown input remains pending without notice or input replay", async () => {
+  await attach(); const saved = readJson<any>(join(h.state.dir, "attachments/lead.json"));
+  h.s.inbox.put({ id: "unknown-input", target: "lead", text: "uncertain", thread: "slack:unknown", state: "unknown", attachmentInstance: saved.instance, at: new Date().toISOString() });
+  h.setTurns([{ id: "unknown-turn", status: "failed", items: [{ type: "userMessage", content: [{ type: "text", text: operationText("uncertain", "unknown-input") }] }], error: { codexErrorInfo: "unauthorized" } }]);
+  const restarted = new DoriService(h.config, h.run); await restarted.tick(); await restarted.notifyFailures();
+  expect(restarted.failures.list()).toHaveLength(1); expect(restarted.failures.list()[0]?.state).toBe("queued"); expect(restarted.outbox.list()).toHaveLength(0); expect(restarted.inbox.get("unknown-input")?.state).toBe("unknown"); expect(queueCalls()).toHaveLength(0);
 });
