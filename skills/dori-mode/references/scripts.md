@@ -1,6 +1,6 @@
 # CLI and runtime
 
-The Bun/TypeScript package exposes dori. Real Codex TUIs run the lead and each lane in Herdr, each connected to a dedicated app-server endpoint; dori serve owns lifecycle state, monitor schedules and durable input/output ledgers. Herdr owns tabs, TUI start/resume, prompts, interactive controls and exit. The off-pane host uses an allowlisted Unix WebSocket observer; it cannot start/resume threads, submit turns, or answer approvals. Managed agents use the required `dori_runtime.control` stdio MCP tool; operator CLI and host control use local sockets. See sessions.md for Done signal grammar.
+The Bun/TypeScript package exposes dori. The lead attaches to the existing Codex conversation and shared daemon; worker TUIs run in Herdr with dedicated app-server endpoints; dori serve owns lifecycle state, monitor schedules and durable input/output ledgers. Herdr owns tabs, TUI start/resume, prompts, interactive controls and exit. The off-pane host uses an allowlisted Unix WebSocket observer; it cannot start/resume threads, submit turns, or answer approvals. Managed agents use the required `dori_runtime.control` stdio MCP tool; operator CLI and host control use local sockets. See sessions.md for Done signal grammar.
 
 ```sh
 bun install --frozen-lockfile
@@ -43,11 +43,13 @@ Run dori help for all flags.
 
 Timers are private readable JSON at `<stateDir>/work/<id>.json` and survive service restarts. The service serializes timer writes. Start after the intake lookup and before work; stop immediately before the final reply and include start/end timestamps and elapsed seconds. Similarity supplies duration facts, not a routing verdict: delegate if similar work took at least the configured threshold; otherwise use the skill’s direct/complex-work rules. Resource HOLD still means queue.
 
-Managed Codex leads use `dori_runtime.control` actions `work-start` (`title,tags?,thread?,operationId` with a stable UUID), `work-stop` (`id`), and `work-similar` (`title?,tags?`). These are lead/operator-only; lanes cannot read or change direct-task timers. Operators use the CLI above, which calls the same service. No sandbox CLI or extra network permission is needed.
+Managed MCP clients use `dori_runtime.control` actions `work-start` (`title,tags?,thread?,operationId` with a stable UUID), `work-stop` (`id`), and `work-similar` (`title?,tags?`). These are lead/operator-only; lanes cannot read or change direct-task timers. Operators use the CLI above, which calls the same service. No sandbox CLI or extra network permission is needed.
 
 
 - serve: one state writer, socket owner, monitor supervisor. A second owner is refused.
-- lead: open the reserved Codex lead, once.
+- lead / lead-attach --thread-id UUID --pane ID --cwd DIR: attach the verified current Codex session as the lead. Returns its absolute generation-scoped bridge. No new lead TUI or backend is created. Repeating the same identity is idempotent.
+- lead-detach --thread-id UUID: detach only the expected lead, revoke its bridge, and preserve the user session and daemon.
+- An attached lead receives queued messages only when idle; exact persisted user-message receipts confirm delivery. Unknown results are not replayed. Startup revalidates attachments without launching Codex. Managed pause/resume/close/recover commands do not apply to attached leads.
 - launch KEY: validate Done, enforce resources, optionally create an owned worktree, create tab/host, persist thread.id, submit brief. Supply --operation-id when callers may replay requests.
 - input KEY --text-file FILE: structured input; active turns are steered. Paused inputs remain queued.
 - report KEY --kind KIND --text-file FILE --event-id ID: milestone/blocker/question/done event. A done report alone does not claim completion.
@@ -132,7 +134,7 @@ This initializes the installed Codex 0.163.0 with a temporary home, creates a th
 
 Protocol and configuration references: [Codex App Server](https://learn.chatgpt.com/docs/app-server), [Shell environment policy](https://learn.chatgpt.com/docs/config-file/config-advanced). Per-thread MCP setup is also checked against the locally generated version-specific schema and the opt-in smoke test.
 
-## Visible runtime and recovery
+## Managed worker runtime and recovery
 
 `session-host` is an off-pane supervisor. It starts a dedicated app-server Unix socket, then uses `herdr agent start` to run the interactive TUI with an explicit `--remote` endpoint. The first prompt is a tiny handshake, never the full task. The exact backend-owned thread ID is verified against the handshake/resume and reported to Herdr before task dispatch. A missing or `notLoaded` thread, changed TUI occupant, unknown goal, or duplicate receipt blocks dispatch.
 
@@ -145,10 +147,10 @@ Blocked transitions create one durable lead/owner notice pointing to the real TU
 Existing visible sessions reopen with the same recorded thread. Legacy private-RPC sessions use an operator-authenticated handoff because remote resume can preserve obsolete developer instructions. After fully stopping the old host/backend and closing its TUI, use:
 
 ```sh
-dori recover lead --new-session --handoff-file /absolute/path/verified-handoff.md
-dori status lead
+dori recover WORKER_KEY --new-session --handoff-file /absolute/path/verified-handoff.md
+dori status WORKER_KEY
 dori mail list
-dori resume lead
+dori resume WORKER_KEY
 ```
 
 The handoff must identify the old thread/history path, confirmed work, pending work and unknown operations. Recovery preserves `runtimeHistory`, old bootstrap/checkpoints and the handoff under `hosts/history/`; the original Codex history remains in its established home. The new session starts held and the handoff queues durably until explicit resume. This is a new identity, not claimed thread continuity. Existing unknown inbox/outbox rows still require explicit reconciliation.

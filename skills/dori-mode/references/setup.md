@@ -12,20 +12,21 @@ bun install --frozen-lockfile
 bun link
 ```
 
-Copy references/config.example.json to ~/.dori/config.json only for a new installation. Set defaultCwd and laneWorkspace. Set an explicit model and reasoning effort for both runtime roles; launch validates them against the installed catalog. The private sidecar inherits the established CODEX_HOME settings/tools/plugins/auth/history and adds process-scoped Dori overrides without writing global config. Set runtime.settingsHome only when selecting another established settings home. Configure sandbox and approval policy explicitly; installation never relaxes them. Preserve existing config and use migration for legacy installs.
+Copy references/config.example.json to ~/.dori-codex/config.json only for a new installation. Set defaultCwd and an existing laneWorkspace. Set an explicit model and reasoning effort for workers; launch validates them against the installed catalog. The current-session lead retains its existing model, effort and permissions. The private sidecar inherits the established CODEX_HOME settings/tools/plugins/auth/history and adds process-scoped Dori overrides without writing global config. Set runtime.settingsHome only when selecting another established settings home. Configure sandbox and approval policy explicitly; installation never relaxes them. Preserve existing config and use migration for legacy installs.
 
 ```sh
+export DORI_CONFIG="$HOME/.dori-codex/config.json"
 dori doctor
 dori serve
 ```
 
-Keep serve running in a supervised terminal or the host's existing process supervisor. In another terminal:
+Keep serve running in the host's process supervisor. Link this repository's `skills/iyen` directory into `~/.codex/skills/iyen`, then ask the current Codex conversation to start Iyen mode. The skill verifies the current UUID and pane and runs:
 
 ```sh
-dori lead
+python3 /path/to/iyen/skills/iyen/scripts/activate.py start --session UUID --pane PANE
 ```
 
-The service opens a no-focus Herdr lead tab. Every work lane has its own tab and Codex process. The terminal shows streamed responses; operators use dori input and approval commands for control. Managed agents use the required stdio MCP tool, so lifecycle commands do not require network-enabled sandbox access.
+The current conversation becomes the lead. No new lead TUI or private backend is created. The returned absolute `bridge` executable provides scoped lead commands; its status self-check must succeed before activation is reported. It requires the current sandbox to permit that executable and local socket access; permissions are never widened automatically. `stop --session UUID` revokes routing without closing the conversation. Managed worker lanes keep their own tabs, Codex processes and scoped stdio MCP tools.
 
 ## Messenger
 

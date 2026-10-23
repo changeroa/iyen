@@ -2,9 +2,9 @@
 
 # Dori — Codex 런타임
 
-하나의 메신저 봇이 요청을 받고, 리드가 작업마다 독립된 Codex 세션을 Herdr 탭에 열어 맡깁니다. **리드와 모든 레인은 Codex app-server로 실행**하며 OMO 설치가 필요하지 않습니다.
+`iyen` 스킬을 설치한 뒤 현재 Codex 대화에서 **“이연 모드 시작”**이라고 요청하면 그 대화가 이연 리드가 됩니다. 별도 리드는 띄우지 않습니다. 이연은 메신저 요청을 받고, 필요한 작업만 독립된 Codex 작업자 세션에 맡깁니다.
 
-기존 시스템 구조는 유지합니다. 메신저 스레드와 작업 레인 연결, 진행 보고, 5분 완료 이의 제기, 실제 Done 증거 확인, 자원 제한과 heavy 슬롯은 그대로입니다. `dori serve`가 감시와 상태 저장을 담당하고, Codex가 추론·도구·turn·goal을 실행합니다. 에이전트는 레인별 권한을 가진 stdio MCP 도구로 서비스를 제어하므로 명령 sandbox의 네트워크 권한을 넓히지 않습니다.
+기존 시스템 구조는 유지합니다. 메신저 스레드와 작업 레인 연결, 진행 보고, 5분 완료 이의 제기, 실제 Done 증거 확인, 자원 제한과 heavy 슬롯은 그대로입니다. `dori serve`가 감시와 상태 저장을 담당하고, Codex가 추론·도구·turn·goal을 실행합니다. 작업자는 레인별 stdio MCP를, 현재 세션의 리드는 등록 시 받은 전용 실행 파일을 사용합니다. 기존 세션의 모델과 권한은 유지합니다.
 
 ## 설치와 시작
 
@@ -16,14 +16,17 @@ bun install --frozen-lockfile
 bun link
 ```
 
-신규 설치만 `references/config.example.json`을 `~/.dori/config.json`으로 복사하세요. `defaultCwd`, `laneWorkspace`, 메신저 hook과 owner ID를 설정합니다. 기존 설정은 덮어쓰지 않고 마이그레이션합니다.
+신규 설치만 `references/config.example.json`을 `~/.dori-codex/config.json`으로 복사하세요. `defaultCwd`, `laneWorkspace`, 메신저 hook과 owner ID를 설정합니다. 기존 설정은 덮어쓰지 않고 마이그레이션합니다.
 
 ```sh
+export DORI_CONFIG="$HOME/.dori-codex/config.json"
 dori doctor
 dori serve
-# 별도 터미널에서
-dori lead
+# 현재 Codex 세션의 검증된 UUID와 Herdr pane으로 연결
+python3 /path/to/iyen/skills/iyen/scripts/activate.py start --session UUID --pane PANE
 ```
+
+`skills/iyen` 폴더를 `~/.codex/skills/iyen`에 연결하면 시작 스킬을 사용할 수 있습니다. 리드 제어에는 시작 결과의 `bridge` 실행 경로를 사용합니다. `stop --session UUID`는 이연 연결만 해제하고 현재 대화는 유지합니다. 대화가 작업 중이면 메시지는 대기하며, 세션을 닫으면 전달이 보류됩니다.
 
 `doctor`는 버전·프로토콜·인증 상태·모델을 확인하며 모델 추론을 호출하지 않습니다. Codex의 기존 로그인을 사용하고, 토큰을 설정 파일에 저장하지 않습니다.
 
@@ -45,7 +48,7 @@ dori claim-done fix-login --evidence "PR과 merge SHA"
 
 Telegram·Discord·Slack 클라이언트, 입력 표시, draft, presence, 음성 변환, thread 추적을 유지합니다. 봇 이름, 말투, 사용자·봇 Slack 토큰 선택, 연동별 온보딩 동의도 유지합니다. 실제 수신은 ACK 후 cursor를 전진시키는 ingress 어댑터를 설정해야 합니다. 사람이 읽는 messenger watch 출력을 그대로 연결하면 안 됩니다.
 
-요청을 분류하기 전에 `dori work similar --title "작업"` 또는 `--tag`로 이력을 확인합니다. 비슷한 작업이 `workThresholdSec`(기본 120초) 이상 걸렸다면 레인에 위임합니다. 작은 직접 작업은 `dori work start --title "작업"` / `dori work stop ID`로 측정하고 최종 보고에 시작·종료 시각과 소요 초를 포함합니다. 복잡한 작업은 범위와 완료 조건이 분명한 레인에 나누고 통합 검증합니다. Codex 리드는 MCP의 `work-similar`, `work-start`, `work-stop`을 사용하며 운영자 CLI도 같은 서비스를 호출합니다.
+요청을 분류하기 전에 `dori work similar --title "작업"` 또는 `--tag`로 이력을 확인합니다. 비슷한 작업이 `workThresholdSec`(기본 120초) 이상 걸렸다면 레인에 위임합니다. 작은 직접 작업은 `dori work start --title "작업"` / `dori work stop ID`로 측정하고 최종 보고에 시작·종료 시각과 소요 초를 포함합니다. 복잡한 작업은 범위와 완료 조건이 분명한 레인에 나누고 통합 검증합니다. 리드는 전용 bridge의 `work similar`, `work start`, `work stop`을 사용하며 운영자 CLI도 같은 서비스를 호출합니다.
 
 
 ## 이전과 복구
