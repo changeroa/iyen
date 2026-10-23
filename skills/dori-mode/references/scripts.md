@@ -31,7 +31,7 @@ Use ~/.dori/config.json or DORI_CONFIG. DORI_STATE_DIR overrides state placement
 | hooks | threadReply, threadDone, transcribe argv templates |
 | ingress | owner-filtered, replayable JSON-line source processes |
 
-Models must be IDs from Codex model/list. Provider/model routes and silent model fallback are not supported. The CLI requires the pinned version and doctor checks startup, authentication metadata, model selection and local tools without calling a model.
+Models must be IDs from Codex model/list. Provider/model routes and silent model fallback are not supported. Managed worker startup requires the pinned version and doctor checks startup, authentication metadata, model selection and local tools without calling a model.
 
 ## Commands
 
@@ -49,6 +49,7 @@ Managed MCP clients use `dori_runtime.control` actions `work-start` (`title,tags
 - serve: one state writer, socket owner, monitor supervisor. A second owner is refused.
 - lead / lead-attach --thread-id UUID --pane ID --cwd DIR: attach the verified current Codex session as the lead. Returns its absolute generation-scoped bridge. No new lead TUI or backend is created. Repeating the same identity is idempotent.
 - lead-detach --thread-id UUID: detach only the expected lead, revoke its bridge, and preserve the user session and daemon.
+- After a supported daemon update, repeat lead-attach for the same UUID, pane, cwd and socket. It verifies the new binary/version while preserving attachment credentials, historical exclusions and eligible queued messages. Unknown delivery is never replayed. Public runtime.external.holdReason explains a hold; messenger acknowledgments confirm storage, not receipt by the lead.
 - An attached lead receives queued messages only when idle; exact persisted user-message receipts confirm delivery. Unknown results are not replayed. Startup revalidates attachments without launching Codex. Managed pause/resume/close/recover commands do not apply to attached leads.
 - launch KEY: validate Done, enforce resources, optionally create an owned worktree, create tab/host, persist thread.id, submit brief. Supply --operation-id when callers may replay requests.
 - input KEY --text-file FILE: structured input; active turns are steered. Paused inputs remain queued.

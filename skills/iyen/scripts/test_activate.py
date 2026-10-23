@@ -107,6 +107,18 @@ class ActivationTests(unittest.TestCase):
         with self.assertRaisesRegex(activate.ActivationError, "not ready"):
             self.run_helper()
 
+    def test_held_status_explains_runtime_version_change_without_reattaching(self):
+        self.args.action = "status"
+        self.lead["dispatchBlocked"] = True
+        self.lead["readiness"] = "held"
+        self.lead["runtime"]["external"] = {"holdReason": {
+            "code": "runtime-version-changed",
+            "message": "Codex client 0.163.0 and daemon 0.164.0 differ; explicitly reattach."
+        }}
+        with self.assertRaisesRegex(activate.ActivationError, "daemon 0.164.0 differ"):
+            self.run_helper()
+        self.assertFalse(any("lead-attach" in argv for argv, _ in self.calls))
+
 
 if __name__ == "__main__":
     unittest.main()
