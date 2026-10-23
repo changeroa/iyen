@@ -7,21 +7,36 @@ import { operationText, type Agent } from "./herdr.ts";
 import { connectObserver, readGoal, readLoadedThreads, readTurns, receipt, type Observer } from "./observer.ts";
 import type { Thread } from "./generated/v2/Thread.ts";
 import type { Turn } from "./generated/v2/Turn.ts";
-import type { RuntimeSnapshot } from "./types.ts";
+import type { ExternalHoldCode, RuntimeSnapshot } from "./types.ts";
 
 export const THREAD_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export type ExternalIdentity = { threadId: string; pane: string; cwd: string; model?: string; effort?: string };
-export type Attachment = ExternalIdentity & { instance: string; generation: number; token: string; socketPath: string; binary: string; bridge: string; excludedInboxIds: string[] };
+export type Attachment = ExternalIdentity & { instance: string; generation: number; token: string; socketPath: string; binary: string; binaryVersion?: string; bridge: string; excludedInboxIds: string[] };
 
+// External sessions borrow a user-owned runtime. This explicit protocol support
+// table is independent of the managed host's requiredVersion pin.
+const supportedVersions = new Set(["0.163.0", "0.164.0"]);
+export class ExternalSessionError extends Error {
+  constructor(readonly code: ExternalHoldCode, message: string) { super(message); }
+}
+const safeVersion = (version: unknown): string => typeof version === "string" && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(version) ? version : "unrecognized";
 // Version is a supported read-only command: never start/restart/configure the
 // user's daemon to obtain an endpoint.
-export const sharedDaemon = async (run: Runner, binary: string, config: RuntimeConfig): Promise<{ socketPath: string }> => {
-  const result = await run([binary, "app-server", "daemon", "version"], { timeoutMs: config.rpcTimeoutMs });
-  if (result.code !== 0) throw new Error("Shared Codex daemon unavailable; attachment requires an already-running daemon");
-  const version = JSON.parse(result.out);
-  if (version.status !== "running" || version.cliVersion !== config.requiredVersion || version.appServerVersion !== config.requiredVersion ||
-      typeof version.socketPath !== "string" || !isAbsolute(version.socketPath)) throw new Error("Unsupported shared Codex daemon identity/version");
-  return { socketPath: version.socketPath };
+export const sharedDaemon = async (run: Runner, binary: string, config: RuntimeConfig): Promise<{ socketPath: string; binaryVersion: string }> => {
+  let version: any;
+  try {
+    const result = await run([binary, "app-server", "daemon", "version"], { timeoutMs: config.rpcTimeoutMs });
+    if (result.code !== 0) throw new Error();
+    version = JSON.parse(result.out);
+  } catch { throw new ExternalSessionError("runtime-unavailable", "Shared Codex runtime unavailable; delivery is waiting for reconnection."); }
+  if (version?.status !== "running" || typeof version.socketPath !== "string" || !isAbsolute(version.socketPath))
+    throw new ExternalSessionError("runtime-unavailable", "Shared Codex runtime identity unavailable; delivery is waiting for reconnection.");
+  const client = safeVersion(version.cliVersion), server = safeVersion(version.appServerVersion);
+  if (version.cliVersion !== version.appServerVersion)
+    throw new ExternalSessionError("runtime-version-changed", `Shared Codex runtime version changed (client ${client}, server ${server}); explicitly reattach with a supported matching client.`);
+  if (!supportedVersions.has(version.cliVersion))
+    throw new ExternalSessionError("runtime-version-unsupported", `Unsupported shared Codex runtime version (client ${client}, server ${server}); supported pairs are 0.163.0/0.163.0 and 0.164.0/0.164.0.`);
+  return { socketPath: version.socketPath, binaryVersion: version.appServerVersion };
 };
 
 export class ExternalCurrentSession {
@@ -53,10 +68,10 @@ export class ExternalCurrentSession {
     return { threadId, state, activeTurnId: active[0]?.id, goal, model: thread.model ?? undefined, effort: thread.reasoningEffort ?? undefined };
   }
 
-  async input(text: string, id: string, onIdentityLoss: () => Promise<void>): Promise<{ turnId: string }> {
+  async input(text: string, id: string, onIdentityLoss: (error: unknown) => Promise<void>): Promise<{ turnId: string }> {
     const verify = async () => {
       try { return await this.inspect(); }
-      catch { await onIdentityLoss(); throw new DeliveryDeferred("Attached identity unavailable; dispatch held"); }
+      catch (error) { await onIdentityLoss(error); throw new DeliveryDeferred("Attached identity unavailable; dispatch held"); }
     };
     const snap = await verify();
     if (snap.state !== "idle") throw new DeliveryDeferred("Attached session busy; input remains queued");
@@ -74,7 +89,7 @@ export class ExternalCurrentSession {
     const deadline = this.clock.now() + this.config.rpcTimeoutMs;
     do {
       // Verify borrowed identity before accepting any observed receipt too.
-      try { await this.inspect(); } catch { await onIdentityLoss(); throw new Error("Attached identity lost after submission; delivery unknown"); }
+      try { await this.inspect(); } catch (error) { await onIdentityLoss(error); throw new Error("Attached identity lost after submission; delivery unknown"); }
       const turnId = await receipt(this.observer, this.identity.threadId, marked);
       if (turnId) return { turnId };
       await this.clock.sleep(100);
@@ -83,10 +98,12 @@ export class ExternalCurrentSession {
   }
 }
 
-export const observeExternal = async <T>(run: Runner, config: RuntimeConfig, attachment: Pick<Attachment, "binary" | "socketPath">,
+export const observeExternal = async <T>(run: Runner, config: RuntimeConfig, attachment: Pick<Attachment, "binary" | "socketPath" | "binaryVersion">,
   action: (observer: Observer) => Promise<T>): Promise<T> => {
   const daemon = await sharedDaemon(run, attachment.binary, config);
-  if (daemon.socketPath !== attachment.socketPath) throw new Error("Shared daemon affinity changed; explicit attachment required");
-  const observer = await connectObserver(daemon.socketPath, config.rpcTimeoutMs);
+  if (daemon.socketPath !== attachment.socketPath) throw new ExternalSessionError("identity-unverified", "Shared Codex daemon affinity changed; explicit attachment required.");
+  if (attachment.binaryVersion && daemon.binaryVersion !== attachment.binaryVersion)
+    throw new ExternalSessionError("runtime-version-changed", `Shared Codex runtime version changed (attached ${safeVersion(attachment.binaryVersion)}, observed ${daemon.binaryVersion}); explicit attachment required.`);
+  const observer = await connectObserver(daemon.socketPath, config.rpcTimeoutMs).catch(() => { throw new ExternalSessionError("runtime-unavailable", "Shared Codex observer unavailable; delivery is waiting for reconnection."); });
   try { return await action(observer); } finally { observer.close(); }
 };
