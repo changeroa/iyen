@@ -16,9 +16,10 @@ type Workspace = { replies: Record<string, { ts: string; user?: string; text: st
 const slackFake = (w: Workspace) => {
   const calls: string[] = [];
   const http: Http = async (req: HttpRequest): Promise<HttpResponse> => {
-    const method = req.url.split("/").pop() ?? "";
+    const url = new URL(req.url);
+    const method = url.pathname.split("/").pop() ?? "";
     calls.push(method);
-    const p = JSON.parse(String(req.body ?? "{}")) as Record<string, unknown>;
+    const p = (req.method === "GET" ? Object.fromEntries(url.searchParams) : JSON.parse(String(req.body ?? "{}"))) as Record<string, unknown>;
     const body = (b: unknown): HttpResponse => ({ status: 200, headers: {}, body: JSON.stringify({ ok: true, ...(b as object) }) });
     if (method === "chat.postMessage") {
       const ts = `${w.nextTs++}.000100`;
