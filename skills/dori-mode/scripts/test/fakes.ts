@@ -18,7 +18,7 @@ export type World = {
   dirty: string;
   stuckReads: number;
   screen: string;
-  panes: { pane_id: string; workspace_id: string; agent?: string; agent_status?: string; title?: string; cwd?: string }[];
+  panes: { pane_id: string; workspace_id: string; agent?: string; agent_status?: string; agent_session?: { agent: string; kind: string; value: string }; title?: string; cwd?: string }[];
   /** agent_status the target pane moves to when Enter is pressed (models a lane picking up the message). */
   onEnterStatus?: string;
   /** Screens returned by successive reads; falls back to `screen` when empty. */

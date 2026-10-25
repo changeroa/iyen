@@ -44,6 +44,8 @@ dori claim-done fix-login --evidence "PR과 merge SHA"
 
 병렬 코드 작업에는 `--worktree`를 사용합니다. 진행 보고는 `dori report`, 사용자 답변은 `dori reply`, 후속 입력은 `dori input --text-file`로 전달합니다. 완료 요청 후 5분이 지나도 변경 파일·미추적 파일·미푸시 커밋이 있거나 실행 중단이 확인되지 않으면 닫지 않습니다. `dori reopen`은 같은 Codex thread와 기존 메신저 스레드를 이어갑니다.
 
+이연 리드가 연결된 동안 서비스는 리드와 등록된 작업자의 Herdr 상태 변화를 확인해 해당 메신저 스레드에 진행·대기·응답 종료 상태를 알립니다. 리드의 직접 작업은 실제로 전달된 요청의 Codex turn과 스레드가 일치할 때만 알립니다. 리드 연결이 해제되면 진행 상태용 Herdr 조회와 알림을 멈춥니다. 상태 알림은 작업 완료 증거가 아니며, 구체적인 단계와 결과는 작업자가 `dori report`로 보냅니다.
+
 화면을 읽어 세션 상태를 추측하거나 Enter/Escape로 제어하지 않습니다. 중단 실패 시에도 새 입력은 차단합니다. 결과를 모르는 전송은 `dori mail list`에 남기고 자동 재실행하지 않습니다. 승인은 `dori approval list/respond`로 정확한 요청에 연결합니다.
 
 Telegram·Discord·Slack 클라이언트, 입력 표시, draft, presence, 음성 변환, thread 추적을 유지합니다. 봇 이름, 말투, 사용자·봇 Slack 토큰 선택, 연동별 온보딩 동의도 유지합니다. 실제 수신은 ACK 후 cursor를 전진시키는 ingress 어댑터를 설정해야 합니다. 사람이 읽는 messenger watch 출력을 그대로 연결하면 안 됩니다.
