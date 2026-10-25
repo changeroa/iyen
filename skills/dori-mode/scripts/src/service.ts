@@ -8,6 +8,7 @@ import { claimDone, closeLane, objectDone, watchTick, type FlowDeps } from "./do
 import { pauseLane, resumeLane } from "./pause.ts";
 import { launchLane, quoteForPane, validateLaunch, LaunchError, type LaunchInput } from "./launch.ts";
 import { freshnessTick } from "./freshness.ts";
+import { herdrProgressTick } from "./herdr-progress.ts";
 import { deadPaneTick } from "./dead-panes.ts";
 import { syncRegistry } from "./sync.ts";
 import { sampleHost, guardTick } from "./host-guard.ts";
@@ -587,7 +588,7 @@ export class DoriService {
   }
   async tick(): Promise<void> {
     const once = async (name: string, fn: () => Promise<unknown>) => {
-      const interval = name === "inbox" || name === "failures" || name === "external-observation" ? 1000 : name === "done" ? 30000 : name === "launch-queue" ? 10000 : 60000;
+      const interval = name === "inbox" || name === "failures" || name === "external-observation" ? 1000 : name === "herdr-progress" ? 5000 : name === "done" ? 30000 : name === "launch-queue" ? 10000 : 60000;
       if (this.ticks.has(name) || Date.now() - (this.lastTick.get(name) ?? 0) < interval) return;
       this.lastTick.set(name, Date.now()); this.ticks.add(name);
       try { await fn(); } catch { console.error(`MONITOR_ERROR ${name}`); } finally { this.ticks.delete(name); }
@@ -598,6 +599,11 @@ export class DoriService {
         if (lead?.runtime?.backend === "external-current-session" && lead.runtime.state !== "stopped" && !lead.runtime.external?.detachedAt) await this.deps.runtime.inspect(lead.key).catch(() => {});
       }),
       once("failures", () => this.notifyFailures()),
+      once("herdr-progress", () => herdrProgressTick(this.deps, (turnId, instance) => {
+        const lead = this.inbox.list().filter(row => row.target === "lead" && row.state === "sent" && row.turnId === turnId &&
+          row.attachmentInstance === instance && row.thread && row.thread !== "none");
+        return lead.length === 1 ? lead[0]!.thread : undefined;
+      })),
       once("done", () => watchTick(this.deps).then(lines => lines.forEach(l => console.log(l)))),
       once("freshness", () => freshnessTick(this.deps, process.env.HOME ?? "")),
       once("runtime-health", async () => {
