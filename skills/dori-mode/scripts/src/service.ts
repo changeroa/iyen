@@ -29,6 +29,7 @@ import type { Turn } from "./runtime/generated/v2/Turn.ts";
 export type Caller = { role: "admin" | "lead" | "lane" | "host"; key?: string; instance?: string };
 export type ExternalTransport = { connect: typeof connectObserver; observe: typeof observeExternal };
 type OwnedFailure = Mail & { leadIntakeInstance?: string };
+const UNOWNED_LEAD = "unattached-lead";
 type HandoffArgs = { fromThreadId: string; threadId: string; pane: string; cwd: string; mailIds: string[]; operationId: string };
 type HandoffIntent = { version: 1; status: "prepared" | "committed"; args: HandoffArgs; before: Lane; beforeAttachment: Attachment; after: Lane; afterAttachment: Attachment; result: any; createdAt: string; identityHeld?: boolean; cleanupPending?: boolean };
 export type HandoffIO = { removeMarker(path: string): void };
@@ -156,7 +157,7 @@ export class DoriService {
     if (existsSync(this.attachmentPath())) return readJson<Attachment>(this.attachmentPath()).instance;
     // Work accepted before any attachment must never become fresh new-session
     // intake merely because its asynchronous producer finishes after attach.
-    return "unattached-lead";
+    return UNOWNED_LEAD;
   }
   private withIntake<T>(action: () => T): T {
     return this.intakeScope.getStore() !== undefined ? action() : this.intakeScope.run(this.captureIntakeInstance(), action);
@@ -192,9 +193,9 @@ export class DoriService {
     const eligibleMailIds: string[] = [], blocked: { id: string; reason: string }[] = [], historicalMailIds: string[] = [];
     for (const row of this.inbox.list().filter(row => row.target === "lead")) {
       const reason = row.state !== "queued" ? `delivery-${row.state}` : row.turnId ? "has-turn-receipt" : row.source?.startsWith("reconciled:") ? "previously-reconciled" :
-        row.attachmentInstance && row.attachmentInstance !== saved.instance ? "other-attachment" : undefined;
+        row.attachmentInstance && row.attachmentInstance !== UNOWNED_LEAD && row.attachmentInstance !== saved.instance ? "other-attachment" : undefined;
       if (reason) blocked.push({ id: row.id, reason });
-      else { eligibleMailIds.push(row.id); if (saved.excludedInboxIds.includes(row.id)) historicalMailIds.push(row.id); }
+      else { eligibleMailIds.push(row.id); if (row.attachmentInstance === UNOWNED_LEAD || saved.excludedInboxIds.includes(row.id)) historicalMailIds.push(row.id); }
     }
     return { eligibleMailIds: eligibleMailIds.sort(), blocked, historicalMailIds: historicalMailIds.sort() };
   }
@@ -285,7 +286,7 @@ export class DoriService {
         await this.registry.update("lead", lane => ({ ...lane, dispatchBlocked: true, holdReason: lane.holdReason ?? "recovery", runtime: { ...lane.runtime!, held: true, state: "recovering" } }));
         for (const id of args.mailIds) {
           const row = this.inbox.get(id);
-          if (!row || row.target !== "lead" || row.state !== "queued" || row.turnId || row.source?.startsWith("reconciled:") || row.attachmentInstance && ![beforeAttachment.instance, afterAttachment.instance].includes(row.attachmentInstance)) throw new Error("Handoff selected mail no longer safe; operator reconciliation required");
+          if (!row || row.target !== "lead" || row.state !== "queued" || row.turnId || row.source?.startsWith("reconciled:") || row.attachmentInstance && ![UNOWNED_LEAD, beforeAttachment.instance, afterAttachment.instance].includes(row.attachmentInstance)) throw new Error("Handoff selected mail no longer safe; operator reconciliation required");
           if (row.attachmentInstance !== afterAttachment.instance) this.inbox.mark(id, { attachmentInstance: afterAttachment.instance });
         }
         if (!sameJson(readJson(this.attachmentPath()), afterAttachment)) atomicJson(this.attachmentPath(), afterAttachment);
@@ -863,7 +864,7 @@ export class DoriService {
         const metadata = JSON.parse(failure.text) as ReturnType<typeof turnFailure>;
         const text = `Codex task failed (${metadata.category}). ${metadata.guidance} The task was not automatically retried.`;
         if (lane.role !== "lead") {
-          this.putInbox({ id: `notice:${failure.id}`, target: "lead", attachmentInstance: (failure as OwnedFailure).leadIntakeInstance, thread: lane.thread, text: `Lane ${lane.key}: ${text}`, state: "queued", at: failure.at });
+          this.putInbox({ id: `notice:${failure.id}`, target: "lead", attachmentInstance: (failure as OwnedFailure).leadIntakeInstance ?? UNOWNED_LEAD, thread: lane.thread, text: `Lane ${lane.key}: ${text}`, state: "queued", at: failure.at });
         } else {
           // Completion notifications can precede the input RPC receipt. Keep the failure
           // pending until a sent receipt associates that turn with its owner thread.

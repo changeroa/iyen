@@ -205,6 +205,34 @@ test("inbox persistence failure leaves cache unchanged and same-process handoff 
 
 const workerLane = () => ({ key: "handoff-worker", role: "lane" as const, title: "Managed worker", thread: "owner:worker", brief: "", done: "", openedAt: new Date().toISOString(),
   runtime: { kind: "codex" as const, backend: "herdr-tui" as const, threadId: "33333333-3333-4333-8333-333333333333", hostInstanceId: "worker-instance", generation: 1, state: "running" as const, binaryVersion: "0.163.0", lastHeartbeatAt: new Date().toISOString() } });
+
+test("real ingress before first attachment remains historical and transfers only by explicit selection", async () => {
+  h.s.stop(); h.state.done(); h = fixture();
+  for (const id of ["chosen", "retained"]) await h.s.receive("owner", { id, user: "owner", thread: "owner:thread", text: id });
+  const selected = "inbound:owner:owner:thread:chosen", retained = "inbound:owner:owner:thread:retained";
+  expect(h.s.inbox.get(selected)?.attachmentInstance).toBe("unattached-lead");
+  await h.s.handle("lead-attach", h.attach, admin);
+  const preview = await h.s.handle("lead-handoff-preview", h.args, admin);
+  expect(preview.eligibleMailIds).toContain(selected); expect(preview.historicalMailIds).toContain(selected);
+  expect(await h.s.handle("lead-handoff", { ...h.args, mailIds: [selected] }, admin)).toMatchObject({ handedOff: true });
+  expect(h.s.inbox.get(selected)?.attachmentInstance).toBe(saved().instance);
+  expect(h.s.inbox.get(retained)?.attachmentInstance).toBe("unattached-lead");
+  expect(saved().excludedInboxIds).toContain(retained); expect(queues()).toHaveLength(0);
+});
+
+test("legacy persisted failure first processed after handoff cannot acquire replacement ownership", async () => {
+  const worker = workerLane(); await h.s.registry.write(worker);
+  h.s.failures.put({ id: "legacy-failure", target: worker.key, text: JSON.stringify({ category: "authorization", guidance: "Inspect failure" }), state: "queued", at: "2020-01-01" });
+  await h.s.handle("lead-handoff", { ...h.args, mailIds: [] }, admin);
+  const restarted = new DoriService(h.config, h.run, h.transport);
+  await restarted.notifyFailures();
+  const notice = restarted.inbox.get("notice:legacy-failure")!;
+  expect(notice).toMatchObject({ state: "queued", attachmentInstance: "unattached-lead" });
+  const caller = await restarted.authorize(saved().token);
+  expect(await restarted.handle("input", { key: "lead", text: notice.text, operationId: notice.id }, caller)).toMatchObject({ queued: true });
+  expect(restarted.inbox.get(notice.id)?.state).toBe("queued"); expect(queues()).toHaveLength(0);
+});
+
 async function interruptAtHold(): Promise<void> {
   const update = h.s.registry.update.bind(h.s.registry); let armed = true;
   h.s.registry.update = async (key, fn) => { const result = await update(key, fn); if (armed && key === "lead" && result.dispatchBlocked) { armed = false; throw new Error("injected hold"); } return result; };
@@ -270,17 +298,18 @@ test("completed handoff retry reports current readiness and cannot restore a det
 
 for (const producer of ["host-event", "failure", "queueInput", "report"] as const) test(`suspended ${producer} producer keeps old lead affinity across empty-selection handoff`, async () => {
   const worker = workerLane(), old = saved(); await h.s.registry.write(worker);
+  if (producer === "failure") await h.s.handle("host-event", { key: worker.key, instance: worker.runtime.hostInstanceId, runtime: worker.runtime,
+    event: { method: "turn/completed", params: { threadId: worker.runtime.threadId, turn: { id: "failure-turn", status: "failed", error: { message: "authorization failed" } } } } }, { role: "host", key: worker.key });
   const read = h.s.registry.read.bind(h.s.registry); let release!: () => void, entered!: () => void, armed = true;
   const paused = new Promise<void>(resolve => release = resolve), started = new Promise<void>(resolve => entered = resolve);
   // Host/failure/queueInput pause before publishing a notice. Report publishes
   // synchronously, then pauses its registry continuation; both remain old-bound.
   h.s.registry.read = async key => { const result = await read(key); if (armed && key === (producer === "queueInput" ? "lead" : worker.key)) { armed = false; entered(); await paused; } return result; };
-  if (producer === "failure") h.s.failures.put({ id: "worker-failure", target: worker.key, text: JSON.stringify({ category: "authorization", guidance: "Inspect failure" }), state: "queued", at: "2026-01-01" });
   const pending = producer === "host-event" ? h.s.handle("host-event", { key: worker.key, instance: worker.runtime.hostInstanceId, runtime: worker.runtime, event: { id: "race", method: "tui/inputRequired", params: {} } }, { role: "host", key: worker.key }) :
     producer === "failure" ? h.s.notifyFailures() : producer === "queueInput" ? h.s.deps.queueInput!("lead", "old producer", "old-producer") :
     h.s.handle("report", { key: worker.key, kind: "milestone", eventId: "race", text: "Old report" }, { role: "lane", key: worker.key });
   await started; await h.s.handle("lead-handoff", { ...h.args, mailIds: [] }, admin); const current = saved(); release(); await pending;
-  const id = producer === "host-event" ? `approval-notice:${worker.key}:race` : producer === "failure" ? "notice:worker-failure" : producer === "queueInput" ? "old-producer" : `report:${worker.key}:race`;
+  const id = producer === "host-event" ? `approval-notice:${worker.key}:race` : producer === "failure" ? `notice:failed-turn:${worker.key}:${worker.runtime.hostInstanceId}:failure-turn` : producer === "queueInput" ? "old-producer" : `report:${worker.key}:race`;
   expect(h.s.inbox.get(id)).toMatchObject({ state: "queued", attachmentInstance: old.instance });
   expect(h.s.inbox.get(id)?.attachmentInstance).not.toBe(current.instance);
   const caller = await h.s.authorize(current.token);
