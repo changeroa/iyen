@@ -10,11 +10,14 @@ import { mcpServer } from "./mcp.ts";
 import { utilities } from "./utilities.ts";
 import { atomicJson } from "./journal.ts";
 import { join } from "node:path";
+import { readStartupHealth } from "./health.ts";
 const help = `dori — Codex-only messenger lead and lanes
 
-  doctor | serve | status [key]
+  doctor | serve | status [key] | health
   lead-attach --thread-id UUID --pane ID --cwd DIR
   lead-detach --thread-id UUID
+  lead-handoff-preview --from-thread-id UUID --thread-id UUID --pane ID --cwd DIR
+  lead-handoff --from-thread-id UUID --thread-id UUID --pane ID --cwd DIR --operation-id ID (--mail-id ID ... | --no-mail)
   launch KEY --title T --brief FILE --done SIGNALS [--thread REF] [--cwd DIR] [--model M] [--worktree]
   input KEY --text-file FILE [--operation-id ID]
   report KEY --kind milestone|blocker|question|done --text-file FILE --event-id ID
@@ -41,10 +44,10 @@ const scopedInvocation = ["DORI_CONTEXT", "DORI_LANE_KEY", "DORI_LANE_TOKEN"].so
 // Scoped executables are service clients, never entrypoints to local lifecycle,
 // migration or messenger utilities. Apply this gate before any local handler,
 // even when the context is missing, malformed or already revoked.
-const scopedCommands = new Set(["", "help", "status", "can-launch", "launch", "adopt", "input", "reply", "report", "claim-done", "object-done", "pause", "resume", "close", "reopen", "recover", "sync", "approval", "mail", "work", "lead-detach", "watch", "freshness", "dead-panes", "guard", "mcp-server"]);
+const scopedCommands = new Set(["", "help", "status", "health", "can-launch", "launch", "adopt", "input", "reply", "report", "claim-done", "object-done", "pause", "resume", "close", "reopen", "recover", "sync", "approval", "mail", "work", "lead-detach", "watch", "freshness", "dead-panes", "guard", "mcp-server"]);
 const scopedHelp = `iyen — scoped service commands
 
-  help | status [key] | can-launch
+  help | status [key] | health | can-launch
   lead-detach --thread-id UUID
   launch KEY --title T --brief FILE --done SIGNALS [--thread REF] [--cwd DIR] [--model M] [--worktree]
   input KEY --text-file FILE [--operation-id ID]
@@ -61,8 +64,9 @@ const scopedHelp = `iyen — scoped service commands
 Service authorization applies to every operation. Attached lead lifecycle uses lead-detach.
 Unknown deliveries are never automatically replayed.`;
 const flags = parseArgs({ args: rest, allowPositionals: true, strict: true, options: Object.fromEntries([
-  ...["title", "brief", "done", "thread", "model", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "response-file", "state-dir", "handoff-file", "key", "box", "state"].map(k => [k, { type: "string" }]),
-  ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help", "new-session"].map(k => [k, { type: "boolean" }]),
+  ...["title", "brief", "done", "thread", "model", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "from-thread-id", "response-file", "state-dir", "handoff-file", "key", "box", "state"].map(k => [k, { type: "string" }]),
+  ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help", "new-session", "no-mail"].map(k => [k, { type: "boolean" }]),
+  ["mail-id", { type: "string", multiple: true }],
   ["reason", { type: "string", multiple: true }],
   ["tag", { type: "string", multiple: true }],
 ]) as any });
@@ -82,6 +86,14 @@ try {
   }
   if (command === "session-host-start") { startSessionHost(need("state-dir"), need("key")); process.exit(0); }
   const config = await loadConfig();
+  if (command === "health") {
+    try { output(await serviceClient(config)("health", {}, 2000)); }
+    catch (error) {
+      if (scopedInvocation) throw error;
+      output(readStartupHealth(config.stateDir)); process.exitCode = 3;
+    }
+    process.exit(process.exitCode ?? 0);
+  }
   if (command === "mcp-server") { await mcpServer(config); process.exit(0); }
   if (command === "serve") { await serve(config); process.exit(0); }
   if (command === "doctor") { const result = await doctor(config); output(result); process.exit(result.ok ? 0 : 2); }
@@ -94,6 +106,14 @@ try {
   switch (command) {
     case "lead": case "lead-attach": result = await call("lead-attach", { threadId: need("thread-id"), pane: need("pane"), cwd: need("cwd") }); break;
     case "lead-detach": result = await call(command, { threadId: need("thread-id") }); break;
+    case "lead-handoff-preview": case "lead-handoff": {
+      const mailIds = values["mail-id"] as string[] | undefined;
+      if (values["no-mail"] && mailIds?.length) throw new Error("Choose --mail-id or --no-mail, not both");
+      if (command === "lead-handoff" && !mailIds?.length && !values["no-mail"]) throw new Error("Explicit --mail-id selections or --no-mail required");
+      result = await call(command, { fromThreadId: need("from-thread-id"), threadId: need("thread-id"), pane: need("pane"), cwd: need("cwd"),
+        ...(command === "lead-handoff" ? { operationId: need("operation-id"), mailIds: mailIds ?? [] } : mailIds ? { mailIds } : {}) });
+      break;
+    }
     case "work":
       if (key === "start") result = await call("work-start", { title: need("title"), tags: values.tag ?? [], thread: opt("thread"), operationId });
       else if (key === "stop") result = await call("work-stop", { id: flags.positionals[1] ?? (() => { throw new Error("work stop needs a work id"); })() });

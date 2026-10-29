@@ -135,6 +135,7 @@ test("current-session CLI attaches a busy existing lead, scopes controls, delive
   await call("input",{key:"lead",text:"literal owner message",thread:"chat:owner",operationId:"ingress"});
   expect((await call("mail-list")).inbox.find((m:any)=>m.id==="ingress").state).toBe("queued");
   const snapshot=readJson<any>(statePath);snapshot.thread.status={type:"idle"};snapshot.turns[0].status="completed";atomicJson(statePath,snapshot);
+  const idlePanes=readJson<any[]>(join(state.dir,"fixture-panes.json"));idlePanes[0].agent_status="idle";atomicJson(join(state.dir,"fixture-panes.json"),idlePanes);
   const mail=await waitFor(()=>call("mail-list"),v=>v.inbox.find((m:any)=>m.id==="ingress")?.state==="sent");
   const delivered=mail.inbox.find((m:any)=>m.id==="ingress");expect(delivered.turnId).toBeTruthy();
   expect(readJson<any>(statePath).turns.find((t:any)=>t.id===delivered.turnId).items[0].content[0].text).toBe(operationText("literal owner message","ingress"));
@@ -158,14 +159,14 @@ test("current-session CLI attaches a busy existing lead, scopes controls, delive
   await call("lead-detach",{threadId});
   const observer=await connectObserver(socketPath,500);try{expect((await observer.read<any>("thread/read",{threadId})).thread.id).toBe(threadId);}finally{observer.close();}
   const calls=readFileSync(join(state.dir,"external-codex-calls.jsonl"),"utf8").trim().split("\n").map(l=>JSON.parse(l));
-  expect(calls.filter(a=>a[0]==="queue")).toHaveLength(2);expect(calls.every(a=>a.join(" ")==="app-server daemon version"||a[0]==="queue")).toBe(true);
+  expect(calls.filter(a=>a[0]==="queue"&&a[1]!=="--help")).toHaveLength(2);expect(calls.every(a=>a.join(" ")==="app-server daemon version"||a[0]==="queue")).toBe(true);
   const herdrCalls=readFileSync(join(state.dir,"fixture-herdr-calls.jsonl"),"utf8").trim().split("\n").map(l=>JSON.parse(l));expect(herdrCalls.every(a=>a[0]==="agent"&&a[1]==="get")).toBe(true);
   daemon!.kill("SIGTERM");await daemon!.exited;expect(await logs.err).toBe("");
  }finally{daemon?.kill();if(daemon)await daemon.exited;server.stop(true);state.done();}
 },30000);
 
 
-for (const upgradeVersion of ["0.164.0", "0.165.0"]) test(`CLI 163 attachment survives shared ${upgradeVersion} upgrade, interrupted binding restart and explicit same-session repair`, async () => {
+for (const upgradeVersion of ["0.165.0", "0.999.0"]) test(`CLI 163 attachment automatically survives compatible ${upgradeVersion} upgrade and interrupted binding restart`, async () => {
  const state = withState(); let daemon: ReturnType<typeof Bun.spawn> | undefined;
  const threadId = "11111111-1111-4111-8111-111111111111", socketPath = join(socketDir(state.dir), "shared.sock"), statePath = join(state.dir, "external-state.json");
  const server = Bun.serve({ unix: socketPath, fetch(req, s) { if (s.upgrade(req)) return; return new Response(null, { status: 400 }); }, websocket: { message(ws, raw) {
@@ -202,7 +203,8 @@ for (const upgradeVersion of ["0.164.0", "0.165.0"]) test(`CLI 163 attachment su
   expect(await call("status", { key: "lead" })).toMatchObject({ readiness: "held", runtime: { external: { holdReason: { code: "runtime-version-changed" } } } });
   // The stable external command now resolves a different release; managed binary stays163.
   unlinkSync(externalLink); symlinkSync(binaries[1]!, externalLink);
-  const rebound = await attach(); expect(rebound).toMatchObject({ reused: true, bridge: saved.bridge, lead: { readiness: "busy", runtime: { binaryVersion: upgradeVersion } } });
+  const rebound = await waitFor(() => call("status", { key: "lead" }, saved.token), row => row.readiness === "busy" && row.runtime.binaryVersion === upgradeVersion);
+  expect(rebound).toMatchObject({ bridge: saved.bridge, runtime: { hostInstanceId: saved.instance, generation: saved.generation } });
   expect(readJson<any>(attachmentPath)).toMatchObject({ token: saved.token, instance: saved.instance, generation: saved.generation, excludedInboxIds: saved.excludedInboxIds, binary: binaries[1]!, binaryVersion: upgradeVersion });
   expect(readJson<any>(cfgPath).runtime).toMatchObject({ binary: binaries[0]!, requiredVersion: "0.163.0" });
   expect((await call("mail-list")).inbox.find((row: any) => row.id === "upgrade-mail").state).toBe("queued");
@@ -212,17 +214,17 @@ for (const upgradeVersion of ["0.164.0", "0.165.0"]) test(`CLI 163 attachment su
   const { Registry } = await import("../src/registry.ts"); const registry = new Registry(state.dir); registry.enableJournal(state.dir);
   await registry.update("lead", lane => ({ ...lane, dispatchBlocked: true, holdReason: "recovery", runtime: { ...lane.runtime!, binaryVersion: "0.163.0", held: true, state: "recovering", external: { ...lane.runtime!.external!, binary: binaries[0]!, rebind: { binary: binaries[1]!, binaryVersion: upgradeVersion }, holdReason: { code: "rebind-interrupted", message: "Attached runtime rebind incomplete; explicitly reattach to finish reconnection.", at: new Date().toISOString() } } } }));
   logs = await start();
-  expect(await call("status", { key: "lead" }, saved.token)).toMatchObject({ readiness: "held", runtime: { external: { holdReason: { code: "rebind-interrupted" } } } });
+  expect(await waitFor(() => call("status", { key: "lead" }, saved.token), row => row.readiness === "busy")).toMatchObject({ runtime: { binaryVersion: upgradeVersion } });
   expect((await call("mail-list")).inbox.find((row: any) => row.id === "upgrade-mail").state).toBe("queued");
-  expect(await attach()).toMatchObject({ reused: true, bridge: saved.bridge, lead: { readiness: "busy" } });
   snapshot.thread.status = { type: "idle" }; snapshot.turns[0].status = "completed"; atomicJson(statePath, snapshot);
+  const panes = readJson<any[]>(join(state.dir, "fixture-panes.json")); panes[0].agent_status = "idle"; atomicJson(join(state.dir, "fixture-panes.json"), panes);
   const mail = await waitFor(() => call("mail-list"), value => value.inbox.find((row: any) => row.id === "upgrade-mail")?.state === "sent");
   const delivered = mail.inbox.find((row: any) => row.id === "upgrade-mail"); expect(delivered.turnId).toBeTruthy();
   await stop(logs); logs = await start();
   expect(await call("status", { key: "lead" }, saved.token)).toMatchObject({ readiness: "ready", runtime: { binaryVersion: upgradeVersion } });
   expect((await call("mail-list")).inbox.find((row: any) => row.id === "upgrade-mail").turnId).toBe(delivered.turnId);
   const calls = readFileSync(join(state.dir, "external-codex-calls.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
-  expect(calls.filter(args => args[0] === "queue")).toHaveLength(1); expect(calls.every(args => args[0] === "queue" || args.join(" ") === "app-server daemon version")).toBe(true);
+  expect(calls.filter(args => args[0] === "queue" && args[1] !== "--help")).toHaveLength(1); expect(calls.every(args => args[0] === "queue" || args.join(" ") === "app-server daemon version")).toBe(true);
   await stop(logs);
  } finally { daemon?.kill(); if (daemon) await daemon.exited; server.stop(true); state.done(); }
 }, 30000);

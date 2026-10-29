@@ -25,11 +25,15 @@ export class Mailbox {
       if (existing.text !== mail.text || existing.target !== mail.target) throw new Error("Operation ID reused with different content");
       return existing;
     }
-    this.rows[mail.id] = mail; atomicJson(this.path, this.rows); return mail;
+    const next = { ...this.rows, [mail.id]: mail };
+    atomicJson(this.path, next); this.rows = next; return mail;
   }
   mark(id: string, patch: Partial<Mail>): Mail {
     if (!this.rows[id]) throw new Error("Unknown mail");
-    const row = { ...this.rows[id]!, ...patch, id }; this.rows[id] = row; atomicJson(this.path, this.rows); return row;
+    const row = { ...this.rows[id]!, ...patch, id }, next = { ...this.rows, [id]: row };
+    // A failed write must not make a retry believe an assignment or receipt was
+    // persisted. Publish the in-memory state only after durable replacement.
+    atomicJson(this.path, next); this.rows = next; return row;
   }
   async deliver(id: string, action: (row: Mail) => Promise<{ turnId?: string }>): Promise<Mail> {
     return this.queue.run(id, async () => {

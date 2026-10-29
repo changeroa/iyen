@@ -41,6 +41,10 @@ class ActivationTests(unittest.TestCase):
             return copy.deepcopy(self.lead)
         if "lead-attach" in argv:
             return {"attached": True, "bridge": str(self.bridge), "lead": copy.deepcopy(self.lead)}
+        if "lead-handoff-preview" in argv:
+            return {"eligible": ["saved-message"]}
+        if "lead-handoff" in argv:
+            return {"attached": True, "bridge": str(self.bridge), "lead": copy.deepcopy(self.lead)}
         if "lead-detach" in argv:
             return {"detached": True}
         if argv[-2:] == ["status", "lead"]:
@@ -102,6 +106,51 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(self.run_helper()["status"], "active")
         self.assertFalse(any("lead-attach" in argv for argv, _ in self.calls))
 
+    def test_handoff_preview_never_detaches_or_claims_activation(self):
+        self.args.action = "handoff-preview"
+        self.args.from_session = "22222222-2222-4222-8222-222222222222"
+        result = self.run_helper()
+        self.assertEqual(result["status"], "preview")
+        self.assertEqual(len(self.calls), 2)
+        self.assertIn("lead-handoff-preview", self.calls[-1][0])
+        self.assertFalse(any("lead-detach" in argv for argv, _ in self.calls))
+
+    def test_handoff_requires_explicit_mail_selection_and_stable_operation(self):
+        self.args.action = "handoff"
+        self.args.from_session = "22222222-2222-4222-8222-222222222222"
+        with self.assertRaisesRegex(activate.ActivationError, "operation-id"):
+            self.run_helper()
+        self.args.operation_id = "handoff-1"
+        with self.assertRaisesRegex(activate.ActivationError, "mail-id"):
+            self.run_helper()
+        self.assertEqual(self.calls, [])
+        self.args.mail_id = ["message-one", "message-two"]
+        self.assertEqual(self.run_helper()["status"], "active")
+        argv = self.calls[1][0]
+        self.assertEqual(argv.count("--mail-id"), 2)
+        self.assertIn("handoff-1", argv)
+        self.assertIn(self.args.from_session, argv)
+        self.assertEqual(self.calls[-1][0], [str(self.bridge), "status", "lead"])
+
+    def test_handoff_with_no_mail_is_explicit(self):
+        self.args.action = "handoff"
+        self.args.from_session = "22222222-2222-4222-8222-222222222222"
+        self.args.operation_id = "handoff-empty"
+        self.args.no_mail = True
+        self.assertEqual(self.run_helper()["status"], "active")
+        self.assertIn("--no-mail", self.calls[1][0])
+
+    def test_handoff_cannot_omit_expected_source_or_bypass_target_identity(self):
+        self.args.action = "handoff-preview"
+        with self.assertRaisesRegex(activate.ActivationError, "from-session"):
+            self.run_helper()
+        self.assertEqual(self.calls, [])
+        self.args.from_session = "22222222-2222-4222-8222-222222222222"
+        self.args.pane = "w1:p9"
+        with self.assertRaisesRegex(activate.ActivationError, "different session"):
+            self.run_helper()
+        self.assertEqual(len(self.calls), 1)
+
     def test_unverified_public_status_cannot_report_active(self):
         self.lead["identityVerified"] = False
         with self.assertRaisesRegex(activate.ActivationError, "not ready"):
@@ -118,6 +167,16 @@ class ActivationTests(unittest.TestCase):
         with self.assertRaisesRegex(activate.ActivationError, "daemon 0.164.0 differ"):
             self.run_helper()
         self.assertFalse(any("lead-attach" in argv for argv, _ in self.calls))
+
+    def test_held_status_prefers_latest_cause_over_original_failure(self):
+        self.args.action = "status"
+        self.lead["dispatchBlocked"] = True
+        self.lead["runtime"]["external"] = {
+            "holdReason": {"message": "Original temporary disconnect"},
+            "latestHoldReason": {"message": "Current session identity changed"},
+        }
+        with self.assertRaisesRegex(activate.ActivationError, "Current session identity changed"):
+            self.run_helper()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 import type { DoriConfig } from "./config.ts";
 import { serviceClient } from "./ipc.ts";
-const actions = ["work-start", "work-stop", "work-similar", "status", "can-launch", "launch", "input", "report", "reply", "claim-done", "object-done", "pause", "resume", "close", "recover", "reopen", "sync", "approval-list", "mail-list"];
+const actions = ["work-start", "work-stop", "work-similar", "status", "health", "can-launch", "launch", "input", "report", "reply", "claim-done", "object-done", "pause", "resume", "close", "recover", "reopen", "sync", "approval-list", "mail-list"];
 /** stdio MCP keeps lifecycle RPC outside the command sandbox without granting network access. */
 export const mcpServer = async (config: DoriConfig): Promise<void> => {
   if (!process.env.DORI_CONTEXT) throw new Error("MCP requires a managed lane context");

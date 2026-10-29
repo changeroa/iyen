@@ -1,5 +1,7 @@
-import { chmodSync, existsSync, mkdirSync, unlinkSync, openSync, closeSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { chmodSync, existsSync, mkdirSync, unlinkSync, openSync, closeSync, readFileSync, writeFileSync, realpathSync, fsyncSync } from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { workspaceForRole, type DoriConfig } from "./config.ts";
 import { atomicJson, SerialQueue } from "./journal.ts";
 import { ipc, serviceSocket, hostSocket, readJson } from "./ipc.ts";
@@ -14,17 +16,31 @@ import { syncRegistry } from "./sync.ts";
 import { sampleHost, guardTick } from "./host-guard.ts";
 import { canLaunch } from "./routing.ts";
 import { run, realClock, type Runner } from "./run.ts";
-import { backendSocket, bootstrapPath, resolveCodexBinary, type Bootstrap } from "./runtime/session-host.ts";
-import type { RuntimeControl, RuntimeRef, RuntimeSnapshot } from "./runtime/types.ts";
+import { backendSocket, bootstrapPath, type Bootstrap } from "./runtime/session-host.ts";
+import type { ExternalHoldCode, RuntimeControl, RuntimeRef, RuntimeSnapshot } from "./runtime/types.ts";
 import { WorkTimers } from "./work.ts";
 import { turnFailure } from "./turn-failure.ts";
-import { DeliveryDeferred, Mailbox, postHook } from "./mailbox.ts";
-import { ExternalCurrentSession, ExternalSessionError, observeExternal, sharedDaemon, THREAD_UUID, type Attachment } from "./runtime/external-current-session.ts";
+import { DeliveryDeferred, Mailbox, postHook, type Mail } from "./mailbox.ts";
+import { ExternalCurrentSession, ExternalSessionError, discoverExternal, observeExternal, sharedDaemon, THREAD_UUID, type Attachment } from "./runtime/external-current-session.ts";
 import { connectObserver, receiptInTurns } from "./runtime/observer.ts";
 import { operationText } from "./runtime/herdr.ts";
 import type { Turn } from "./runtime/generated/v2/Turn.ts";
 
 export type Caller = { role: "admin" | "lead" | "lane" | "host"; key?: string; instance?: string };
+export type ExternalTransport = { connect: typeof connectObserver; observe: typeof observeExternal };
+type OwnedFailure = Mail & { leadIntakeInstance?: string };
+const UNOWNED_LEAD = "unattached-lead";
+type HandoffArgs = { fromThreadId: string; threadId: string; pane: string; cwd: string; mailIds: string[]; operationId: string };
+type HandoffIntent = { version: 1; status: "prepared" | "committed"; args: HandoffArgs; before: Lane; beforeAttachment: Attachment; after: Lane; afterAttachment: Attachment; result: any; createdAt: string; identityHeld?: boolean; cleanupPending?: boolean };
+export type HandoffIO = { removeMarker(path: string): void };
+const durableMarkerRemoval = (path: string): void => {
+  // Open before unlink so an open failure leaves the recovery marker intact.
+  const directory = openSync(dirname(path), "r");
+  try { unlinkSync(path); fsyncSync(directory); } finally { closeSync(directory); }
+};
+export type ServicePhase = "starting" | "replaying" | "reconciling" | "ready" | "stopping" | "failed";
+const reconnectable = (code?: ExternalHoldCode): boolean => Boolean(code && ["runtime-unavailable", "runtime-version-changed", "runtime-version-unsupported", "runtime-incompatible", "rebind-interrupted"].includes(code));
+const sameJson = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
 export class DoriService {
   readonly registry: Registry;
   readonly inbox: Mailbox;
@@ -36,13 +52,27 @@ export class DoriService {
   private launchQueue = new SerialQueue();
   private dispatchQueue = new SerialQueue();
   private failureQueue = new SerialQueue();
+  private intakeScope = new AsyncLocalStorage<string>();
   private stopping = false;
+  private phase: ServicePhase = "starting";
+  private startedAt = new Date().toISOString();
+  private replay = { records: 0, lanes: 0 };
+  private ingressHealth = new Map<string, { process: "starting" | "running" | "stopped" | "failed"; lastAcceptedAt?: string }>();
+  private lastHealth?: string;
   private ticks = new Set<string>();
   private lastTick = new Map<string, number>();
-  constructor(readonly config: DoriConfig, readonly runner: Runner = run) {
-    this.registry = new Registry(config.stateDir); this.registry.enableJournal(config.stateDir);
-    this.inbox = new Mailbox(config.stateDir, "inbox"); this.outbox = new Mailbox(config.stateDir, "outbox"); this.operations = new Mailbox(config.stateDir, "operations");
-    this.failures = new Mailbox(config.stateDir, "failures");
+  constructor(readonly config: DoriConfig, readonly runner: Runner = run, readonly externalTransport: ExternalTransport = { connect: connectObserver, observe: observeExternal }, readonly handoffIO: HandoffIO = { removeMarker: durableMarkerRemoval }) {
+    this.writeHealth();
+    this.phase = "replaying"; this.writeHealth();
+    this.registry = new Registry(config.stateDir);
+    try {
+      this.registry.enableJournal(config.stateDir, progress => { this.replay = progress; this.writeHealth(); });
+    } catch (error) { this.phase = "failed"; this.writeHealth(); throw error; }
+    this.phase = "reconciling"; this.writeHealth();
+    try {
+      this.inbox = new Mailbox(config.stateDir, "inbox"); this.outbox = new Mailbox(config.stateDir, "outbox"); this.operations = new Mailbox(config.stateDir, "operations");
+      this.failures = new Mailbox(config.stateDir, "failures");
+    } catch (error) { this.phase = "failed"; this.writeHealth(); throw error; }
     const call = async <T>(key: string, action: string, args: any = {}): Promise<T> => {
       const lane = await this.registry.read(key);
       if (!lane?.runtime?.threadId) throw new Error("Runtime is not registered");
@@ -55,10 +85,10 @@ export class DoriService {
     };
     const runtime: RuntimeControl = {
       inspect: key => this.dispatchQueue.run(key, () => call(key, "inspect")),
-      input: (key, text, operationId) => this.dispatchQueue.run(key, async () => {
+      input: (key, text, operationId) => this.withIntake(() => this.dispatchQueue.run(key, async () => {
         const lane = await this.registry.read(key);
         if (!lane || lane.dispatchBlocked || statusOf(lane) === "closed") throw new Error("Lane dispatch is blocked");
-        const mail = this.inbox.put({ id: operationId, target: key, text, thread: lane.thread, state: "queued", at: new Date().toISOString() });
+        const mail = this.putInbox({ id: operationId, target: key, text, thread: lane.thread, state: "queued", at: new Date().toISOString() });
         if (lane.runtime?.backend === "external-current-session") {
           if (mail.attachmentInstance && mail.attachmentInstance !== lane.runtime.hostInstanceId) throw new DeliveryDeferred("Mail belongs to a previous lead attachment");
           if (this.attachment(lane).excludedInboxIds.includes(mail.id)) throw new DeliveryDeferred("Historical mail is held for explicit reconciliation");
@@ -72,14 +102,227 @@ export class DoriService {
         });
         if (!delivered.turnId) throw new Error("Missing turn receipt");
         return { turnId: delivered.turnId };
-      }),
+      })),
       hold: (key, origin) => call(key, "hold", { origin }), release: (key, origin) => call(key, "release", { origin }), stop: key => call(key, "stop"),
     };
     this.deps = { config, registry: this.registry, clock: realClock, run: runner, runtime, post: (id, hook, values) => postHook(this.outbox, runner, id, hook, values),
-      queueInput: async (key, text, operationId) => {
+      queueInput: (key, text, operationId) => this.withIntake(async () => {
         const lane = await this.lane(key);
-        this.inbox.put({ id: operationId, target: key, text, thread: lane.thread, state: "queued", at: new Date().toISOString() });
-      } };
+        this.putInbox({ id: operationId, target: key, text, thread: lane.thread, state: "queued", at: new Date().toISOString(), attachmentInstance: this.intakeInstance(lane) });
+      }) };
+    this.phase = "ready"; this.writeHealth();
+  }
+  private healthSnapshot: Record<string, unknown> = {};
+  private writeHealth(): void {
+    const value = { schemaVersion: 1, phase: this.phase, pid: process.pid, startedAt: this.startedAt, updatedAt: new Date().toISOString(), replay: this.replay, ...this.healthSnapshot };
+    // Progress callbacks and idle observations need not rewrite identical state.
+    const fingerprint = JSON.stringify({ ...value, updatedAt: undefined });
+    if (fingerprint === this.lastHealth) return;
+    atomicJson(join(this.config.stateDir, "service-health.json"), value); this.lastHealth = fingerprint;
+  }
+  setPhase(phase: ServicePhase): void { this.phase = phase; this.writeHealth(); }
+  setIngressProcess(id: string, process: "starting" | "running" | "stopped" | "failed"): void {
+    this.ingressHealth.set(id, { ...this.ingressHealth.get(id), process });
+    this.healthSnapshot = { ...this.healthSnapshot, ingress: this.ingressStatus() }; this.writeHealth();
+  }
+  private ingressStatus(): unknown[] {
+    return this.config.ingress.map(source => ({ id: source.id, process: this.ingressHealth.get(source.id)?.process ?? "starting",
+      lastAcceptedAt: this.ingressHealth.get(source.id)?.lastAcceptedAt ?? null,
+      // A child process alone is not evidence of the adapter's network state.
+      connection: "unverified", queued: this.inbox?.list().filter(row => row.source === source.id && row.state === "queued").length ?? 0 }));
+  }
+  async health(): Promise<any> {
+    const lead = await this.registry.read("lead"), rows = this.inbox.list();
+    const queued = rows.filter(row => row.state === "queued"), oldest = queued.map(row => Date.parse(row.at)).filter(Number.isFinite).sort((a, b) => a - b)[0];
+    const ext = lead?.runtime?.external;
+    const delivery = { state: !lead ? "missing" : ext?.detachedAt || lead.runtime?.state === "stopped" ? "detached" : lead.dispatchBlocked || lead.runtime?.held ? "held" : lead.runtime?.state === "idle" ? "ready" : "busy",
+      threadId: lead?.runtime?.threadId, observedState: lead?.runtime?.state, blocked: Boolean(lead?.dispatchBlocked),
+      firstCause: ext?.firstHoldReason ?? ext?.holdReason ?? null, latestCause: ext?.latestHoldReason ?? ext?.holdReason ?? null,
+      retry: ext?.reconnect ?? null, handoffPending: existsSync(this.activeHandoffPath()) };
+    const queue = { queued: queued.length, unknown: rows.filter(row => row.state === "unknown").length, sending: rows.filter(row => row.state === "sending").length,
+      oldestQueuedAt: oldest === undefined ? null : new Date(oldest).toISOString(), oldestQueuedAgeMs: oldest === undefined ? null : Math.max(0, this.deps.clock.now() - oldest) };
+    this.healthSnapshot = { delivery, queue, ingress: this.ingressStatus() }; this.writeHealth();
+    return readJson(join(this.config.stateDir, "service-health.json"));
+  }
+  private activeHandoffPath(): string { return join(this.config.stateDir, "attachments", "handoff.json"); }
+  private handoffPath(id: string): string { return join(this.config.stateDir, "attachments", "handoffs", `${createHash("sha256").update(id).digest("hex")}.json`); }
+  private pendingHandoff(): HandoffIntent | undefined {
+    if (!existsSync(this.activeHandoffPath())) return undefined;
+    const { operationId } = readJson<{ operationId: string }>(this.activeHandoffPath());
+    return readJson<HandoffIntent>(this.handoffPath(operationId));
+  }
+  private captureIntakeInstance(): string {
+    const pending = this.pendingHandoff();
+    if (pending && pending.status !== "committed") return pending.beforeAttachment.instance;
+    if (existsSync(this.attachmentPath())) return readJson<Attachment>(this.attachmentPath()).instance;
+    // Work accepted before any attachment must never become fresh new-session
+    // intake merely because its asynchronous producer finishes after attach.
+    return UNOWNED_LEAD;
+  }
+  private withIntake<T>(action: () => T): T {
+    return this.intakeScope.getStore() !== undefined ? action() : this.intakeScope.run(this.captureIntakeInstance(), action);
+  }
+  private intakeInstance(lane: Lane | null): string | undefined {
+    return lane?.runtime?.backend === "external-current-session" ? this.intakeScope.getStore() ?? this.captureIntakeInstance() : undefined;
+  }
+  private putInbox(mail: Mail): Mail {
+    return this.inbox.put(mail.target === "lead" ? { ...mail, attachmentInstance: mail.attachmentInstance ?? this.intakeScope.getStore() ?? this.captureIntakeInstance() } : mail);
+  }
+  private putFailure(mail: Mail): Mail {
+    const owned: OwnedFailure = { ...mail, leadIntakeInstance: this.intakeScope.getStore() ?? this.captureIntakeInstance() };
+    return this.failures.put(owned);
+  }
+  private assertNoPendingLeadMutation(): void {
+    if (this.pendingHandoff()) throw new Error("Lead handoff incomplete; mutations are held until its recorded operation finishes");
+  }
+  private blocksPendingMutation(action: string, args: any, caller: Caller): boolean {
+    if (["health", "status", "lead-handoff", "tick", "mail-list", "approval-list", "can-launch"].includes(action)) return false;
+    if (["lead", "lead-attach", "lead-detach", "lead-handoff-preview"].includes(action)) return true;
+    if (action === "sync") return Boolean(args.write);
+    if (action === "mail-resolve") return args.box !== "outbox" && (!this.inbox.get(args.id) || this.inbox.get(args.id)?.target === "lead");
+    return (args.key ?? caller.key) === "lead";
+  }
+  private handoffArgs(args: any, apply: boolean): HandoffArgs {
+    if (typeof args.fromThreadId !== "string" || !THREAD_UUID.test(args.fromThreadId) || typeof args.threadId !== "string" || !THREAD_UUID.test(args.threadId) || args.fromThreadId === args.threadId ||
+      typeof args.pane !== "string" || !args.pane.trim() || typeof args.cwd !== "string" || !isAbsolute(args.cwd)) throw new Error("Handoff requires exact fromThreadId, different UUID threadId, pane and absolute cwd");
+    if (apply && (!Array.isArray(args.mailIds) || typeof args.operationId !== "string" || !args.operationId.trim() || args.operationId.length > 200)) throw new Error("Handoff requires explicit mailIds array and stable operationId");
+    if (args.mailIds !== undefined && (!Array.isArray(args.mailIds) || args.mailIds.some((id: unknown) => typeof id !== "string" || !id) || new Set(args.mailIds).size !== args.mailIds.length)) throw new Error("mailIds must contain unique nonempty strings");
+    return { fromThreadId: args.fromThreadId, threadId: args.threadId, pane: args.pane, cwd: realpathSync(args.cwd), mailIds: [...(args.mailIds ?? [])].sort(), operationId: args.operationId ?? "" };
+  }
+  private handoffMail(saved: Attachment): { eligibleMailIds: string[]; blocked: { id: string; reason: string }[]; historicalMailIds: string[] } {
+    const eligibleMailIds: string[] = [], blocked: { id: string; reason: string }[] = [], historicalMailIds: string[] = [];
+    for (const row of this.inbox.list().filter(row => row.target === "lead")) {
+      const reason = row.state !== "queued" ? `delivery-${row.state}` : row.turnId ? "has-turn-receipt" : row.source?.startsWith("reconciled:") ? "previously-reconciled" :
+        row.attachmentInstance && row.attachmentInstance !== UNOWNED_LEAD && row.attachmentInstance !== saved.instance ? "other-attachment" : undefined;
+      if (reason) blocked.push({ id: row.id, reason });
+      else { eligibleMailIds.push(row.id); if (row.attachmentInstance === UNOWNED_LEAD || saved.excludedInboxIds.includes(row.id)) historicalMailIds.push(row.id); }
+    }
+    return { eligibleMailIds: eligibleMailIds.sort(), blocked, historicalMailIds: historicalMailIds.sort() };
+  }
+  private async validateHandoffTarget(args: HandoffArgs, socketPath: string): Promise<{ daemon: Awaited<ReturnType<typeof discoverExternal>>; snap: Awaited<ReturnType<ExternalCurrentSession["inspect"]>> }> {
+    const daemon = await discoverExternal(this.runner, this.config.runtime);
+    if (daemon.socketPath !== socketPath) throw new ExternalSessionError("identity-unverified", "Handoff daemon affinity changed; explicit detach and attach required.");
+    const observer = await this.externalTransport.connect(daemon.socketPath, this.config.runtime.rpcTimeoutMs).catch(() => { throw new ExternalSessionError("runtime-unavailable", "Handoff target observer unavailable; replacement remains held."); });
+    try {
+      const snap = await new ExternalCurrentSession(observer, this.runner, this.config.runtime, args, daemon.binary).inspect();
+      if (snap.state === "failed") throw new ExternalSessionError("runtime-failed", "Handoff target reports a runtime failure; replacement remains held.");
+      return { daemon, snap };
+    } finally { observer.close(); }
+  }
+  private async previewHandoff(raw: any): Promise<any> {
+    const args = this.handoffArgs(raw, false), lane = await this.lane("lead");
+    if (lane.runtime?.threadId !== args.fromThreadId || lane.runtime.backend !== "external-current-session") throw new Error("Handoff expected source session mismatch");
+    const saved = this.attachment(lane), summary = this.handoffMail(saved);
+    await this.validateHandoffTarget(args, saved.socketPath);
+    return { fromThreadId: args.fromThreadId, threadId: args.threadId, pane: args.pane, cwd: args.cwd, ...summary,
+      selectedMailIds: args.mailIds, selectionValid: args.mailIds.every(id => summary.eligibleMailIds.includes(id)), dispatches: false };
+  }
+  private async applyHandoff(raw: any): Promise<any> {
+    const args = this.handoffArgs(raw, true), path = this.handoffPath(args.operationId);
+    let intent: HandoffIntent;
+    if (existsSync(path)) {
+      intent = readJson<HandoffIntent>(path);
+      if (!sameJson(intent.args, args)) throw new Error("Handoff operationId reused with different arguments");
+      if (intent.status === "committed" && !this.pendingHandoff()) {
+        await this.assertHandoffCurrent(intent);
+        if (!intent.cleanupPending) return this.completedHandoff(intent);
+        atomicJson(this.activeHandoffPath(), { operationId: args.operationId });
+        return this.finishHandoff(intent);
+      }
+    } else {
+      if (this.pendingHandoff()) throw new Error("Another handoff is pending; finish its recorded operation first");
+      const before = await this.lane("lead");
+      if (before.runtime?.threadId !== args.fromThreadId || before.runtime.backend !== "external-current-session") throw new Error("Handoff expected source session mismatch");
+      const beforeAttachment = this.attachment(before), summary = this.handoffMail(beforeAttachment);
+      if (args.mailIds.some(id => !summary.eligibleMailIds.includes(id))) throw new Error("Handoff selection includes attempted, reconciled, unknown or other-attachment mail");
+      const { daemon, snap } = await this.validateHandoffTarget(args, beforeAttachment.socketPath);
+      const excluded = [...new Set([...beforeAttachment.excludedInboxIds, ...this.inbox.list().filter(row => row.target === "lead").map(row => row.id)])].filter(id => !args.mailIds.includes(id));
+      const { saved: afterAttachment, lead: after } = this.prepareAttachment(args, args.cwd, before, daemon.binary, daemon, snap, excluded);
+      const protectedHold = before.holdReason === "owner-pause" || before.holdReason === "done-review" || statusOf(before) === "paused" || statusOf(before) === "done-claimed" || statusOf(before) === "verified-done";
+      if (protectedHold) { Object.assign(after, { status: before.status, dispatchBlocked: true, holdReason: before.holdReason, claim: before.claim }); after.runtime!.held = true; }
+      const publicLead = { ...after, mode: "external-current-session", bridge: afterAttachment.bridge, identityVerified: true,
+        verifiedIdentity: { threadId: args.threadId, pane: args.pane, cwd: args.cwd, model: snap.model, effort: snap.effort }, readiness: protectedHold ? "held" : snap.state === "idle" ? "ready" : "busy" };
+      intent = { version: 1, status: "prepared", args, before, beforeAttachment, after, afterAttachment, createdAt: new Date().toISOString(),
+        result: { attached: true, handedOff: true, operationId: args.operationId, fromThreadId: args.fromThreadId, threadId: args.threadId, mailIds: args.mailIds, bridge: afterAttachment.bridge, lead: publicLead } };
+      atomicJson(path, intent);
+    }
+    const pending = this.pendingHandoff();
+    if (pending && pending.args.operationId !== args.operationId) throw new Error("Another handoff is pending");
+    if (!pending) {
+      // An orphan prepared record means no transaction write was started. Its
+      // selected mail may have progressed meanwhile; never replay it.
+      const current = await this.lane("lead"), summary = this.handoffMail(this.attachment(current));
+      if (current.runtime?.hostInstanceId !== intent.beforeAttachment.instance || current.revision !== intent.before.revision || args.mailIds.some(id => !summary.eligibleMailIds.includes(id))) throw new Error("Handoff source or selected mail changed before intent activation");
+      atomicJson(this.activeHandoffPath(), { operationId: args.operationId });
+    }
+    return this.finishHandoff(intent);
+  }
+  private async assertHandoffCurrent(intent: HandoffIntent): Promise<Lane> {
+    const current = await this.lane("lead");
+    if (current.runtime?.hostInstanceId !== intent.afterAttachment.instance || current.runtime.generation !== intent.afterAttachment.generation ||
+      current.runtime.threadId !== intent.args.threadId || current.pane !== intent.args.pane || current.cwd !== intent.args.cwd || current.runtime.external?.detachedAt || current.runtime.state === "stopped")
+      throw new Error("Completed handoff has been detached or superseded; refusing to restore its old target");
+    this.attachment(current); return current;
+  }
+  private async completedHandoff(intent: HandoffIntent): Promise<any> {
+    const current = await this.assertHandoffCurrent(intent);
+    const result = { ...intent.result, lead: await this.publicLane(current, true) };
+    const completed = { ...intent, cleanupPending: false, result };
+    if (!sameJson(intent, completed)) atomicJson(this.handoffPath(intent.args.operationId), completed);
+    return result;
+  }
+  private async finishHandoff(intent: HandoffIntent, automatic = false): Promise<any> {
+    const { args, beforeAttachment, afterAttachment } = intent, path = this.handoffPath(args.operationId);
+    try {
+      const current = await this.lane("lead");
+      if (automatic && intent.identityHeld) throw new DeliveryDeferred("Recorded handoff target identity changed; explicit operator retry required");
+      if (automatic && Date.parse(current.runtime?.external?.reconnect?.nextAttemptAt ?? "") > this.deps.clock.now()) throw new DeliveryDeferred("Recorded handoff recovery is waiting for its next retry");
+      if (![beforeAttachment.instance, afterAttachment.instance].includes(current.runtime?.hostInstanceId ?? "")) throw new Error("Handoff registry identity changed; operator reconciliation required");
+      // Every restart validates the exact recorded target before committing or
+      // releasing dispatch. A different focused pane/cwd is never substituted.
+      await this.validateHandoffTarget(args, beforeAttachment.socketPath);
+      if (intent.identityHeld) { intent = { ...intent, identityHeld: undefined }; atomicJson(path, intent); }
+      if (intent.status !== "committed") {
+        await this.registry.update("lead", lane => ({ ...lane, dispatchBlocked: true, holdReason: lane.holdReason ?? "recovery", runtime: { ...lane.runtime!, held: true, state: "recovering" } }));
+        for (const id of args.mailIds) {
+          const row = this.inbox.get(id);
+          if (!row || row.target !== "lead" || row.state !== "queued" || row.turnId || row.source?.startsWith("reconciled:") || row.attachmentInstance && ![UNOWNED_LEAD, beforeAttachment.instance, afterAttachment.instance].includes(row.attachmentInstance)) throw new Error("Handoff selected mail no longer safe; operator reconciliation required");
+          if (row.attachmentInstance !== afterAttachment.instance) this.inbox.mark(id, { attachmentInstance: afterAttachment.instance });
+        }
+        if (!sameJson(readJson(this.attachmentPath()), afterAttachment)) atomicJson(this.attachmentPath(), afterAttachment);
+        await this.registry.update("lead", lane => ({ ...lane, pane: intent.after.pane, cwd: intent.after.cwd, model: intent.after.model, runtimeHistory: intent.after.runtimeHistory,
+          dispatchBlocked: true, holdReason: lane.holdReason ?? "recovery", runtime: { ...intent.after.runtime!, held: true, state: "recovering" } }));
+        intent = { ...intent, status: "committed" }; atomicJson(path, intent);
+      }
+      await this.registry.update("lead", lane => {
+        const protectedHold = lane.holdReason === "owner-pause" || lane.holdReason === "done-review" || ["paused", "done-claimed", "verified-done", "closed"].includes(statusOf(lane));
+        // A committed marker left after a crash may outlive later observations.
+        // Finalize only the handoff's recovery barrier; preserve newer holds and
+        // runtime observations rather than restoring the old intent snapshot.
+        const cause = lane.runtime?.external?.holdReason?.code;
+        if (lane.runtime?.hostInstanceId === afterAttachment.instance && (!lane.dispatchBlocked || cause && cause !== "handoff-interrupted")) return lane;
+        return { ...lane, dispatchBlocked: protectedHold, holdReason: protectedHold ? lane.holdReason : undefined,
+          runtime: { ...intent.after.runtime!, held: protectedHold, state: protectedHold ? "recovering" : intent.after.runtime!.state } };
+      });
+      // Persist cleanup intent before removing the gate. If unlink succeeds but
+      // directory fsync fails, the same operation can reconstruct the marker.
+      intent = { ...intent, cleanupPending: true }; atomicJson(path, intent);
+      this.handoffIO.removeMarker(this.activeHandoffPath());
+      return await this.completedHandoff(intent);
+    } catch (error) {
+      if (!(error instanceof DeliveryDeferred)) {
+        const current = await this.registry.read("lead");
+        if (intent.cleanupPending && current?.runtime?.hostInstanceId === afterAttachment.instance && !existsSync(this.activeHandoffPath()))
+          atomicJson(this.activeHandoffPath(), { operationId: args.operationId });
+        if (error instanceof ExternalSessionError && error.code === "identity-unverified") { intent = { ...intent, identityHeld: true }; atomicJson(path, intent); }
+        const lane = await this.registry.read("lead");
+        if (lane?.runtime) {
+          await this.holdExternal(lane.runtime.hostInstanceId, new ExternalSessionError("handoff-interrupted", "Recorded lead handoff is incomplete; verify its exact target and retry the same operationId."));
+          await this.recordRetry(lane.runtime.hostInstanceId);
+        }
+      }
+      throw error;
+    }
   }
   private attachmentPath(): string { return join(this.config.stateDir, "attachments", "lead.json"); }
   private attachment(lane: Lane): Attachment {
@@ -92,9 +335,66 @@ export class DoriService {
     return saved;
   }
   private async holdExternal(instance: string, error: unknown = new ExternalSessionError("identity-unverified", "Attached session identity unavailable; explicit attachment required.")): Promise<void> {
-    const reason = error instanceof ExternalSessionError ? error : new ExternalSessionError("identity-unverified", "Attached session could not be verified; delivery is waiting for reconnection.");
-    await this.registry.update("lead", lane => lane.runtime?.hostInstanceId !== instance || lane.runtime.external?.detachedAt || lane.runtime.state === "stopped" ? lane : ({ ...lane, dispatchBlocked: true, holdReason: "recovery", runtime: { ...lane.runtime, held: true, state: "recovering", activeTurnId: undefined,
-      external: { ...lane.runtime.external!, holdReason: lane.runtime.external?.holdReason ?? { code: reason.code, message: reason.message, at: new Date().toISOString() } } } }));
+    const reason = error instanceof ExternalSessionError ? error : new ExternalSessionError("identity-unverified", "Attached session could not be verified; explicit reconnection required.");
+    await this.registry.update("lead", lane => {
+      if (lane.runtime?.hostInstanceId !== instance || lane.runtime.external?.detachedAt || lane.runtime.state === "stopped") return lane;
+      const ext = lane.runtime.external!;
+      const latest = ext.latestHoldReason?.code === reason.code && ext.latestHoldReason.message === reason.message ? ext.latestHoldReason : { code: reason.code, message: reason.message, at: new Date().toISOString() };
+      const next: Lane = { ...lane, dispatchBlocked: true, holdReason: lane.holdReason ?? "recovery", runtime: { ...lane.runtime, held: true, state: "recovering", activeTurnId: undefined,
+        external: { ...ext, holdReason: ext.holdReason ?? latest, firstHoldReason: ext.firstHoldReason ?? ext.holdReason ?? latest, latestHoldReason: latest,
+          reconnectBlocked: Boolean(ext.reconnectBlocked || !reconnectable(reason.code)) } } };
+      return sameJson(lane, next) ? lane : next;
+    });
+  }
+  private async rebindExternal(lane: Lane, saved: Attachment, automatic: boolean): Promise<Awaited<ReturnType<ExternalCurrentSession["inspect"]>>> {
+    const daemon = await discoverExternal(this.runner, this.config.runtime);
+    if (daemon.socketPath !== saved.socketPath) throw new ExternalSessionError("identity-unverified", "Attached daemon affinity changed; explicit attachment required.");
+    const observer = await this.externalTransport.connect(daemon.socketPath, this.config.runtime.rpcTimeoutMs).catch(() => { throw new ExternalSessionError("runtime-unavailable", "Shared Codex observer unavailable; delivery is waiting for reconnection."); });
+    let snap: Awaited<ReturnType<ExternalCurrentSession["inspect"]>>;
+    try { snap = await new ExternalCurrentSession(observer, this.runner, this.config.runtime, saved, daemon.binary, realClock, turns => this.recordExternalFailures(saved, turns)).inspect(); }
+    finally { observer.close(); }
+    if (snap.state === "failed") throw new ExternalSessionError("runtime-failed", "Attached Codex session reports a runtime failure; explicit attachment required.");
+    const protectedHold = lane.holdReason === "owner-pause" || lane.holdReason === "done-review" || statusOf(lane) === "paused" || statusOf(lane) === "done-claimed" || statusOf(lane) === "verified-done";
+    if (automatic && (protectedHold || lane.runtime?.external?.reconnectBlocked)) throw new DeliveryDeferred("Attached lead requires explicit reconciliation");
+    const changed = saved.binary !== daemon.binary || saved.binaryVersion !== daemon.binaryVersion || Boolean(lane.runtime?.external?.rebind);
+    try {
+      if (changed) {
+        // Record both sides before changing the attachment. Either side is accepted
+        // on recovery, but affinity and identity are always revalidated first.
+        await this.registry.update("lead", current => ({ ...current, dispatchBlocked: true, holdReason: current.holdReason ?? "recovery", runtime: { ...current.runtime!, held: true, state: "recovering",
+          external: { ...current.runtime!.external!, rebind: { binary: daemon.binary, binaryVersion: daemon.binaryVersion } } } }));
+        atomicJson(this.attachmentPath(), { ...saved, binary: daemon.binary, binaryVersion: daemon.binaryVersion, model: snap.model, effort: snap.effort });
+      }
+      await this.registry.update("lead", current => {
+        const next: Lane = { ...current, model: snap.model, dispatchBlocked: protectedHold, holdReason: protectedHold ? current.holdReason : undefined, runtime: { ...current.runtime!,
+          binaryVersion: daemon.binaryVersion, model: snap.model, effort: snap.effort, held: protectedHold, state: protectedHold ? "recovering" : snap.state, activeTurnId: snap.activeTurnId,
+          external: { ...current.runtime!.external!, binary: daemon.binary, holdReason: undefined, reconnectBlocked: undefined, reconnect: undefined, rebind: undefined } } };
+        return sameJson(current, next) ? current : next;
+      });
+    } catch {
+      throw new ExternalSessionError("rebind-interrupted", "Recorded runtime rebind is incomplete; delivery is waiting for verified reconnection.");
+    }
+    return snap;
+  }
+  private async reconnectExternal(lane: Lane, saved: Attachment): Promise<Awaited<ReturnType<ExternalCurrentSession["inspect"]>> | null> {
+    const ext = lane.runtime!.external!;
+    if (lane.holdReason && lane.holdReason !== "recovery" || ext.reconnectBlocked || !ext.rebind && !reconnectable(ext.holdReason?.code)) return null;
+    if (Date.parse(ext.reconnect?.nextAttemptAt ?? "") > this.deps.clock.now()) throw new DeliveryDeferred("Attached runtime reconnect is waiting for its next retry");
+    try { return await this.rebindExternal(lane, saved, true); }
+    catch (error) {
+      if (!(error instanceof DeliveryDeferred)) {
+        await this.holdExternal(saved.instance, error);
+        await this.recordRetry(saved.instance);
+      }
+      throw error;
+    }
+  }
+  private async recordRetry(instance: string): Promise<void> {
+    await this.registry.update("lead", current => {
+      if (current.runtime?.hostInstanceId !== instance) return current;
+      const attempts = Math.min(16, (current.runtime.external?.reconnect?.attempts ?? 0) + 1);
+      return { ...current, runtime: { ...current.runtime, external: { ...current.runtime.external!, reconnect: { attempts, nextAttemptAt: new Date(this.deps.clock.now() + Math.min(60000, 1000 * 2 ** (attempts - 1))).toISOString() } } } };
+    });
   }
   private async recordExternalFailures(saved: Attachment, turns: Turn[]): Promise<void> {
     const current = await this.registry.read("lead");
@@ -110,34 +410,49 @@ export class DoriService {
       const id = `failed-turn:lead:${saved.instance}:${turnId}`;
       // Preserve first observation and resolution across repeated polling and
       // restarts; never replace a durable failure's metadata or state.
-      if (!this.failures.get(id)) this.failures.put({ id, target: "lead", turnId, source: saved.instance, attachmentInstance: saved.instance,
+      if (!this.failures.get(id)) this.putFailure({ id, target: "lead", turnId, source: saved.instance, attachmentInstance: saved.instance,
         text: JSON.stringify(turnFailure(turn.error)), state: "queued", at: new Date().toISOString() });
     }
   }
   private async externalCall(lane: Lane, action: string, args: any): Promise<unknown> {
     if (!["inspect", "input"].includes(action)) throw new Error(`External current-session ${action} is unsupported; use lead-detach`);
+    const pending = this.pendingHandoff();
+    if (pending) {
+      if (action !== "inspect") throw new DeliveryDeferred("Recorded lead handoff is incomplete; dispatch held");
+      await this.finishHandoff(pending, true); lane = await this.lane("lead");
+    }
     let saved: Attachment;
     try { saved = this.attachment(lane); }
     catch (error) { await this.holdExternal(lane.runtime!.hostInstanceId, new ExternalSessionError("attachment-inconsistent", "Attached session records are inconsistent; explicit attachment required.")); throw error; }
-    if (lane.runtime?.external?.rebind) {
-      await this.holdExternal(saved.instance, new ExternalSessionError("rebind-interrupted", "Attached runtime rebind incomplete; explicitly reattach to finish reconnection."));
-      throw new DeliveryDeferred("Attached runtime rebind incomplete; dispatch held");
+    if (action === "inspect" && (lane.runtime?.external?.rebind || lane.runtime?.external?.holdReason)) {
+      const recovered = await this.reconnectExternal(lane, saved);
+      if (recovered) return recovered;
     }
     if (action === "input" && lane.dispatchBlocked) throw new DeliveryDeferred("Attached lead dispatch is held");
     let connected = false;
     try {
-      return await observeExternal(this.runner, this.config.runtime, { ...saved, binaryVersion: saved.binaryVersion ?? lane.runtime?.binaryVersion }, async observer => {
+      return await this.externalTransport.observe(this.runner, this.config.runtime, { ...saved, binaryVersion: saved.binaryVersion ?? lane.runtime?.binaryVersion }, async observer => {
         connected = true;
         const session = new ExternalCurrentSession(observer, this.runner, this.config.runtime, saved, saved.binary, realClock, turns => this.recordExternalFailures(saved, turns));
         if (action === "input") return session.input(args.text, args.operationId, error => this.holdExternal(saved.instance, error));
         const snap = await session.inspect();
         if (snap.state === "failed") await this.holdExternal(saved.instance, new ExternalSessionError("runtime-failed", "Attached Codex session reports a runtime failure; explicit attachment required."));
-        await this.registry.update(lane.key, current => current.runtime?.hostInstanceId !== saved.instance || current.runtime.external?.detachedAt ? current : ({ ...current,
-          model: snap.model, runtime: { ...current.runtime, model: snap.model, effort: snap.effort, state: current.dispatchBlocked ? "recovering" : snap.state, activeTurnId: snap.activeTurnId } }));
+        await this.registry.update(lane.key, current => {
+          if (current.runtime?.hostInstanceId !== saved.instance || current.runtime.external?.detachedAt) return current;
+          const next = { ...current, model: snap.model, runtime: { ...current.runtime, model: snap.model, effort: snap.effort, state: current.dispatchBlocked ? "recovering" as const : snap.state, activeTurnId: snap.activeTurnId } };
+          return sameJson(current, next) ? current : next;
+        });
         return snap;
       });
     } catch (error) {
-      if (!(error instanceof DeliveryDeferred)) await this.holdExternal(saved.instance, error);
+      if (!(error instanceof DeliveryDeferred)) {
+        await this.holdExternal(saved.instance, error);
+        if (action === "inspect") {
+          const current = await this.lane("lead");
+          const recovered = await this.reconnectExternal(current, saved);
+          if (recovered) return recovered;
+        }
+      }
       if (action === "input" && !connected) throw new DeliveryDeferred("Attached observer unavailable before submission; input remains queued");
       throw error;
     }
@@ -163,27 +478,17 @@ export class DoriService {
     // This also accepts either side of a previously interrupted, recorded rebind.
     const saved = same ? this.attachment(previous) : undefined;
     try {
-      const binary = resolveCodexBinary(this.config.runtime.externalBinary ?? this.config.runtime.binary);
-      const daemon = await sharedDaemon(this.runner, binary, this.config.runtime);
-      if (saved && saved.socketPath !== daemon.socketPath) throw new ExternalSessionError("identity-unverified", "Attached daemon affinity changed; detach before attaching a different daemon.");
-      const observer = await connectObserver(daemon.socketPath, this.config.runtime.rpcTimeoutMs).catch(() => { throw new ExternalSessionError("runtime-unavailable", "Shared Codex observer unavailable; delivery is waiting for reconnection."); });
+      if (saved) {
+        await this.rebindExternal(previous!, saved, false);
+        return { attached: true, bridge: saved.bridge, lead: await this.publicLane(await this.lane("lead"), true), reused: true };
+      }
+      const daemon = await discoverExternal(this.runner, this.config.runtime), binary = daemon.binary;
+      const observer = await this.externalTransport.connect(daemon.socketPath, this.config.runtime.rpcTimeoutMs).catch(() => { throw new ExternalSessionError("runtime-unavailable", "Shared Codex observer unavailable; delivery is waiting for reconnection."); });
       let snap: Awaited<ReturnType<ExternalCurrentSession["inspect"]>>;
       try {
         snap = await new ExternalCurrentSession(observer, this.runner, this.config.runtime, { threadId: args.threadId, pane: args.pane, cwd }, binary).inspect();
       } finally { observer.close(); }
       if (snap.state === "failed") throw new ExternalSessionError("runtime-failed", "Current Codex session reports a runtime failure; resolve it before attaching.");
-      if (saved) {
-        // Both writes follow a durable hold/intent. A crash between either write
-        // leaves dispatch held, while preserving this exact session's capability.
-        await this.registry.update("lead", lane => ({ ...lane, dispatchBlocked: true, holdReason: "recovery", runtime: { ...lane.runtime!, held: true, state: "recovering",
-          external: { ...lane.runtime!.external!, rebind: { binary, binaryVersion: daemon.binaryVersion },
-            holdReason: lane.runtime!.external?.holdReason ?? { code: "rebind-interrupted", message: "Attached runtime rebind incomplete; explicitly reattach to finish reconnection.", at: new Date().toISOString() } } } }));
-        atomicJson(this.attachmentPath(), { ...saved, binary, binaryVersion: daemon.binaryVersion, model: snap.model, effort: snap.effort });
-        await this.registry.update("lead", lane => ({ ...lane, model: snap.model, dispatchBlocked: false, holdReason: undefined, runtime: { ...lane.runtime!, binaryVersion: daemon.binaryVersion,
-          model: snap.model, effort: snap.effort, held: false, state: snap.state, activeTurnId: snap.activeTurnId,
-          external: { ...lane.runtime!.external!, binary, holdReason: undefined, rebind: undefined } } }));
-        return { attached: true, bridge: saved.bridge, lead: await this.publicLane(await this.lane("lead"), true), reused: true };
-      }
       return await this.createAttachment(args, cwd, previous, binary, daemon, snap);
     } catch (error) {
       if (saved) await this.holdExternal(saved.instance, error);
@@ -211,11 +516,20 @@ export class DoriService {
       }
       if (existsSync(this.attachmentPath())) writeFileSync(join(history, "attachment.json"), readFileSync(this.attachmentPath()), { mode: 0o600 });
     }
+    const { saved, lead } = this.prepareAttachment(args, cwd, previous, binary, daemon, snap, this.inbox.list().filter(row => row.target === "lead").map(row => row.id));
+    await this.registry.write(lead);
+    // Publish the credential only after the registry commit succeeds. A revision
+    // conflict must not revoke a previously valid attachment's capability.
+    atomicJson(this.attachmentPath(), saved);
+    return { attached: true, bridge: saved.bridge, lead: await this.publicLane(await this.lane("lead"), true) };
+  }
+  private prepareAttachment(args: any, cwd: string, previous: Lane | null, binary: string,
+    daemon: Awaited<ReturnType<typeof sharedDaemon>>, snap: Awaited<ReturnType<ExternalCurrentSession["inspect"]>>, excludedInboxIds: string[]): { saved: Attachment; lead: Lane } {
     const instance = crypto.randomUUID(), generation = (previous?.runtime?.generation ?? 0) + 1;
     const clientDir = resolve(this.config.stateDir, "clients", "attached-lead", instance), bridge = join(clientDir, "iyen");
     mkdirSync(clientDir, { recursive: true, mode: 0o700 });
     const saved: Attachment = { threadId: args.threadId, pane: args.pane, cwd, model: snap.model, effort: snap.effort, instance, generation, token: crypto.randomUUID(), ...daemon, binary, bridge,
-      excludedInboxIds: this.inbox.list().filter(row => row.target === "lead").map(row => row.id) };
+      excludedInboxIds: excludedInboxIds };
     atomicJson(join(clientDir, "context.json"), { token: saved.token, key: "lead", stateDir: this.config.stateDir });
     atomicJson(join(clientDir, "config.json"), this.config);
     writeFileSync(bridge, `#!/bin/sh\nDORI_CONTEXT=${quoteForPane(join(clientDir, "context.json"))} DORI_STATE_DIR=${quoteForPane(this.config.stateDir)} DORI_CONFIG=${quoteForPane(join(clientDir, "config.json"))} DORI_LANE_KEY=lead exec ${quoteForPane(process.execPath)} ${quoteForPane(resolve(import.meta.dir, "cli.ts"))} "$@"\n`, { mode: 0o700 });
@@ -224,11 +538,7 @@ export class DoriService {
       runtimeHistory: [...(previous?.runtimeHistory ?? []), ...(previous?.runtime ? [previous.runtime] : [])],
       runtime: { kind: "codex", backend: "external-current-session", threadId: args.threadId, state: snap.state, activeTurnId: snap.activeTurnId,
         hostInstanceId: instance, generation, binaryVersion: daemon.binaryVersion, model: snap.model, effort: snap.effort, external: { socketPath: daemon.socketPath, binary, bridge } } };
-    await this.registry.write(lead);
-    // Publish the credential only after the registry commit succeeds. A revision
-    // conflict must not revoke a previously valid attachment's capability.
-    atomicJson(this.attachmentPath(), saved);
-    return { attached: true, bridge, lead: await this.publicLane(await this.lane("lead"), true) };
+    return { saved, lead };
   }
   private async lane(key: string): Promise<Lane> { if (!key || !LANE_KEY.test(key)) throw new Error("Invalid lane key"); const lane = await this.registry.read(key); if (!lane) throw new Error("Unknown lane"); return lane; }
   private async assertHostStopped(lane: Lane): Promise<void> {
@@ -283,6 +593,9 @@ export class DoriService {
   async authorize(token: string): Promise<Caller> {
     const control = readJson<{ token: string }>(join(this.config.stateDir, "control.json"));
     if (token === control.token) return { role: "admin" };
+    const pending = this.pendingHandoff();
+    if (pending && pending.status !== "committed" && token === pending.beforeAttachment.token) return { role: "lead", key: "lead", instance: pending.beforeAttachment.instance };
+    if (pending && pending.status !== "committed" && token === pending.afterAttachment.token) throw new Error("Forbidden");
     for (const lane of await this.registry.open()) {
       if (lane.runtime?.backend === "external-current-session") {
         if (!lane.runtime.external?.detachedAt && lane.runtime.state !== "stopped") {
@@ -301,22 +614,39 @@ export class DoriService {
     }
     throw new Error("Forbidden");
   }
-  async handle(action: string, args: any, caller: Caller): Promise<any> {
+  handle(action: string, args: any, caller: Caller): Promise<any> {
+    return this.withIntake(() => this.handleScoped(action, args, caller));
+  }
+  private async handleScoped(action: string, args: any, caller: Caller): Promise<any> {
     if (!args || typeof args !== "object") throw new Error("Expected args object");
     if (this.stopping) throw new Error("Service stopping");
+    if (this.pendingHandoff() && this.blocksPendingMutation(action, args, caller)) throw new Error("Lead handoff incomplete; mutations are held until its recorded operation finishes");
     if (caller.instance) {
       const lead = await this.lane("lead");
-      if (caller.role !== "lead" || caller.key !== "lead" || this.attachment(lead).instance !== caller.instance) throw new Error("Stale lead capability");
+      const pending = this.pendingHandoff();
+      const instance = pending && pending.status !== "committed" ? pending.beforeAttachment.instance : this.attachment(lead).instance;
+      if (caller.role !== "lead" || caller.key !== "lead" || instance !== caller.instance) throw new Error("Stale lead capability");
+      if (pending && !["health", "status"].includes(action)) throw new Error("Lead handoff incomplete; dispatch held");
     }
+    if (action === "health") {
+      if (caller.role !== "admin" && !(caller.role === "lead" && caller.key === "lead" && caller.instance)) throw new Error("Health requires operator or current scoped lead capability");
+      return this.health();
+    }
+    if (action === "lead-handoff-preview" || action === "lead-handoff") {
+      if (caller.role !== "admin") throw new Error("Lead handoff requires operator capability");
+      return this.launchQueue.run("lead", () => this.dispatchQueue.run("lead", () => action === "lead-handoff-preview" ? this.previewHandoff(args) : this.applyHandoff(args)));
+    }
+    if (["lead-attach", "lead", "lead-detach"].includes(action) && this.pendingHandoff()) throw new Error("Recorded handoff is incomplete; retry its operationId first");
     if (action === "lead-attach" || action === "lead") {
       if (caller.role !== "admin") throw new Error("lead-attach requires operator capability");
       if (action === "lead" && (!args.threadId || !args.pane || !args.cwd)) throw new Error("Start Iyen in this session with lead-attach --thread-id UUID --pane ID --cwd DIR");
-      return this.launchQueue.run("lead", () => this.dispatchQueue.run("lead", () => this.attachLead(args)));
+      return this.launchQueue.run("lead", () => this.dispatchQueue.run("lead", () => { this.assertNoPendingLeadMutation(); return this.attachLead(args); }));
     }
     if (action === "lead-detach") {
       if (caller.role !== "admin" && !(caller.role === "lead" && caller.key === "lead" && caller.instance)) throw new Error("lead-detach requires operator or current attached lead capability");
       if (typeof args.threadId !== "string" || !THREAD_UUID.test(args.threadId)) throw new Error("lead-detach requires expected UUID thread-id");
       return this.launchQueue.run("lead", () => this.dispatchQueue.run("lead", async () => {
+        this.assertNoPendingLeadMutation();
         const lane = await this.lane("lead");
         if (lane.runtime?.backend !== "external-current-session" || lane.runtime.threadId !== args.threadId || (caller.instance && caller.instance !== lane.runtime.hostInstanceId)) throw new Error("lead-detach expected session mismatch");
         await this.registry.update("lead", current => ({ ...current, dispatchBlocked: true, runtime: { ...current.runtime!, held: true, state: "stopped", activeTurnId: undefined,
@@ -338,15 +668,15 @@ export class DoriService {
       if (action === "host-event" && args.event?.id !== undefined) {
         const id = args.event.method === "tui/inputRequired" ? `${lane.key}:${args.event.id}` : `${args.instance}:${args.event.id}`;
         this.outbox.put({ id: `approval:${id}`, target: lane.thread, text: JSON.stringify({ lane: lane.key, id, method: args.event.method, params: args.event.params }), state: "queued", at: new Date().toISOString() });
-        this.inbox.put({ id: `approval-notice:${id}`, target: "lead", text: `Approval or input required for ${lane.key}. Inspect dori approval list. ID: ${id}`, state: "queued", at: new Date().toISOString() });
+        this.putInbox({ id: `approval-notice:${id}`, target: "lead", text: `Approval or input required for ${lane.key}. Inspect dori approval list. ID: ${id}`, state: "queued", at: new Date().toISOString() });
       }
       if (action === "host-event" && args.event?.method === "runtime/disconnected" && lane.role !== "lead") {
-        this.inbox.put({ id: `runtime-failed:${lane.key}:${args.instance}`, target: "lead", text: `Runtime failed for ${lane.key}. Inspect status and reconcile unknown operations before recover.`, state: "queued", at: new Date().toISOString() });
+        this.putInbox({ id: `runtime-failed:${lane.key}:${args.instance}`, target: "lead", text: `Runtime failed for ${lane.key}. Inspect status and reconcile unknown operations before recover.`, state: "queued", at: new Date().toISOString() });
       }
       if (action === "host-event" && args.event?.method === "turn/completed" && args.event.params?.turn?.status === "failed") {
         const turnId = args.event.params.turn.id;
         if (typeof turnId !== "string" || !turnId || (args.event.params.threadId && args.event.params.threadId !== lane.runtime.threadId)) throw new Error("Invalid failed turn identity");
-        this.failures.put({ id: `failed-turn:${lane.key}:${args.instance}:${turnId}`, target: lane.key, turnId, source: args.instance,
+        this.putFailure({ id: `failed-turn:${lane.key}:${args.instance}:${turnId}`, target: lane.key, turnId, source: args.instance,
           text: JSON.stringify(turnFailure(args.event.params.turn.error)), state: "queued", at: new Date().toISOString() });
       }
       if (action === "host-event" && args.event?.method === "serverRequest/resolved") {
@@ -420,8 +750,8 @@ export class DoriService {
     if (action === "input") {
       if (!args.text || !args.operationId) throw new Error("text and operationId required");
       const lane = await this.lane(key);
-      const mail = this.inbox.put({ id: args.operationId, target: key, text: args.text, thread: args.thread ?? lane.thread, state: "queued", at: new Date().toISOString(),
-        attachmentInstance: lane.runtime?.backend === "external-current-session" ? caller.instance ?? lane.runtime.hostInstanceId : undefined });
+      const mail = this.putInbox({ id: args.operationId, target: key, text: args.text, thread: args.thread ?? lane.thread, state: "queued", at: new Date().toISOString(),
+        attachmentInstance: lane.runtime?.backend === "external-current-session" ? caller.instance ?? this.intakeInstance(lane) : undefined });
       if (mail.state === "unknown" || mail.state === "sending") throw new Error("Delivery unknown; reconcile before retry");
       if (mail.state === "sent") {
         if (!mail.turnId) throw new Error("Missing turn receipt");
@@ -437,7 +767,7 @@ export class DoriService {
     if (action === "report") {
       if (!["milestone", "blocker", "question", "done"].includes(args.kind) || !args.text || !args.eventId) throw new Error("Invalid report");
       const id = `report:${key}:${args.eventId}`;
-      const report = this.inbox.put({ id, target: "lead", text: `[REPORT] ${key} | ${args.kind} | ${args.text}`, state: "queued", at: new Date().toISOString() });
+      const report = this.putInbox({ id, target: "lead", text: `[REPORT] ${key} | ${args.kind} | ${args.text}`, state: "queued", at: new Date().toISOString() });
       await this.registry.update(key, l => ({ ...l, report: { id: args.eventId, kind: args.kind, text: args.text, at: Date.parse(report.at) } }));
       const lane = await this.lane(key);
       if (this.config.hooks.threadReply && lane.thread !== "none") {
@@ -505,7 +835,7 @@ export class DoriService {
         lane = await this.registry.update(key, l => ({ ...l, pane: made.root_pane.pane_id, tab: made.tab_id ?? made.root_pane.tab_id }));
         await this.boot(lane);
         const text = args.text ?? (!lane.runtime?.threadId ? await Bun.file(lane.brief).text() : undefined);
-        if (text) this.inbox.put({ id: args.operationId ?? `handoff:${key}:${lane.cycle ?? 1}`, target: key, text, state: "queued", at: new Date().toISOString() });
+        if (text) this.putInbox({ id: args.operationId ?? `handoff:${key}:${lane.cycle ?? 1}`, target: key, text, state: "queued", at: new Date().toISOString() });
         return { recovering: true, key };
       });
     }
@@ -524,7 +854,8 @@ export class DoriService {
     }
     return result;
   }
-  async notifyFailures(): Promise<void> {
+  notifyFailures(): Promise<void> { return this.withIntake(() => this.notifyFailuresScoped()); }
+  private async notifyFailuresScoped(): Promise<void> {
     for (const failure of this.failures.list().filter(row => row.state === "queued")) {
       await this.failureQueue.run(failure.id, async () => {
         if (this.failures.get(failure.id)?.state !== "queued") return;
@@ -533,7 +864,7 @@ export class DoriService {
         const metadata = JSON.parse(failure.text) as ReturnType<typeof turnFailure>;
         const text = `Codex task failed (${metadata.category}). ${metadata.guidance} The task was not automatically retried.`;
         if (lane.role !== "lead") {
-          this.inbox.put({ id: `notice:${failure.id}`, target: "lead", thread: lane.thread, text: `Lane ${lane.key}: ${text}`, state: "queued", at: failure.at });
+          this.putInbox({ id: `notice:${failure.id}`, target: "lead", attachmentInstance: (failure as OwnedFailure).leadIntakeInstance ?? UNOWNED_LEAD, thread: lane.thread, text: `Lane ${lane.key}: ${text}`, state: "queued", at: failure.at });
         } else {
           // Completion notifications can precede the input RPC receipt. Keep the failure
           // pending until a sent receipt associates that turn with its owner thread.
@@ -553,7 +884,8 @@ export class DoriService {
       });
     }
   }
-  async receive(source: string, event: any): Promise<void> {
+  receive(source: string, event: any): Promise<void> { return this.withIntake(() => this.receiveScoped(source, event)); }
+  private async receiveScoped(source: string, event: any): Promise<void> {
     const ingress = this.config.ingress.find(i => i.id === source);
     if (!ingress || !ingress.owners.includes(event.user) || !event.id || !event.thread || typeof event.text !== "string") throw new Error("Untrusted or incomplete inbound event");
     const id = `inbound:${source}:${event.thread}:${event.id}`;
@@ -565,12 +897,15 @@ export class DoriService {
         const request = (await this.approvals()).find(a => a.id === event.control.args?.id);
         if (!request || (await this.lane(request.key)).thread !== event.thread) throw new Error("Approval belongs to another thread");
       } else if (!known || event.control.args?.key !== known.key) throw new Error("Control belongs to another lane");
-      this.inbox.put({ id, target: "owner-control", text: JSON.stringify(event.control), source, thread: event.thread, state: "queued", at: new Date().toISOString() });
+      this.putInbox({ id, target: "owner-control", text: JSON.stringify(event.control), source, thread: event.thread, state: "queued", at: new Date().toISOString() });
+      this.ingressHealth.set(source, { process: this.ingressHealth.get(source)?.process ?? "starting", lastAcceptedAt: new Date().toISOString() });
       await this.inbox.deliver(id, async () => { await this.handle(event.control.action, event.control.args, { role: "admin" }); return {}; });
       return;
     }
     const target = known && statusOf(known) !== "closed" ? known.key : "lead";
-    this.inbox.put({ id, target, thread: event.thread, text: `Owner message in ${event.thread}${known && statusOf(known) === "closed" ? ` (closed lane ${known.key}; reopen if appropriate)` : ""}:\n${event.text}`, source, state: "queued", at: new Date().toISOString() });
+    const intakeLane = target === "lead" ? await this.registry.read("lead") : null;
+    this.putInbox({ id, target, attachmentInstance: this.intakeInstance(intakeLane), thread: event.thread, text: `Owner message in ${event.thread}${known && statusOf(known) === "closed" ? ` (closed lane ${known.key}; reopen if appropriate)` : ""}:\n${event.text}`, source, state: "queued", at: new Date().toISOString() });
+    this.ingressHealth.set(source, { process: this.ingressHealth.get(source)?.process ?? "starting", lastAcceptedAt: new Date().toISOString() });
     if (this.config.hooks.threadReply) {
       let waiting = false;
       if (target === "lead") {
@@ -586,7 +921,11 @@ export class DoriService {
         text: "Received and saved. Delivery is waiting for the lead to reconnect." }).catch(() => { /* inbox acceptance does not depend on outbound delivery */ });
     }
   }
-  async tick(): Promise<void> {
+  tick(): Promise<void> { return this.withIntake(() => this.tickScoped()); }
+  private async tickScoped(): Promise<void> {
+    if (this.pendingHandoff()) {
+      await this.deps.runtime.inspect("lead").catch(() => {}); await this.health(); return;
+    }
     const once = async (name: string, fn: () => Promise<unknown>) => {
       const interval = name === "inbox" || name === "failures" || name === "external-observation" ? 1000 : name === "herdr-progress" ? 5000 : name === "done" ? 30000 : name === "launch-queue" ? 10000 : 60000;
       if (this.ticks.has(name) || Date.now() - (this.lastTick.get(name) ?? 0) < interval) return;
@@ -613,7 +952,7 @@ export class DoriService {
           const age = Date.now() - Date.parse(lane.runtime.lastHeartbeatAt ?? lane.openedAt);
           if (age <= this.config.runtime.heartbeatTimeoutMs || lane.holdReason === "recovery") continue;
           await this.registry.update(lane.key, l => ({ ...l, dispatchBlocked: true, holdReason: l.holdReason ?? "recovery", runtime: l.runtime && { ...l.runtime, state: "recovering" } }));
-          if (lane.role !== "lead") this.inbox.put({ id: `host-unreachable:${lane.key}:${lane.runtime.hostInstanceId}`, target: "lead", text: `Host unreachable for ${lane.key}; dispatch held. Reconcile before recovery.`, state: "queued", at: new Date().toISOString() });
+          if (lane.role !== "lead") this.putInbox({ id: `host-unreachable:${lane.key}:${lane.runtime.hostInstanceId}`, target: "lead", text: `Host unreachable for ${lane.key}; dispatch held. Reconcile before recovery.`, state: "queued", at: new Date().toISOString() });
         }
       }),
       once("launch-queue", async () => {
@@ -637,11 +976,12 @@ export class DoriService {
         }
       }),
     ]);
+    await this.health();
   }
-  stop(): void { this.stopping = true; }
+  stop(): void { this.stopping = true; this.setPhase("stopping"); }
 }
 
-export const serve = async (config: DoriConfig): Promise<void> => {
+const serveService = async (config: DoriConfig): Promise<void> => {
   mkdirSync(config.stateDir, { recursive: true, mode: 0o700 }); chmodSync(config.stateDir, 0o700);
   const socket = serviceSocket(config.stateDir), lockPath = join(config.stateDir, "service.lock");
   if (existsSync(lockPath)) {
@@ -655,6 +995,7 @@ export const serve = async (config: DoriConfig): Promise<void> => {
   if (!existsSync(controlPath)) atomicJson(controlPath, { token: crypto.randomUUID() });
   if (existsSync(socket)) unlinkSync(socket);
   const service = new DoriService(config);
+  service.setPhase("reconciling");
   for (const lane of await service.registry.open()) if (lane.runtime?.backend === "external-current-session" && lane.runtime.state !== "stopped") await service.deps.runtime.inspect(lane.key).catch(() => {});
   const server = Bun.serve({ unix: socket, async fetch(request) {
     try {
@@ -675,11 +1016,12 @@ export const serve = async (config: DoriConfig): Promise<void> => {
   }, 60000);
   const children: ReturnType<typeof Bun.spawn>[] = [];
   for (const ingress of config.ingress) {
+    service.setIngressProcess(ingress.id, "starting");
     void (async () => {
       for (let attempt = 0; !stopping && attempt < 5; attempt++) {
         let producer: ReturnType<typeof Bun.spawn> | undefined;
         try {
-          const child = Bun.spawn(ingress.command, { stdin: "pipe", stdout: "pipe", stderr: "ignore" }); children.push(child); producer = child;
+          const child = Bun.spawn(ingress.command, { stdin: "pipe", stdout: "pipe", stderr: "ignore" }); children.push(child); producer = child; service.setIngressProcess(ingress.id, "running");
           const reader = child.stdout as ReadableStream<Uint8Array>; const decoder = new TextDecoder(); let pending = "";
           for await (const chunk of reader) {
             pending += decoder.decode(chunk, { stream: true });
@@ -688,12 +1030,13 @@ export const serve = async (config: DoriConfig): Promise<void> => {
           }
           await child.exited;
         } catch { console.error(`INGRESS_ERROR ${ingress.id}`); }
-        finally { producer?.kill(); }
+        finally { producer?.kill(); service.setIngressProcess(ingress.id, stopping ? "stopped" : "failed"); }
         if (!stopping) await Bun.sleep(1000 * 2 ** attempt);
       }
       if (!stopping) console.error(`INGRESS_STOPPED ${ingress.id}; restart service after fixing adapter`);
     })();
   }
+  service.setPhase("ready"); await service.health();
   console.log("DORI_SERVICE_READY");
   await new Promise<void>(resolveStop => {
     const stop = () => { stopping = true; resolveStop(); };
@@ -705,4 +1048,17 @@ export const serve = async (config: DoriConfig): Promise<void> => {
   service.stop(); server.stop(true);
   if (existsSync(socket)) unlinkSync(socket);
   if (readJson<{ instance: string }>(lockPath).instance === instance) unlinkSync(lockPath);
+};
+
+export const serve = async (config: DoriConfig): Promise<void> => {
+  try { await serveService(config); }
+  catch (error) {
+    const path = join(config.stateDir, "service-health.json");
+    let previous: any;
+    try { previous = readJson(path); } catch { /* startup may fail before its first write */ }
+    // A second start must not overwrite the live owner's health.
+    if (!previous || previous.pid === process.pid) atomicJson(path, { ...previous, schemaVersion: 1, phase: "failed", pid: process.pid,
+      startedAt: previous?.startedAt ?? new Date().toISOString(), updatedAt: new Date().toISOString(), cause: { code: "service-failed", message: "Service startup or runtime failed; inspect service logs." } });
+    throw error;
+  }
 };
