@@ -1,9 +1,53 @@
 ---
 name: iyen
-description: Start or stop Iyen (이연) mode in the current Codex session. Use for “이연 모드 시작”, “iyen 모드 켜줘”, Iyen activation status, or turning Iyen mode off. The current conversation becomes the messenger lead; no separate lead session is created.
+description: Operate Iyen (이연) in the current Codex session. Use for Iyen activation/status/stop and for handling owner messenger messages, Slack read receipts, and replies while Iyen is active. The current conversation is the messenger lead; no separate lead session is created.
 ---
 
 # Iyen in this conversation
+
+## First: acknowledge and answer messenger requests
+
+For an owner message received through Slack, read it and add an `eyes` reaction
+to that exact message using Iyen's configured messenger identity. The reaction
+means “read”; leave it in place when the work finishes. React to the incoming
+message, not the thread root or your own reply. A local chat response does not
+reach Slack.
+
+The `Owner message in ...` reference is the reply destination. `Source message
+ID: slack:CHANNEL:TIMESTAMP` identifies the individual message for the reaction.
+For an older envelope without that reference, resolve the exact message from the
+inbox or original Slack thread; do not guess that the thread root is the message.
+
+Use an existing messenger connection authenticated as Iyen. Check the account
+when selecting a connection: a connector acting as the owner is not Iyen. For a
+configured bot-token installation, the existing CLI can add the reaction without
+new runtime code:
+
+```sh
+agent-messenger slackbot whoami --bot BOT_ID
+agent-messenger slackbot reaction add CHANNEL TIMESTAMP eyes --bot BOT_ID
+```
+
+Use the installed CLI help for other configured account types. If the reaction
+is already present, leave it. A missing scope or unavailable reaction tool does
+not block useful work; do not claim the reaction succeeded or substitute a
+generic “working” message.
+
+Send the substantive answer to the original thread with the returned bridge:
+
+```sh
+BRIDGE reply --thread REF --text-file FILE --operation-id STABLE_ID
+```
+
+Verify delivery before claiming the answer was sent. Share a concrete result,
+material progress, or a blocker when it helps the owner. Do not send routine
+“이연: 작업 진행 중입니다.” or “이연: 현재 응답을 마쳤습니다.” messages, fixed-interval
+updates, or a separate completion notice inferred from Herdr's idle/done state.
+There is no required status message, thread renaming, or reaction removal cycle.
+These are skill instructions followed by the lead, not service-enforced gates
+or automatic reaction/notification timers.
+
+## Attach this conversation
 
 “Iyen mode start” attaches this already-running Codex session as the service's
 lead. Keep the same conversation, pane, model, permissions and working directory.
@@ -57,8 +101,7 @@ running session. Existing sandbox and approval constraints still apply.
   `work start --title TITLE --operation-id UUID` and `work stop ID`, retaining the
   timing record. Delegate complex work through `launch` with a bounded brief,
   explicit available model, and checkable Done signal; verify the worker's result.
-- For an owner message received through a messenger, reply to its exact thread
-  using `reply --thread REF --text-file FILE --operation-id STABLE_ID`. Ordinary
+- Follow the messenger acknowledgment and reply instructions above. Ordinary
   conversation here is answered here. Preserve owner authorization and do not
   send messages to other recipients without instruction.
 - Inspect `mail list` for uncertain operations. A queued prompt is not a delivery
@@ -79,8 +122,9 @@ Required capabilities and the CLI/daemon pairing must validate; a different
 pane/thread/cwd or daemon socket is not automatically adopted. Use `start` for an
 explicit same-session retry when needed. Do not detach merely to update versions:
 a fresh attachment excludes old inbox entries. Use `BRIDGE health` and inspect the
-latest `runtime.external.latestHoldReason` (or legacy `holdReason`) when held. A messenger acknowledgment confirms
-inbox storage, not delivery to this conversation.
+latest `runtime.external.latestHoldReason` (or legacy `holdReason`) when held.
+The adapter's durable ACK confirms inbox storage, not that the lead has read the
+message. The lead adds the read receipt after reading it.
 
 For an owner-authorized change to a different lead session, preview the handoff
 before applying it. Verify the target UUID and pane as for ordinary activation:
