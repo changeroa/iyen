@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, renameSync, rmdirSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, rmdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { defaultConfig } from "../src/config.ts";
 import { atomicJson } from "../src/journal.ts";
 import { readJson, socketDir } from "../src/ipc.ts";
-import { DoriService, type ExternalTransport } from "../src/service.ts";
+import { DoriService, type ExternalTransport, type HandoffIO } from "../src/service.ts";
 import type { Runner } from "../src/run.ts";
 import { withState } from "./fakes.ts";
 
@@ -200,4 +200,92 @@ test("inbox persistence failure leaves cache unchanged and same-process handoff 
   expect(h.s.inbox.get("selected")?.attachmentInstance).toBe(current.instance);
   expect(readJson<any>(path).selected.attachmentInstance).toBe(current.instance);
   expect(readJson<any>(path).unknown.state).toBe("unknown"); expect(queues()).toHaveLength(0);
+});
+
+
+const workerLane = () => ({ key: "handoff-worker", role: "lane" as const, title: "Managed worker", thread: "owner:worker", brief: "", done: "", openedAt: new Date().toISOString(),
+  runtime: { kind: "codex" as const, backend: "herdr-tui" as const, threadId: "33333333-3333-4333-8333-333333333333", hostInstanceId: "worker-instance", generation: 1, state: "running" as const, binaryVersion: "0.163.0", lastHeartbeatAt: new Date().toISOString() } });
+async function interruptAtHold(): Promise<void> {
+  const update = h.s.registry.update.bind(h.s.registry); let armed = true;
+  h.s.registry.update = async (key, fn) => { const result = await update(key, fn); if (armed && key === "lead" && result.dispatchBlocked) { armed = false; throw new Error("injected hold"); } return result; };
+  await expect(h.s.handle("lead-handoff", h.args, admin)).rejects.toThrow("injected");
+}
+
+test("offline pending lead handoff accepts managed-worker heartbeat, host events and durable reports", async () => {
+  const worker = workerLane(), old = saved(); await h.s.registry.write(worker); await interruptAtHold(); h.unavailable();
+  const host = { role: "host" as const, key: worker.key }, args = { key: worker.key, instance: worker.runtime.hostInstanceId, runtime: worker.runtime };
+  expect(await h.s.handle("host-heartbeat", args, host)).toEqual({ accepted: true });
+  expect(await h.s.handle("host-event", { ...args, event: { id: "approval", method: "tui/inputRequired", params: {} } }, host)).toEqual({ accepted: true });
+  expect(await h.s.handle("report", { key: worker.key, kind: "milestone", eventId: "progress", text: "Worker still running" }, { role: "lane", key: worker.key })).toEqual({ recorded: true });
+  await h.s.tick();
+  expect(await h.s.registry.read(worker.key)).toMatchObject({ runtime: { state: "running", hostInstanceId: "worker-instance", lastHeartbeatAt: expect.any(String) } });
+  expect((await h.s.registry.read(worker.key))?.dispatchBlocked).not.toBe(true);
+  expect(h.s.inbox.get(`approval-notice:${worker.key}:approval`)?.attachmentInstance).toBe(old.instance);
+  expect(h.s.inbox.get(`report:${worker.key}:progress`)?.attachmentInstance).toBe(old.instance); expect(queues()).toHaveLength(0);
+});
+
+for (const action of ["lead-detach", "lead-attach"] as const) test(`${action} queued during target validation rechecks pending handoff inside both queues`, async () => {
+  const connect = h.transport.connect; let release!: () => void, entered!: () => void, armed = true;
+  const paused = new Promise<void>(resolve => release = resolve), started = new Promise<void>(resolve => entered = resolve);
+  h.transport.connect = async (...args) => { if (armed) { armed = false; entered(); await paused; } return connect(...args); };
+  const update = h.s.registry.update.bind(h.s.registry); let fail = true;
+  h.s.registry.update = async (key, fn) => { const result = await update(key, fn); if (fail && key === "lead" && result.dispatchBlocked) { fail = false; throw new Error("injected hold"); } return result; };
+  const handoff = h.s.handle("lead-handoff", h.args, admin); await started;
+  const lifecycle = h.s.handle(action, action === "lead-detach" ? { threadId: fromThreadId } : h.attach, admin);
+  // Attach native rejection handlers before release; Bun's rejection matcher
+  // can synchronously drain the event loop and prevent this gate from opening.
+  const lifecycleResult = lifecycle.catch(error => error), handoffResult = handoff.catch(error => error);
+  release();
+  expect(await handoffResult).toBeInstanceOf(Error); expect((await handoffResult).message).toContain("injected");
+  expect(await lifecycleResult).toBeInstanceOf(Error); expect((await lifecycleResult).message).toContain("mutations are held");
+  expect((await h.s.registry.read("lead"))?.runtime?.external?.detachedAt).toBeUndefined();
+  expect(await h.s.handle("lead-handoff", h.args, admin)).toMatchObject({ handedOff: true, threadId }); expect(queues()).toHaveLength(0);
+});
+
+test("post-unlink directory fsync failure restores a recovery marker and same operation retry clears only its own hold", async () => {
+  let armed = true;
+  const io: HandoffIO = { removeMarker(path) { unlinkSync(path); if (armed) { armed = false; throw new Error("injected post-unlink fsync failure"); } } };
+  const service = new DoriService(h.config, h.run, h.transport, io);
+  await expect(service.handle("lead-handoff", h.args, admin)).rejects.toThrow("post-unlink");
+  expect(existsSync(join(h.state.dir, "attachments/handoff.json"))).toBe(true);
+  expect(await service.registry.read("lead")).toMatchObject({ dispatchBlocked: true, runtime: { threadId, external: { holdReason: { code: "handoff-interrupted" } } } });
+  const result = await service.handle("lead-handoff", h.args, admin);
+  expect(result).toMatchObject({ attached: true, handedOff: true, lead: { readiness: "busy", dispatchBlocked: false } });
+  expect((await service.registry.read("lead"))?.runtime?.external?.holdReason).toBeUndefined();
+  expect(existsSync(join(h.state.dir, "attachments/handoff.json"))).toBe(false);
+  expect(await service.handle("lead-handoff", h.args, admin)).toEqual(result); expect(queues()).toHaveLength(0);
+});
+
+test("completed handoff retry reports current readiness and cannot restore a detached or later attachment", async () => {
+  await h.s.handle("lead-handoff", h.args, admin); const original = saved();
+  await h.s.registry.update("lead", lane => ({ ...lane, dispatchBlocked: true, holdReason: "owner-pause", runtime: { ...lane.runtime!, held: true } }));
+  expect(await h.s.handle("lead-handoff", h.args, admin)).toMatchObject({ attached: true, lead: { readiness: "held", holdReason: "owner-pause" } });
+  await h.s.handle("lead-detach", { threadId }, admin);
+  await expect(h.s.handle("lead-handoff", h.args, admin)).rejects.toThrow("detached or superseded");
+  await h.s.handle("lead-attach", { threadId, pane: "new:pane", cwd: h.state.dir }, admin);
+  const current = await h.s.registry.read("lead"); expect(saved().instance).not.toBe(original.instance);
+  await expect(h.s.handle("lead-handoff", h.args, admin)).rejects.toThrow("superseded");
+  expect(await h.s.registry.read("lead")).toEqual(current); expect(queues()).toHaveLength(0);
+});
+
+for (const producer of ["host-event", "failure", "queueInput", "report"] as const) test(`suspended ${producer} producer keeps old lead affinity across empty-selection handoff`, async () => {
+  const worker = workerLane(), old = saved(); await h.s.registry.write(worker);
+  const read = h.s.registry.read.bind(h.s.registry); let release!: () => void, entered!: () => void, armed = true;
+  const paused = new Promise<void>(resolve => release = resolve), started = new Promise<void>(resolve => entered = resolve);
+  // Host/failure/queueInput pause before publishing a notice. Report publishes
+  // synchronously, then pauses its registry continuation; both remain old-bound.
+  h.s.registry.read = async key => { const result = await read(key); if (armed && key === (producer === "queueInput" ? "lead" : worker.key)) { armed = false; entered(); await paused; } return result; };
+  if (producer === "failure") h.s.failures.put({ id: "worker-failure", target: worker.key, text: JSON.stringify({ category: "authorization", guidance: "Inspect failure" }), state: "queued", at: "2026-01-01" });
+  const pending = producer === "host-event" ? h.s.handle("host-event", { key: worker.key, instance: worker.runtime.hostInstanceId, runtime: worker.runtime, event: { id: "race", method: "tui/inputRequired", params: {} } }, { role: "host", key: worker.key }) :
+    producer === "failure" ? h.s.notifyFailures() : producer === "queueInput" ? h.s.deps.queueInput!("lead", "old producer", "old-producer") :
+    h.s.handle("report", { key: worker.key, kind: "milestone", eventId: "race", text: "Old report" }, { role: "lane", key: worker.key });
+  await started; await h.s.handle("lead-handoff", { ...h.args, mailIds: [] }, admin); const current = saved(); release(); await pending;
+  const id = producer === "host-event" ? `approval-notice:${worker.key}:race` : producer === "failure" ? "notice:worker-failure" : producer === "queueInput" ? "old-producer" : `report:${worker.key}:race`;
+  expect(h.s.inbox.get(id)).toMatchObject({ state: "queued", attachmentInstance: old.instance });
+  expect(h.s.inbox.get(id)?.attachmentInstance).not.toBe(current.instance);
+  const caller = await h.s.authorize(current.token);
+  expect(await h.s.handle("input", { key: "lead", text: h.s.inbox.get(id)!.text, operationId: id }, caller)).toMatchObject({ queued: true });
+  expect(h.s.inbox.get(id)?.state).toBe("queued"); expect(queues()).toHaveLength(0);
+  await h.s.handle("report", { key: worker.key, kind: "milestone", eventId: "future", text: "New report" }, { role: "lane", key: worker.key });
+  expect(h.s.inbox.get(`report:${worker.key}:future`)?.attachmentInstance).toBe(current.instance);
 });

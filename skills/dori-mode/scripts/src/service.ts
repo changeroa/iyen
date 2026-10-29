@@ -1,4 +1,5 @@
 import { chmodSync, existsSync, mkdirSync, unlinkSync, openSync, closeSync, readFileSync, writeFileSync, realpathSync, fsyncSync } from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { workspaceForRole, type DoriConfig } from "./config.ts";
@@ -19,7 +20,7 @@ import { backendSocket, bootstrapPath, type Bootstrap } from "./runtime/session-
 import type { ExternalHoldCode, RuntimeControl, RuntimeRef, RuntimeSnapshot } from "./runtime/types.ts";
 import { WorkTimers } from "./work.ts";
 import { turnFailure } from "./turn-failure.ts";
-import { DeliveryDeferred, Mailbox, postHook } from "./mailbox.ts";
+import { DeliveryDeferred, Mailbox, postHook, type Mail } from "./mailbox.ts";
 import { ExternalCurrentSession, ExternalSessionError, discoverExternal, observeExternal, sharedDaemon, THREAD_UUID, type Attachment } from "./runtime/external-current-session.ts";
 import { connectObserver, receiptInTurns } from "./runtime/observer.ts";
 import { operationText } from "./runtime/herdr.ts";
@@ -27,8 +28,15 @@ import type { Turn } from "./runtime/generated/v2/Turn.ts";
 
 export type Caller = { role: "admin" | "lead" | "lane" | "host"; key?: string; instance?: string };
 export type ExternalTransport = { connect: typeof connectObserver; observe: typeof observeExternal };
+type OwnedFailure = Mail & { leadIntakeInstance?: string };
 type HandoffArgs = { fromThreadId: string; threadId: string; pane: string; cwd: string; mailIds: string[]; operationId: string };
-type HandoffIntent = { version: 1; status: "prepared" | "committed"; args: HandoffArgs; before: Lane; beforeAttachment: Attachment; after: Lane; afterAttachment: Attachment; result: any; createdAt: string; identityHeld?: boolean };
+type HandoffIntent = { version: 1; status: "prepared" | "committed"; args: HandoffArgs; before: Lane; beforeAttachment: Attachment; after: Lane; afterAttachment: Attachment; result: any; createdAt: string; identityHeld?: boolean; cleanupPending?: boolean };
+export type HandoffIO = { removeMarker(path: string): void };
+const durableMarkerRemoval = (path: string): void => {
+  // Open before unlink so an open failure leaves the recovery marker intact.
+  const directory = openSync(dirname(path), "r");
+  try { unlinkSync(path); fsyncSync(directory); } finally { closeSync(directory); }
+};
 export type ServicePhase = "starting" | "replaying" | "reconciling" | "ready" | "stopping" | "failed";
 const reconnectable = (code?: ExternalHoldCode): boolean => Boolean(code && ["runtime-unavailable", "runtime-version-changed", "runtime-version-unsupported", "runtime-incompatible", "rebind-interrupted"].includes(code));
 const sameJson = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
@@ -43,6 +51,7 @@ export class DoriService {
   private launchQueue = new SerialQueue();
   private dispatchQueue = new SerialQueue();
   private failureQueue = new SerialQueue();
+  private intakeScope = new AsyncLocalStorage<string>();
   private stopping = false;
   private phase: ServicePhase = "starting";
   private startedAt = new Date().toISOString();
@@ -51,7 +60,7 @@ export class DoriService {
   private lastHealth?: string;
   private ticks = new Set<string>();
   private lastTick = new Map<string, number>();
-  constructor(readonly config: DoriConfig, readonly runner: Runner = run, readonly externalTransport: ExternalTransport = { connect: connectObserver, observe: observeExternal }) {
+  constructor(readonly config: DoriConfig, readonly runner: Runner = run, readonly externalTransport: ExternalTransport = { connect: connectObserver, observe: observeExternal }, readonly handoffIO: HandoffIO = { removeMarker: durableMarkerRemoval }) {
     this.writeHealth();
     this.phase = "replaying"; this.writeHealth();
     this.registry = new Registry(config.stateDir);
@@ -75,10 +84,10 @@ export class DoriService {
     };
     const runtime: RuntimeControl = {
       inspect: key => this.dispatchQueue.run(key, () => call(key, "inspect")),
-      input: (key, text, operationId) => this.dispatchQueue.run(key, async () => {
+      input: (key, text, operationId) => this.withIntake(() => this.dispatchQueue.run(key, async () => {
         const lane = await this.registry.read(key);
         if (!lane || lane.dispatchBlocked || statusOf(lane) === "closed") throw new Error("Lane dispatch is blocked");
-        const mail = this.inbox.put({ id: operationId, target: key, text, thread: lane.thread, state: "queued", at: new Date().toISOString() });
+        const mail = this.putInbox({ id: operationId, target: key, text, thread: lane.thread, state: "queued", at: new Date().toISOString() });
         if (lane.runtime?.backend === "external-current-session") {
           if (mail.attachmentInstance && mail.attachmentInstance !== lane.runtime.hostInstanceId) throw new DeliveryDeferred("Mail belongs to a previous lead attachment");
           if (this.attachment(lane).excludedInboxIds.includes(mail.id)) throw new DeliveryDeferred("Historical mail is held for explicit reconciliation");
@@ -92,14 +101,14 @@ export class DoriService {
         });
         if (!delivered.turnId) throw new Error("Missing turn receipt");
         return { turnId: delivered.turnId };
-      }),
+      })),
       hold: (key, origin) => call(key, "hold", { origin }), release: (key, origin) => call(key, "release", { origin }), stop: key => call(key, "stop"),
     };
     this.deps = { config, registry: this.registry, clock: realClock, run: runner, runtime, post: (id, hook, values) => postHook(this.outbox, runner, id, hook, values),
-      queueInput: async (key, text, operationId) => {
+      queueInput: (key, text, operationId) => this.withIntake(async () => {
         const lane = await this.lane(key);
-        this.inbox.put({ id: operationId, target: key, text, thread: lane.thread, state: "queued", at: new Date().toISOString(), attachmentInstance: this.intakeInstance(lane) });
-      } };
+        this.putInbox({ id: operationId, target: key, text, thread: lane.thread, state: "queued", at: new Date().toISOString(), attachmentInstance: this.intakeInstance(lane) });
+      }) };
     this.phase = "ready"; this.writeHealth();
   }
   private healthSnapshot: Record<string, unknown> = {};
@@ -141,10 +150,36 @@ export class DoriService {
     const { operationId } = readJson<{ operationId: string }>(this.activeHandoffPath());
     return readJson<HandoffIntent>(this.handoffPath(operationId));
   }
-  private intakeInstance(lane: Lane | null): string | undefined {
-    if (lane?.runtime?.backend !== "external-current-session") return undefined;
+  private captureIntakeInstance(): string {
     const pending = this.pendingHandoff();
-    return pending && pending.status !== "committed" ? pending.beforeAttachment.instance : lane.runtime.hostInstanceId;
+    if (pending && pending.status !== "committed") return pending.beforeAttachment.instance;
+    if (existsSync(this.attachmentPath())) return readJson<Attachment>(this.attachmentPath()).instance;
+    // Work accepted before any attachment must never become fresh new-session
+    // intake merely because its asynchronous producer finishes after attach.
+    return "unattached-lead";
+  }
+  private withIntake<T>(action: () => T): T {
+    return this.intakeScope.getStore() !== undefined ? action() : this.intakeScope.run(this.captureIntakeInstance(), action);
+  }
+  private intakeInstance(lane: Lane | null): string | undefined {
+    return lane?.runtime?.backend === "external-current-session" ? this.intakeScope.getStore() ?? this.captureIntakeInstance() : undefined;
+  }
+  private putInbox(mail: Mail): Mail {
+    return this.inbox.put(mail.target === "lead" ? { ...mail, attachmentInstance: mail.attachmentInstance ?? this.intakeScope.getStore() ?? this.captureIntakeInstance() } : mail);
+  }
+  private putFailure(mail: Mail): Mail {
+    const owned: OwnedFailure = { ...mail, leadIntakeInstance: this.intakeScope.getStore() ?? this.captureIntakeInstance() };
+    return this.failures.put(owned);
+  }
+  private assertNoPendingLeadMutation(): void {
+    if (this.pendingHandoff()) throw new Error("Lead handoff incomplete; mutations are held until its recorded operation finishes");
+  }
+  private blocksPendingMutation(action: string, args: any, caller: Caller): boolean {
+    if (["health", "status", "lead-handoff", "tick", "mail-list", "approval-list", "can-launch"].includes(action)) return false;
+    if (["lead", "lead-attach", "lead-detach", "lead-handoff-preview"].includes(action)) return true;
+    if (action === "sync") return Boolean(args.write);
+    if (action === "mail-resolve") return args.box !== "outbox" && (!this.inbox.get(args.id) || this.inbox.get(args.id)?.target === "lead");
+    return (args.key ?? caller.key) === "lead";
   }
   private handoffArgs(args: any, apply: boolean): HandoffArgs {
     if (typeof args.fromThreadId !== "string" || !THREAD_UUID.test(args.fromThreadId) || typeof args.threadId !== "string" || !THREAD_UUID.test(args.threadId) || args.fromThreadId === args.threadId ||
@@ -187,7 +222,12 @@ export class DoriService {
     if (existsSync(path)) {
       intent = readJson<HandoffIntent>(path);
       if (!sameJson(intent.args, args)) throw new Error("Handoff operationId reused with different arguments");
-      if (intent.status === "committed" && !this.pendingHandoff()) return intent.result;
+      if (intent.status === "committed" && !this.pendingHandoff()) {
+        await this.assertHandoffCurrent(intent);
+        if (!intent.cleanupPending) return this.completedHandoff(intent);
+        atomicJson(this.activeHandoffPath(), { operationId: args.operationId });
+        return this.finishHandoff(intent);
+      }
     } else {
       if (this.pendingHandoff()) throw new Error("Another handoff is pending; finish its recorded operation first");
       const before = await this.lane("lead");
@@ -215,6 +255,20 @@ export class DoriService {
       atomicJson(this.activeHandoffPath(), { operationId: args.operationId });
     }
     return this.finishHandoff(intent);
+  }
+  private async assertHandoffCurrent(intent: HandoffIntent): Promise<Lane> {
+    const current = await this.lane("lead");
+    if (current.runtime?.hostInstanceId !== intent.afterAttachment.instance || current.runtime.generation !== intent.afterAttachment.generation ||
+      current.runtime.threadId !== intent.args.threadId || current.pane !== intent.args.pane || current.cwd !== intent.args.cwd || current.runtime.external?.detachedAt || current.runtime.state === "stopped")
+      throw new Error("Completed handoff has been detached or superseded; refusing to restore its old target");
+    this.attachment(current); return current;
+  }
+  private async completedHandoff(intent: HandoffIntent): Promise<any> {
+    const current = await this.assertHandoffCurrent(intent);
+    const result = { ...intent.result, lead: await this.publicLane(current, true) };
+    const completed = { ...intent, cleanupPending: false, result };
+    if (!sameJson(intent, completed)) atomicJson(this.handoffPath(intent.args.operationId), completed);
+    return result;
   }
   private async finishHandoff(intent: HandoffIntent, automatic = false): Promise<any> {
     const { args, beforeAttachment, afterAttachment } = intent, path = this.handoffPath(args.operationId);
@@ -249,14 +303,16 @@ export class DoriService {
         return { ...lane, dispatchBlocked: protectedHold, holdReason: protectedHold ? lane.holdReason : undefined,
           runtime: { ...intent.after.runtime!, held: protectedHold, state: protectedHold ? "recovering" : intent.after.runtime!.state } };
       });
-      // The active marker is the dispatch gate, removed only after all durable
-      // writes. The per-operation record preserves history and rollback evidence.
-      unlinkSync(this.activeHandoffPath());
-      const directory = openSync(dirname(this.activeHandoffPath()), "r");
-      try { fsyncSync(directory); } finally { closeSync(directory); }
-      return intent.result;
+      // Persist cleanup intent before removing the gate. If unlink succeeds but
+      // directory fsync fails, the same operation can reconstruct the marker.
+      intent = { ...intent, cleanupPending: true }; atomicJson(path, intent);
+      this.handoffIO.removeMarker(this.activeHandoffPath());
+      return await this.completedHandoff(intent);
     } catch (error) {
       if (!(error instanceof DeliveryDeferred)) {
+        const current = await this.registry.read("lead");
+        if (intent.cleanupPending && current?.runtime?.hostInstanceId === afterAttachment.instance && !existsSync(this.activeHandoffPath()))
+          atomicJson(this.activeHandoffPath(), { operationId: args.operationId });
         if (error instanceof ExternalSessionError && error.code === "identity-unverified") { intent = { ...intent, identityHeld: true }; atomicJson(path, intent); }
         const lane = await this.registry.read("lead");
         if (lane?.runtime) {
@@ -353,7 +409,7 @@ export class DoriService {
       const id = `failed-turn:lead:${saved.instance}:${turnId}`;
       // Preserve first observation and resolution across repeated polling and
       // restarts; never replace a durable failure's metadata or state.
-      if (!this.failures.get(id)) this.failures.put({ id, target: "lead", turnId, source: saved.instance, attachmentInstance: saved.instance,
+      if (!this.failures.get(id)) this.putFailure({ id, target: "lead", turnId, source: saved.instance, attachmentInstance: saved.instance,
         text: JSON.stringify(turnFailure(turn.error)), state: "queued", at: new Date().toISOString() });
     }
   }
@@ -557,10 +613,13 @@ export class DoriService {
     }
     throw new Error("Forbidden");
   }
-  async handle(action: string, args: any, caller: Caller): Promise<any> {
+  handle(action: string, args: any, caller: Caller): Promise<any> {
+    return this.withIntake(() => this.handleScoped(action, args, caller));
+  }
+  private async handleScoped(action: string, args: any, caller: Caller): Promise<any> {
     if (!args || typeof args !== "object") throw new Error("Expected args object");
     if (this.stopping) throw new Error("Service stopping");
-    if (this.pendingHandoff() && !["health", "status", "lead-handoff", "tick"].includes(action)) throw new Error("Lead handoff incomplete; mutations are held until its recorded operation finishes");
+    if (this.pendingHandoff() && this.blocksPendingMutation(action, args, caller)) throw new Error("Lead handoff incomplete; mutations are held until its recorded operation finishes");
     if (caller.instance) {
       const lead = await this.lane("lead");
       const pending = this.pendingHandoff();
@@ -580,12 +639,13 @@ export class DoriService {
     if (action === "lead-attach" || action === "lead") {
       if (caller.role !== "admin") throw new Error("lead-attach requires operator capability");
       if (action === "lead" && (!args.threadId || !args.pane || !args.cwd)) throw new Error("Start Iyen in this session with lead-attach --thread-id UUID --pane ID --cwd DIR");
-      return this.launchQueue.run("lead", () => this.dispatchQueue.run("lead", () => this.attachLead(args)));
+      return this.launchQueue.run("lead", () => this.dispatchQueue.run("lead", () => { this.assertNoPendingLeadMutation(); return this.attachLead(args); }));
     }
     if (action === "lead-detach") {
       if (caller.role !== "admin" && !(caller.role === "lead" && caller.key === "lead" && caller.instance)) throw new Error("lead-detach requires operator or current attached lead capability");
       if (typeof args.threadId !== "string" || !THREAD_UUID.test(args.threadId)) throw new Error("lead-detach requires expected UUID thread-id");
       return this.launchQueue.run("lead", () => this.dispatchQueue.run("lead", async () => {
+        this.assertNoPendingLeadMutation();
         const lane = await this.lane("lead");
         if (lane.runtime?.backend !== "external-current-session" || lane.runtime.threadId !== args.threadId || (caller.instance && caller.instance !== lane.runtime.hostInstanceId)) throw new Error("lead-detach expected session mismatch");
         await this.registry.update("lead", current => ({ ...current, dispatchBlocked: true, runtime: { ...current.runtime!, held: true, state: "stopped", activeTurnId: undefined,
@@ -607,15 +667,15 @@ export class DoriService {
       if (action === "host-event" && args.event?.id !== undefined) {
         const id = args.event.method === "tui/inputRequired" ? `${lane.key}:${args.event.id}` : `${args.instance}:${args.event.id}`;
         this.outbox.put({ id: `approval:${id}`, target: lane.thread, text: JSON.stringify({ lane: lane.key, id, method: args.event.method, params: args.event.params }), state: "queued", at: new Date().toISOString() });
-        this.inbox.put({ id: `approval-notice:${id}`, target: "lead", text: `Approval or input required for ${lane.key}. Inspect dori approval list. ID: ${id}`, state: "queued", at: new Date().toISOString() });
+        this.putInbox({ id: `approval-notice:${id}`, target: "lead", text: `Approval or input required for ${lane.key}. Inspect dori approval list. ID: ${id}`, state: "queued", at: new Date().toISOString() });
       }
       if (action === "host-event" && args.event?.method === "runtime/disconnected" && lane.role !== "lead") {
-        this.inbox.put({ id: `runtime-failed:${lane.key}:${args.instance}`, target: "lead", text: `Runtime failed for ${lane.key}. Inspect status and reconcile unknown operations before recover.`, state: "queued", at: new Date().toISOString() });
+        this.putInbox({ id: `runtime-failed:${lane.key}:${args.instance}`, target: "lead", text: `Runtime failed for ${lane.key}. Inspect status and reconcile unknown operations before recover.`, state: "queued", at: new Date().toISOString() });
       }
       if (action === "host-event" && args.event?.method === "turn/completed" && args.event.params?.turn?.status === "failed") {
         const turnId = args.event.params.turn.id;
         if (typeof turnId !== "string" || !turnId || (args.event.params.threadId && args.event.params.threadId !== lane.runtime.threadId)) throw new Error("Invalid failed turn identity");
-        this.failures.put({ id: `failed-turn:${lane.key}:${args.instance}:${turnId}`, target: lane.key, turnId, source: args.instance,
+        this.putFailure({ id: `failed-turn:${lane.key}:${args.instance}:${turnId}`, target: lane.key, turnId, source: args.instance,
           text: JSON.stringify(turnFailure(args.event.params.turn.error)), state: "queued", at: new Date().toISOString() });
       }
       if (action === "host-event" && args.event?.method === "serverRequest/resolved") {
@@ -689,7 +749,7 @@ export class DoriService {
     if (action === "input") {
       if (!args.text || !args.operationId) throw new Error("text and operationId required");
       const lane = await this.lane(key);
-      const mail = this.inbox.put({ id: args.operationId, target: key, text: args.text, thread: args.thread ?? lane.thread, state: "queued", at: new Date().toISOString(),
+      const mail = this.putInbox({ id: args.operationId, target: key, text: args.text, thread: args.thread ?? lane.thread, state: "queued", at: new Date().toISOString(),
         attachmentInstance: lane.runtime?.backend === "external-current-session" ? caller.instance ?? this.intakeInstance(lane) : undefined });
       if (mail.state === "unknown" || mail.state === "sending") throw new Error("Delivery unknown; reconcile before retry");
       if (mail.state === "sent") {
@@ -706,7 +766,7 @@ export class DoriService {
     if (action === "report") {
       if (!["milestone", "blocker", "question", "done"].includes(args.kind) || !args.text || !args.eventId) throw new Error("Invalid report");
       const id = `report:${key}:${args.eventId}`;
-      const report = this.inbox.put({ id, target: "lead", text: `[REPORT] ${key} | ${args.kind} | ${args.text}`, state: "queued", at: new Date().toISOString() });
+      const report = this.putInbox({ id, target: "lead", text: `[REPORT] ${key} | ${args.kind} | ${args.text}`, state: "queued", at: new Date().toISOString() });
       await this.registry.update(key, l => ({ ...l, report: { id: args.eventId, kind: args.kind, text: args.text, at: Date.parse(report.at) } }));
       const lane = await this.lane(key);
       if (this.config.hooks.threadReply && lane.thread !== "none") {
@@ -774,7 +834,7 @@ export class DoriService {
         lane = await this.registry.update(key, l => ({ ...l, pane: made.root_pane.pane_id, tab: made.tab_id ?? made.root_pane.tab_id }));
         await this.boot(lane);
         const text = args.text ?? (!lane.runtime?.threadId ? await Bun.file(lane.brief).text() : undefined);
-        if (text) this.inbox.put({ id: args.operationId ?? `handoff:${key}:${lane.cycle ?? 1}`, target: key, text, state: "queued", at: new Date().toISOString() });
+        if (text) this.putInbox({ id: args.operationId ?? `handoff:${key}:${lane.cycle ?? 1}`, target: key, text, state: "queued", at: new Date().toISOString() });
         return { recovering: true, key };
       });
     }
@@ -793,7 +853,8 @@ export class DoriService {
     }
     return result;
   }
-  async notifyFailures(): Promise<void> {
+  notifyFailures(): Promise<void> { return this.withIntake(() => this.notifyFailuresScoped()); }
+  private async notifyFailuresScoped(): Promise<void> {
     for (const failure of this.failures.list().filter(row => row.state === "queued")) {
       await this.failureQueue.run(failure.id, async () => {
         if (this.failures.get(failure.id)?.state !== "queued") return;
@@ -802,7 +863,7 @@ export class DoriService {
         const metadata = JSON.parse(failure.text) as ReturnType<typeof turnFailure>;
         const text = `Codex task failed (${metadata.category}). ${metadata.guidance} The task was not automatically retried.`;
         if (lane.role !== "lead") {
-          this.inbox.put({ id: `notice:${failure.id}`, target: "lead", thread: lane.thread, text: `Lane ${lane.key}: ${text}`, state: "queued", at: failure.at });
+          this.putInbox({ id: `notice:${failure.id}`, target: "lead", attachmentInstance: (failure as OwnedFailure).leadIntakeInstance, thread: lane.thread, text: `Lane ${lane.key}: ${text}`, state: "queued", at: failure.at });
         } else {
           // Completion notifications can precede the input RPC receipt. Keep the failure
           // pending until a sent receipt associates that turn with its owner thread.
@@ -822,7 +883,8 @@ export class DoriService {
       });
     }
   }
-  async receive(source: string, event: any): Promise<void> {
+  receive(source: string, event: any): Promise<void> { return this.withIntake(() => this.receiveScoped(source, event)); }
+  private async receiveScoped(source: string, event: any): Promise<void> {
     const ingress = this.config.ingress.find(i => i.id === source);
     if (!ingress || !ingress.owners.includes(event.user) || !event.id || !event.thread || typeof event.text !== "string") throw new Error("Untrusted or incomplete inbound event");
     const id = `inbound:${source}:${event.thread}:${event.id}`;
@@ -834,14 +896,14 @@ export class DoriService {
         const request = (await this.approvals()).find(a => a.id === event.control.args?.id);
         if (!request || (await this.lane(request.key)).thread !== event.thread) throw new Error("Approval belongs to another thread");
       } else if (!known || event.control.args?.key !== known.key) throw new Error("Control belongs to another lane");
-      this.inbox.put({ id, target: "owner-control", text: JSON.stringify(event.control), source, thread: event.thread, state: "queued", at: new Date().toISOString() });
+      this.putInbox({ id, target: "owner-control", text: JSON.stringify(event.control), source, thread: event.thread, state: "queued", at: new Date().toISOString() });
       this.ingressHealth.set(source, { process: this.ingressHealth.get(source)?.process ?? "starting", lastAcceptedAt: new Date().toISOString() });
       await this.inbox.deliver(id, async () => { await this.handle(event.control.action, event.control.args, { role: "admin" }); return {}; });
       return;
     }
     const target = known && statusOf(known) !== "closed" ? known.key : "lead";
     const intakeLane = target === "lead" ? await this.registry.read("lead") : null;
-    this.inbox.put({ id, target, attachmentInstance: this.intakeInstance(intakeLane), thread: event.thread, text: `Owner message in ${event.thread}${known && statusOf(known) === "closed" ? ` (closed lane ${known.key}; reopen if appropriate)` : ""}:\n${event.text}`, source, state: "queued", at: new Date().toISOString() });
+    this.putInbox({ id, target, attachmentInstance: this.intakeInstance(intakeLane), thread: event.thread, text: `Owner message in ${event.thread}${known && statusOf(known) === "closed" ? ` (closed lane ${known.key}; reopen if appropriate)` : ""}:\n${event.text}`, source, state: "queued", at: new Date().toISOString() });
     this.ingressHealth.set(source, { process: this.ingressHealth.get(source)?.process ?? "starting", lastAcceptedAt: new Date().toISOString() });
     if (this.config.hooks.threadReply) {
       let waiting = false;
@@ -858,7 +920,8 @@ export class DoriService {
         text: "Received and saved. Delivery is waiting for the lead to reconnect." }).catch(() => { /* inbox acceptance does not depend on outbound delivery */ });
     }
   }
-  async tick(): Promise<void> {
+  tick(): Promise<void> { return this.withIntake(() => this.tickScoped()); }
+  private async tickScoped(): Promise<void> {
     if (this.pendingHandoff()) {
       await this.deps.runtime.inspect("lead").catch(() => {}); await this.health(); return;
     }
@@ -888,7 +951,7 @@ export class DoriService {
           const age = Date.now() - Date.parse(lane.runtime.lastHeartbeatAt ?? lane.openedAt);
           if (age <= this.config.runtime.heartbeatTimeoutMs || lane.holdReason === "recovery") continue;
           await this.registry.update(lane.key, l => ({ ...l, dispatchBlocked: true, holdReason: l.holdReason ?? "recovery", runtime: l.runtime && { ...l.runtime, state: "recovering" } }));
-          if (lane.role !== "lead") this.inbox.put({ id: `host-unreachable:${lane.key}:${lane.runtime.hostInstanceId}`, target: "lead", text: `Host unreachable for ${lane.key}; dispatch held. Reconcile before recovery.`, state: "queued", at: new Date().toISOString() });
+          if (lane.role !== "lead") this.putInbox({ id: `host-unreachable:${lane.key}:${lane.runtime.hostInstanceId}`, target: "lead", text: `Host unreachable for ${lane.key}; dispatch held. Reconcile before recovery.`, state: "queued", at: new Date().toISOString() });
         }
       }),
       once("launch-queue", async () => {
