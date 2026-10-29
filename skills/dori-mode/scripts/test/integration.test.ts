@@ -165,7 +165,7 @@ test("current-session CLI attaches a busy existing lead, scopes controls, delive
 },30000);
 
 
-test("CLI 163 attachment survives shared 164 upgrade, interrupted binding restart and explicit same-session repair", async () => {
+for (const upgradeVersion of ["0.164.0", "0.165.0"]) test(`CLI 163 attachment survives shared ${upgradeVersion} upgrade, interrupted binding restart and explicit same-session repair`, async () => {
  const state = withState(); let daemon: ReturnType<typeof Bun.spawn> | undefined;
  const threadId = "11111111-1111-4111-8111-111111111111", socketPath = join(socketDir(state.dir), "shared.sock"), statePath = join(state.dir, "external-state.json");
  const server = Bun.serve({ unix: socketPath, fetch(req, s) { if (s.upgrade(req)) return; return new Response(null, { status: 400 }); }, websocket: { message(ws, raw) {
@@ -178,7 +178,7 @@ test("CLI 163 attachment survives shared 164 upgrade, interrupted binding restar
   atomicJson(join(state.dir, "fixture-panes.json"), [{ pane_id: "current:p", tab_id: "current:t", workspace_id: "current", agent: "codex", agent_status: "working", agent_session: { agent: "codex", kind: "id", value: threadId } }]);
   const bin = join(state.dir, "bin"); mkdirSync(bin); symlinkSync(join(import.meta.dir, "fixtures/herdr.ts"), join(bin, "herdr"));
   const binaries: string[] = [];
-  for (const version of ["0.163.0", "0.164.0"]) {
+  for (const version of ["0.163.0", upgradeVersion]) {
    const binary = join(bin, `codex-${version}`);
    await Bun.write(binary, `#!/usr/bin/env bun\nprocess.env.DORI_EXTERNAL_FIXTURE_VERSION = ${JSON.stringify(version)};\nawait import(${JSON.stringify(join(import.meta.dir, "fixtures/external-codex.ts"))});\n`); chmodSync(binary, 0o700); binaries.push(realpathSync(binary));
   }
@@ -198,19 +198,19 @@ test("CLI 163 attachment survives shared 164 upgrade, interrupted binding restar
   const attach = () => call("lead-attach", { threadId, pane: "current:p", cwd: state.dir });
   let logs = await start(); await attach(); const saved = readJson<any>(attachmentPath);
   await call("input", { key: "lead", text: "accepted before upgrade", thread: "chat:owner", operationId: "upgrade-mail" });
-  const snapshot = readJson<any>(statePath); snapshot.serverVersion = "0.164.0"; atomicJson(statePath, snapshot);
+  const snapshot = readJson<any>(statePath); snapshot.serverVersion = upgradeVersion; atomicJson(statePath, snapshot);
   expect(await call("status", { key: "lead" })).toMatchObject({ readiness: "held", runtime: { external: { holdReason: { code: "runtime-version-changed" } } } });
   // The stable external command now resolves a different release; managed binary stays163.
   unlinkSync(externalLink); symlinkSync(binaries[1]!, externalLink);
-  const rebound = await attach(); expect(rebound).toMatchObject({ reused: true, bridge: saved.bridge, lead: { readiness: "busy", runtime: { binaryVersion: "0.164.0" } } });
-  expect(readJson<any>(attachmentPath)).toMatchObject({ token: saved.token, instance: saved.instance, generation: saved.generation, excludedInboxIds: saved.excludedInboxIds, binary: binaries[1]!, binaryVersion: "0.164.0" });
+  const rebound = await attach(); expect(rebound).toMatchObject({ reused: true, bridge: saved.bridge, lead: { readiness: "busy", runtime: { binaryVersion: upgradeVersion } } });
+  expect(readJson<any>(attachmentPath)).toMatchObject({ token: saved.token, instance: saved.instance, generation: saved.generation, excludedInboxIds: saved.excludedInboxIds, binary: binaries[1]!, binaryVersion: upgradeVersion });
   expect(readJson<any>(cfgPath).runtime).toMatchObject({ binary: binaries[0]!, requiredVersion: "0.163.0" });
   expect((await call("mail-list")).inbox.find((row: any) => row.id === "upgrade-mail").state).toBe("queued");
   await stop(logs);
   // Seed the exact durable crash boundary: intent committed, attachment updated,
   // registry still names the prior binary. Journal persists the intent on restart.
   const { Registry } = await import("../src/registry.ts"); const registry = new Registry(state.dir); registry.enableJournal(state.dir);
-  await registry.update("lead", lane => ({ ...lane, dispatchBlocked: true, holdReason: "recovery", runtime: { ...lane.runtime!, binaryVersion: "0.163.0", held: true, state: "recovering", external: { ...lane.runtime!.external!, binary: binaries[0]!, rebind: { binary: binaries[1]!, binaryVersion: "0.164.0" }, holdReason: { code: "rebind-interrupted", message: "Attached runtime rebind incomplete; explicitly reattach to finish reconnection.", at: new Date().toISOString() } } } }));
+  await registry.update("lead", lane => ({ ...lane, dispatchBlocked: true, holdReason: "recovery", runtime: { ...lane.runtime!, binaryVersion: "0.163.0", held: true, state: "recovering", external: { ...lane.runtime!.external!, binary: binaries[0]!, rebind: { binary: binaries[1]!, binaryVersion: upgradeVersion }, holdReason: { code: "rebind-interrupted", message: "Attached runtime rebind incomplete; explicitly reattach to finish reconnection.", at: new Date().toISOString() } } } }));
   logs = await start();
   expect(await call("status", { key: "lead" }, saved.token)).toMatchObject({ readiness: "held", runtime: { external: { holdReason: { code: "rebind-interrupted" } } } });
   expect((await call("mail-list")).inbox.find((row: any) => row.id === "upgrade-mail").state).toBe("queued");
@@ -219,7 +219,7 @@ test("CLI 163 attachment survives shared 164 upgrade, interrupted binding restar
   const mail = await waitFor(() => call("mail-list"), value => value.inbox.find((row: any) => row.id === "upgrade-mail")?.state === "sent");
   const delivered = mail.inbox.find((row: any) => row.id === "upgrade-mail"); expect(delivered.turnId).toBeTruthy();
   await stop(logs); logs = await start();
-  expect(await call("status", { key: "lead" }, saved.token)).toMatchObject({ readiness: "ready", runtime: { binaryVersion: "0.164.0" } });
+  expect(await call("status", { key: "lead" }, saved.token)).toMatchObject({ readiness: "ready", runtime: { binaryVersion: upgradeVersion } });
   expect((await call("mail-list")).inbox.find((row: any) => row.id === "upgrade-mail").turnId).toBe(delivered.turnId);
   const calls = readFileSync(join(state.dir, "external-codex-calls.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
   expect(calls.filter(args => args[0] === "queue")).toHaveLength(1); expect(calls.every(args => args[0] === "queue" || args.join(" ") === "app-server daemon version")).toBe(true);

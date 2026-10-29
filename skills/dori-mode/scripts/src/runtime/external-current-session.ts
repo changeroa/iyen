@@ -15,7 +15,7 @@ export type Attachment = ExternalIdentity & { instance: string; generation: numb
 
 // External sessions borrow a user-owned runtime. This explicit protocol support
 // table is independent of the managed host's requiredVersion pin.
-const supportedVersions = new Set(["0.163.0", "0.164.0"]);
+const supportedVersions = new Set(["0.163.0", "0.164.0", "0.165.0"]);
 export class ExternalSessionError extends Error {
   constructor(readonly code: ExternalHoldCode, message: string) { super(message); }
 }
@@ -35,7 +35,7 @@ export const sharedDaemon = async (run: Runner, binary: string, config: RuntimeC
   if (version.cliVersion !== version.appServerVersion)
     throw new ExternalSessionError("runtime-version-changed", `Shared Codex runtime version changed (client ${client}, server ${server}); explicitly reattach with a supported matching client.`);
   if (!supportedVersions.has(version.cliVersion))
-    throw new ExternalSessionError("runtime-version-unsupported", `Unsupported shared Codex runtime version (client ${client}, server ${server}); supported pairs are 0.163.0/0.163.0 and 0.164.0/0.164.0.`);
+    throw new ExternalSessionError("runtime-version-unsupported", `Unsupported shared Codex runtime version (client ${client}, server ${server}); supported pairs are 0.163.0/0.163.0, 0.164.0/0.164.0 and 0.165.0/0.165.0.`);
   return { socketPath: version.socketPath, binaryVersion: version.appServerVersion };
 };
 
