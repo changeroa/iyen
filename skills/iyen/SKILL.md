@@ -53,6 +53,26 @@ There is no required status message, thread renaming, or reaction removal cycle.
 These are skill instructions followed by the lead, not service-enforced gates
 or automatic reaction/notification timers.
 
+## While work is running
+
+Keep the owner informed in the original Slack thread during the work, not only
+at the end. Send concise updates as meaningful steps finish, findings change
+the plan, or a blocker appears: what changed and what you are doing next. Local
+Codex commentary is not a Slack progress report. Choose useful moments rather
+than a fixed timer or generic “working” notices.
+
+Stay available for steering. When another owner message arrives during work,
+read it, react, and reply without waiting for the current task to finish. Apply
+corrections, constraints, and direction to the ongoing task; answer status
+questions and continue. Replace or cancel the task only when the owner asks.
+
+For substantial or multi-step work, delegate bounded assignments to separate
+Herdr-managed Codex worker panes. Follow the owner's Herdr workflow, preserve
+focus, and select an explicit model and reasoning effort for each assignment.
+This conversation stays the messenger lead: coordinate the workers, integrate
+their changes, and verify their results while keeping Slack progress and
+steering active. A worker's idle/done status alone is not completion evidence.
+
 ## Attach this conversation
 
 “Iyen mode start” attaches this already-running Codex session as the service's
