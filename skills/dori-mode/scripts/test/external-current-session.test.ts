@@ -292,11 +292,11 @@ test("a failure tied to unknown input remains pending without notice or input re
 
 test("external support is an explicit pair table independent of the managed version pin", async () => {
   const pin = h.config.runtime.requiredVersion;
-  for (const version of ["0.163.0", "0.164.0"]) {
+  for (const version of ["0.163.0", "0.164.0", "0.165.0"]) {
     h.versions(version);
     expect(await sharedDaemon(h.run, process.execPath, h.config.runtime)).toEqual({ socketPath: join(socketDir(h.state.dir), "shared.sock"), binaryVersion: version });
   }
-  for (const [client, server, code] of [["0.163.0", "0.164.0", "runtime-version-changed"], ["0.164.0", "0.163.0", "runtime-version-changed"], ["0.165.0", "0.165.0", "runtime-version-unsupported"], ["0.164.1", "0.164.1", "runtime-version-unsupported"]]) {
+  for (const [client, server, code] of [["0.163.0", "0.164.0", "runtime-version-changed"], ["0.164.0", "0.163.0", "runtime-version-changed"], ["0.166.0", "0.166.0", "runtime-version-unsupported"], ["0.164.1", "0.164.1", "runtime-version-unsupported"]]) {
     h.versions(client!, server);
     await expect(sharedDaemon(h.run, process.execPath, h.config.runtime)).rejects.toMatchObject({ code });
     await expect(attach()).rejects.toThrow(/version/);
@@ -305,7 +305,7 @@ test("external support is an explicit pair table independent of the managed vers
   expect(await h.s.registry.read("lead")).toBeNull(); expect(existsSync(join(h.state.dir, "attachments/lead.json"))).toBe(false);
 });
 
-test("same-session 163 to 164 reattach preserves accepted mail, capability and historical exclusions", async () => {
+for (const upgradeVersion of ["0.164.0", "0.165.0"]) test(`same-session 163 to ${upgradeVersion} reattach preserves accepted mail, capability and historical exclusions`, async () => {
   h.s.inbox.put({ id: "history", target: "lead", text: "old", state: "queued", at: "2020-01-01" });
   h.busy(); await attach();
   const path = join(h.state.dir, "attachments/lead.json"), saved = readJson<any>(path);
@@ -317,18 +317,18 @@ test("same-session 163 to 164 reattach preserves accepted mail, capability and h
   const id = "inbound:test:chat:owner:accepted", queued = { ...h.s.inbox.get(id)! };
   for (const state of ["unknown", "sending", "queued"] as const) h.s.inbox.put({ id: state, target: "lead", text: state, state, at: "2020-01-02", attachmentInstance: state === "queued" ? "previous-instance" : saved.instance });
   const before = structuredClone(h.s.inbox.list());
-  h.versions("0.163.0", "0.164.0");
-  expect(await h.s.handle("status", { key: "lead" }, { role: "admin" })).toMatchObject({ readiness: "held", runtime: { external: { holdReason: { code: "runtime-version-changed", message: expect.stringContaining("client 0.163.0, server 0.164.0") } } } });
+  h.versions("0.163.0", upgradeVersion);
+  expect(await h.s.handle("status", { key: "lead" }, { role: "admin" })).toMatchObject({ readiness: "held", runtime: { external: { holdReason: { code: "runtime-version-changed", message: expect.stringContaining(`client 0.163.0, server ${upgradeVersion}`) } } } });
   const fault = (await h.s.registry.read("lead"))!.runtime!.external!.holdReason;
   // Later generic identity faults must preserve the initial version diagnosis.
   h.versions("0.163.0"); h.agent.agent_session.value = otherId;
   await h.s.deps.runtime.inspect("lead").catch(() => {});
   expect((await h.s.registry.read("lead"))!.runtime!.external!.holdReason).toEqual(fault);
-  h.agent.agent_session.value = threadId; h.versions("0.164.0");
+  h.agent.agent_session.value = threadId; h.versions(upgradeVersion);
   const rebound = await attach(), actual = readJson<any>(path);
-  expect(rebound).toMatchObject({ reused: true, bridge: saved.bridge, lead: { readiness: "busy", runtime: { binaryVersion: "0.164.0", held: false } } });
+  expect(rebound).toMatchObject({ reused: true, bridge: saved.bridge, lead: { readiness: "busy", runtime: { binaryVersion: upgradeVersion, held: false } } });
   for (const key of ["instance", "generation", "token", "bridge", "excludedInboxIds", "socketPath", "threadId", "pane", "cwd"]) expect(actual[key]).toEqual(saved[key]);
-  expect(actual.binary).toBe(realpathSync(process.execPath)); expect(actual.binaryVersion).toBe("0.164.0");
+  expect(actual.binary).toBe(realpathSync(process.execPath)); expect(actual.binaryVersion).toBe(upgradeVersion);
   expect(rebound.lead.runtime.external.holdReason).toBeUndefined(); expect(rebound.lead.runtime.external.rebind).toBeUndefined();
   expect(await h.s.authorize(saved.token)).toMatchObject({ instance: saved.instance });
   expect(h.s.inbox.list()).toEqual(before); expect(h.s.inbox.get(id)).toEqual(queued);
