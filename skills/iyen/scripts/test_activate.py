@@ -168,6 +168,16 @@ class ActivationTests(unittest.TestCase):
             self.run_helper()
         self.assertFalse(any("lead-attach" in argv for argv, _ in self.calls))
 
+    def test_held_status_prefers_latest_cause_over_original_failure(self):
+        self.args.action = "status"
+        self.lead["dispatchBlocked"] = True
+        self.lead["runtime"]["external"] = {
+            "holdReason": {"message": "Original temporary disconnect"},
+            "latestHoldReason": {"message": "Current session identity changed"},
+        }
+        with self.assertRaisesRegex(activate.ActivationError, "Current session identity changed"):
+            self.run_helper()
+
 
 if __name__ == "__main__":
     unittest.main()

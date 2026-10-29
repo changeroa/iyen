@@ -77,7 +77,7 @@ Required capabilities and the CLI/daemon pairing must validate; a different
 pane/thread/cwd or daemon socket is not automatically adopted. Use `start` for an
 explicit same-session retry when needed. Do not detach merely to update versions:
 a fresh attachment excludes old inbox entries. Use `BRIDGE health` and inspect the
-latest `runtime.external.holdReason` when held. A messenger acknowledgment confirms
+latest `runtime.external.latestHoldReason` (or legacy `holdReason`) when held. A messenger acknowledgment confirms
 inbox storage, not delivery to this conversation.
 
 For an owner-authorized change to a different lead session, preview the handoff

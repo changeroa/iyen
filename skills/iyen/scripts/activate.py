@@ -58,7 +58,8 @@ def verify_lead(lead, session, pane):
             or lead.get("identityVerified") is not True
             or lead.get("readiness") not in ("ready", "busy")
             or runtime.get("state") not in ("idle", "running")):
-        hold = (runtime.get("external") or {}).get("holdReason")
+        external = runtime.get("external") or {}
+        hold = external.get("latestHoldReason") or external.get("holdReason")
         if isinstance(hold, dict) and isinstance(hold.get("message"), str):
             raise ActivationError(f"The attached lead is not ready: {hold['message']}")
         raise ActivationError("The attached lead is not ready; inspect service status")
