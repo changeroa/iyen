@@ -939,9 +939,9 @@ export class DoriService {
       }),
       once("failures", () => this.notifyFailures()),
       once("herdr-progress", () => herdrProgressTick(this.deps, (turnId, instance) => {
-        const lead = this.inbox.list().filter(row => row.target === "lead" && row.state === "sent" && row.turnId === turnId &&
-          row.attachmentInstance === instance && row.thread && row.thread !== "none");
-        return lead.length === 1 ? lead[0]!.thread : undefined;
+        const threads = [...new Set(this.inbox.list().filter(row => row.target === "lead" && row.state === "sent" && row.turnId === turnId &&
+          row.attachmentInstance === instance && row.thread && row.thread !== "none").map(row => row.thread))];
+        return threads.length === 1 ? threads[0] : undefined;
       })),
       once("done", () => watchTick(this.deps).then(lines => lines.forEach(l => console.log(l)))),
       once("freshness", () => freshnessTick(this.deps, process.env.HOME ?? "")),

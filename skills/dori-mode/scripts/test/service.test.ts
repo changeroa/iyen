@@ -127,7 +127,7 @@ test("explicit operator handoff archives legacy control state, preserves old ide
 
 // A read-only observer transport keeps recovery tests in process; socket-level
 // protocol coverage belongs to the external-session and integration fixtures.
-async function externalFixture() {
+async function externalFixture(progress = false) {
  const { ExternalSessionError, sharedDaemon } = await import("../src/runtime/external-current-session.ts");
  const threadId="11111111-1111-4111-8111-111111111111", pane="test:pane", socketPath=join(state.dir,"exact-daemon.sock");
  let version="0.200.0", offline=false, identity=threadId, reportedSocket=socketPath, accept=true;
@@ -138,13 +138,17 @@ async function externalFixture() {
  }};
  const runner:import("../src/run.ts").Runner=async argv=>{
   calls.push([...argv]);
+  if(argv[0]==="notify")return {code:0,err:"",out:""};
   if(argv[1]==="app-server") {if(offline)throw new Error("Bearer secret-token /private/socket");return {code:0,err:"",out:JSON.stringify({status:"running",cliVersion:version,appServerVersion:version,socketPath:reportedSocket})};}
   if(argv[1]==="queue"&&argv[2]==="--help")return {code:0,err:"",out:"queue --thread <ID> --message <TEXT>"};
   if(argv[0]==="herdr"&&argv[2]==="prompt"){
    if(accept)turns[0].items.push({type:"userMessage",content:[{type:"text",text:argv[4]}]});
    return {code:0,err:"",out:"submitted"};
   }
-  if(argv[0]==="herdr")return {code:0,err:"",out:JSON.stringify({result:{agent:{agent:"codex",pane_id:pane,agent_status:agentStatus,agent_session:{agent:"codex",kind:"id",value:identity}}}})};
+  if(argv[0]==="herdr"){
+   const agent={agent:"codex",pane_id:pane,agent_status:agentStatus,agent_session:{agent:"codex",kind:"id",value:identity}};
+   return {code:0,err:"",out:JSON.stringify({result:argv[2]==="list"?{agents:[agent]}:{agent}})};
+  }
   if(argv[1]==="queue"){turns.push({id:`turn-${turns.length}`,status:"completed",items:[{type:"userMessage",content:[{type:"text",text:argv[5]}]}]});return {code:0,err:"",out:"queued"};}
   throw new Error("Unexpected mutation");
  };
@@ -154,7 +158,7 @@ async function externalFixture() {
   if(daemon.binaryVersion!==attachment.binaryVersion)throw new ExternalSessionError("runtime-version-changed","Shared Codex runtime version changed; verified reconnection required.");
   return action(observer);
  }};
- const config={...s.config,runtime:{...s.config.runtime,binary:process.execPath,rpcTimeoutMs:80},hooks:{}};
+ const config={...s.config,runtime:{...s.config.runtime,binary:process.execPath,rpcTimeoutMs:80},hooks:progress?{threadReply:["notify","{thread}","{text}"]}:{}};
  atomicJson(join(state.dir,"control.json"),{token:"admin"});
  s=new DoriService(config,runner,transport); const clock=fakeClock(Date.now());s.deps.clock=clock;
  const args={threadId,pane,cwd:state.dir};
@@ -183,6 +187,28 @@ test("concurrent working input retries produce one TUI submission and one exact 
  const h=await externalFixture();h.busy();const args={key:"lead",text:"one submission",operationId:"concurrent-working"},caller={role:"admin" as const};
  expect(await Promise.all([s.handle("input",args,caller),s.handle("input",args,caller)])).toEqual([{turnId:"running-turn"},{turnId:"running-turn"}]);
  expect(h.prompts()).toHaveLength(1);expect(h.queues()).toHaveLength(0);expect(h.turns[0].items).toHaveLength(1);expect(h.turns[0].status).toBe("inProgress");
+});
+
+for(const secondThread of ["slack:owner","slack:other"])test(`shared-turn progress ${secondThread==="slack:owner"?"notifies one distinct thread once":"does not route between distinct threads"}`,async()=>{
+ const h=await externalFixture(true);h.busy();const instance=h.attachment().instance;
+ for(const [operationId,thread] of [["first-progress","slack:owner"],["second-progress",secondThread]] as const){
+  expect(await s.handle("input",{key:"lead",text:operationId,operationId,thread},{role:"admin"})).toEqual({turnId:"running-turn"});
+  expect(s.inbox.get(operationId)).toMatchObject({target:"lead",state:"sent",attachmentInstance:instance,turnId:"running-turn",thread});
+ }
+ expect(await s.deps.runtime.inspect("lead")).toMatchObject({state:"running",activeTurnId:"running-turn"});
+ expect(h.turns[0].items).toHaveLength(2);expect(h.turns[0].status).toBe("inProgress");
+ // These matching turn IDs must not contribute thread destinations.
+ for(const [id,target,mailState,attachmentInstance] of [["wrong-target","worker","sent",instance],["not-sent","lead","unknown",instance],["old-instance","lead","sent","previous-instance"]] as const)
+  s.inbox.put({id,target,state:mailState,attachmentInstance,turnId:"running-turn",thread:"slack:decoy",text:id,at:"2020-01-01"});
+ await s.tick();
+ const expected=secondThread==="slack:owner"?1:0;
+ expect(h.calls.filter(argv=>argv[0]==="notify")).toHaveLength(expected);expect(s.outbox.list()).toHaveLength(expected);
+ if(expected){
+  expect(s.outbox.list()[0]).toMatchObject({id:`herdr-progress:lead:${instance}:1`,target:"slack:owner",state:"sent",text:"이연: 작업 진행 중입니다."});
+  expect(h.calls.find(argv=>argv[0]==="notify")).toEqual(["notify","slack:owner","이연: 작업 진행 중입니다."]);
+ }else expect((await s.registry.read("lead"))!.herdrProgress).toBeUndefined();
+ s=new DoriService(h.config,h.runner,h.transport);await s.tick();
+ expect(h.calls.filter(argv=>argv[0]==="notify")).toHaveLength(expected);expect(s.outbox.list()).toHaveLength(expected);
 });
 
 for(const holdReason of ["owner-pause","done-review"] as const)test(`working intake preserves ${holdReason}`,async()=>{
