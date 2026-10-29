@@ -133,14 +133,16 @@ test("current-session CLI attaches a busy existing lead, scopes controls, delive
   expect((await exec([process.execPath,cli,"status"],{DORI_CONTEXT:forged})).code).toBe(1);
   expect((await exec([bridge,"lead-attach","--thread-id",threadId,"--pane","current:p","--cwd",state.dir])).code).toBe(1);
   await call("input",{key:"lead",text:"literal owner message",thread:"chat:owner",operationId:"ingress"});
-  expect((await call("mail-list")).inbox.find((m:any)=>m.id==="ingress").state).toBe("queued");
+  const mail=await waitFor(()=>call("mail-list"),v=>v.inbox.find((m:any)=>m.id==="ingress")?.state==="sent");
+  const delivered=mail.inbox.find((m:any)=>m.id==="ingress");expect(delivered.turnId).toBe("activation-turn");
+  expect(readJson<any>(statePath).turns.find((t:any)=>t.id===delivered.turnId).items[0].content[0].text).toBe(operationText("literal owner message","ingress"));
+  expect(readJson<any>(statePath).turns).toHaveLength(1);expect(readJson<any>(statePath).turns[0].status).toBe("inProgress");
+  expect(readJson<any[]>(join(state.dir,"fixture-panes.json"))[0].agent_status).toBe("working");
+  expect(await call("input",{key:"lead",text:"literal owner message",thread:"chat:owner",operationId:"ingress"})).toEqual({turnId:"activation-turn"});
+  daemon!.kill("SIGTERM");await daemon!.exited;expect(await logs.err).toBe("");expect(await logs.out).toContain("DORI_SERVICE_READY");
+  logs=await start();expect(JSON.parse((await exec([bridge,"status","lead"])).out)).toMatchObject({identityVerified:true,readiness:"busy",bridge});
   const snapshot=readJson<any>(statePath);snapshot.thread.status={type:"idle"};snapshot.turns[0].status="completed";atomicJson(statePath,snapshot);
   const idlePanes=readJson<any[]>(join(state.dir,"fixture-panes.json"));idlePanes[0].agent_status="idle";atomicJson(join(state.dir,"fixture-panes.json"),idlePanes);
-  const mail=await waitFor(()=>call("mail-list"),v=>v.inbox.find((m:any)=>m.id==="ingress")?.state==="sent");
-  const delivered=mail.inbox.find((m:any)=>m.id==="ingress");expect(delivered.turnId).toBeTruthy();
-  expect(readJson<any>(statePath).turns.find((t:any)=>t.id===delivered.turnId).items[0].content[0].text).toBe(operationText("literal owner message","ingress"));
-  daemon!.kill("SIGTERM");await daemon!.exited;expect(await logs.err).toBe("");expect(await logs.out).toContain("DORI_SERVICE_READY");
-  logs=await start();expect(JSON.parse((await exec([bridge,"status","lead"])).out)).toMatchObject({identityVerified:true,readiness:"ready",bridge});
   await call("input",{key:"lead",text:"fixture-fail-auth",thread:"chat:failure",operationId:"failed-owner-input"});
   const failedMail=await waitFor(()=>call("mail-list"),v=>v.outbox.some((m:any)=>m.target==="chat:failure"));
   expect(failedMail.outbox.filter((m:any)=>m.target==="chat:failure")).toHaveLength(1);expect(failedMail.outbox.find((m:any)=>m.target==="chat:failure").text).toContain("Check Codex authentication");
@@ -159,8 +161,8 @@ test("current-session CLI attaches a busy existing lead, scopes controls, delive
   await call("lead-detach",{threadId});
   const observer=await connectObserver(socketPath,500);try{expect((await observer.read<any>("thread/read",{threadId})).thread.id).toBe(threadId);}finally{observer.close();}
   const calls=readFileSync(join(state.dir,"external-codex-calls.jsonl"),"utf8").trim().split("\n").map(l=>JSON.parse(l));
-  expect(calls.filter(a=>a[0]==="queue"&&a[1]!=="--help")).toHaveLength(2);expect(calls.every(a=>a.join(" ")==="app-server daemon version"||a[0]==="queue")).toBe(true);
-  const herdrCalls=readFileSync(join(state.dir,"fixture-herdr-calls.jsonl"),"utf8").trim().split("\n").map(l=>JSON.parse(l));expect(herdrCalls.every(a=>a[0]==="agent"&&a[1]==="get")).toBe(true);
+  expect(calls.filter(a=>a[0]==="queue"&&a[1]!=="--help")).toHaveLength(1);expect(calls.every(a=>a.join(" ")==="app-server daemon version"||a[0]==="queue")).toBe(true);
+  const herdrCalls=readFileSync(join(state.dir,"fixture-herdr-calls.jsonl"),"utf8").trim().split("\n").map(l=>JSON.parse(l));expect(herdrCalls.every(a=>a[0]==="agent"&&["get","prompt"].includes(a[1]))).toBe(true);expect(herdrCalls.filter(a=>a[1]==="prompt")).toEqual([["agent","prompt","current:p",operationText("literal owner message","ingress")]]);
   daemon!.kill("SIGTERM");await daemon!.exited;expect(await logs.err).toBe("");
  }finally{daemon?.kill();if(daemon)await daemon.exited;server.stop(true);state.done();}
 },30000);
@@ -175,7 +177,7 @@ for (const upgradeVersion of ["0.165.0", "0.999.0"]) test(`CLI 163 attachment au
   ws.send(JSON.stringify(result === undefined ? { id: m.id, error: { code: -1, message: "mutation refused" } } : { id: m.id, result }));
  } } });
  try {
-  atomicJson(statePath, { socketPath, serverVersion: "0.163.0", thread: { id: threadId, cwd: state.dir, status: { type: "active", activeFlags: [] } }, turns: [{ id: "busy", status: "inProgress", items: [] }] });
+  atomicJson(statePath, { socketPath, serverVersion: "0.163.0", thread: { id: threadId, cwd: state.dir, status: { type: "active", activeFlags: ["waitingOnApproval"] } }, turns: [{ id: "busy", status: "inProgress", items: [] }] });
   atomicJson(join(state.dir, "fixture-panes.json"), [{ pane_id: "current:p", tab_id: "current:t", workspace_id: "current", agent: "codex", agent_status: "working", agent_session: { agent: "codex", kind: "id", value: threadId } }]);
   const bin = join(state.dir, "bin"); mkdirSync(bin); symlinkSync(join(import.meta.dir, "fixtures/herdr.ts"), join(bin, "herdr"));
   const binaries: string[] = [];

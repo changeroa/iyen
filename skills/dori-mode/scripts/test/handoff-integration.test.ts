@@ -30,7 +30,7 @@ test("process handoff transfers only explicit queued input, revokes the old brid
   } } });
   try {
     const setSession = (id: string, busy: boolean) => {
-      atomicJson(statePath, { socketPath, thread: { id, cwd: state.dir, status: busy ? { type: "active", activeFlags: [] } : { type: "idle" } },
+      atomicJson(statePath, { socketPath, thread: { id, cwd: state.dir, status: busy ? { type: "active", activeFlags: ["waitingOnApproval"] } : { type: "idle" } },
         turns: busy ? [{ id: `busy-${id}`, status: "inProgress", items: [] }] : [] });
       atomicJson(panesPath, [{ pane_id: "current:p", tab_id: "current:t", agent: "codex", agent_status: busy ? "working" : "idle", agent_session: { agent: "codex", kind: "id", value: id } }]);
     };

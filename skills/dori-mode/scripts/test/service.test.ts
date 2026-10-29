@@ -130,16 +130,21 @@ test("explicit operator handoff archives legacy control state, preserves old ide
 async function externalFixture() {
  const { ExternalSessionError, sharedDaemon } = await import("../src/runtime/external-current-session.ts");
  const threadId="11111111-1111-4111-8111-111111111111", pane="test:pane", socketPath=join(state.dir,"exact-daemon.sock");
- let version="0.200.0", offline=false, identity=threadId, reportedSocket=socketPath;
+ let version="0.200.0", offline=false, identity=threadId, reportedSocket=socketPath, accept=true;
+ let threadStatus:any={type:"idle"}, agentStatus="idle";
  const calls:string[][]=[],turns:any[]=[];
  const observer={close(){},async read<T>(method:string):Promise<T>{
-  return (method==="thread/read"?{thread:{id:threadId,cwd:state.dir,status:{type:"idle"}}}:method==="thread/loaded/list"?{data:[threadId],nextCursor:null}:method==="thread/turns/list"?{data:turns,nextCursor:null}:{goal:null}) as T;
+  return (method==="thread/read"?{thread:{id:threadId,cwd:state.dir,status:threadStatus}}:method==="thread/loaded/list"?{data:[threadId],nextCursor:null}:method==="thread/turns/list"?{data:turns,nextCursor:null}:{goal:null}) as T;
  }};
  const runner:import("../src/run.ts").Runner=async argv=>{
   calls.push([...argv]);
   if(argv[1]==="app-server") {if(offline)throw new Error("Bearer secret-token /private/socket");return {code:0,err:"",out:JSON.stringify({status:"running",cliVersion:version,appServerVersion:version,socketPath:reportedSocket})};}
   if(argv[1]==="queue"&&argv[2]==="--help")return {code:0,err:"",out:"queue --thread <ID> --message <TEXT>"};
-  if(argv[0]==="herdr")return {code:0,err:"",out:JSON.stringify({result:{agent:{agent:"codex",pane_id:pane,agent_status:"idle",agent_session:{agent:"codex",kind:"id",value:identity}}}})};
+  if(argv[0]==="herdr"&&argv[2]==="prompt"){
+   if(accept)turns[0].items.push({type:"userMessage",content:[{type:"text",text:argv[4]}]});
+   return {code:0,err:"",out:"submitted"};
+  }
+  if(argv[0]==="herdr")return {code:0,err:"",out:JSON.stringify({result:{agent:{agent:"codex",pane_id:pane,agent_status:agentStatus,agent_session:{agent:"codex",kind:"id",value:identity}}}})};
   if(argv[1]==="queue"){turns.push({id:`turn-${turns.length}`,status:"completed",items:[{type:"userMessage",content:[{type:"text",text:argv[5]}]}]});return {code:0,err:"",out:"queued"};}
   throw new Error("Unexpected mutation");
  };
@@ -149,14 +154,66 @@ async function externalFixture() {
   if(daemon.binaryVersion!==attachment.binaryVersion)throw new ExternalSessionError("runtime-version-changed","Shared Codex runtime version changed; verified reconnection required.");
   return action(observer);
  }};
- const config={...s.config,runtime:{...s.config.runtime,binary:process.execPath},hooks:{}};
+ const config={...s.config,runtime:{...s.config.runtime,binary:process.execPath,rpcTimeoutMs:80},hooks:{}};
  atomicJson(join(state.dir,"control.json"),{token:"admin"});
  s=new DoriService(config,runner,transport); const clock=fakeClock(Date.now());s.deps.clock=clock;
  const args={threadId,pane,cwd:state.dir};
  await s.handle("lead-attach",args,{role:"admin"});
  const attachment=()=>readJson<any>(join(state.dir,"attachments/lead.json"));
- return {args,calls,clock,config,runner,transport,attachment,version(v:string){version=v;},offline(v=true){offline=v;},identity(v=threadId){identity=v;},socket(v:string){reportedSocket=v;},queues:()=>calls.filter(argv=>argv[1]==="queue"&&argv[2]!=="--help")};
+ return {args,calls,clock,config,runner,transport,attachment,turns,
+  busy(){threadStatus={type:"active",activeFlags:[]};agentStatus="working";turns.push({id:"running-turn",status:"inProgress",items:[]});},
+  waiting(flag:string){threadStatus={type:"active",activeFlags:[flag]};},noReceipt(){accept=false;},
+  version(v:string){version=v;},offline(v=true){offline=v;},identity(v=threadId){identity=v;},socket(v:string){reportedSocket=v;},
+  prompts:()=>calls.filter(argv=>argv[0]==="herdr"&&argv[2]==="prompt"),queues:()=>calls.filter(argv=>argv[1]==="queue"&&argv[2]!=="--help")};
 }
+
+test("working Slack intake is durable before tick and steers the same active turn once across restart",async()=>{
+ const h=await externalFixture();h.busy();
+ const event={id:"working-slack",user:"owner",thread:"slack:owner",text:"continue while working"},id="inbound:test:slack:owner:working-slack";
+ await s.receive("test",event);expect(s.inbox.get(id)).toMatchObject({state:"queued",attachmentInstance:h.attachment().instance});
+ expect(h.prompts()).toHaveLength(0);await s.tick();
+ expect(s.inbox.get(id)).toMatchObject({state:"sent",turnId:"running-turn"});expect(h.turns[0].status).toBe("inProgress");
+ expect(await s.deps.runtime.inspect("lead")).toMatchObject({state:"running",activeTurnId:"running-turn"});
+ expect(h.prompts()).toHaveLength(1);expect(h.queues()).toHaveLength(0);
+ s=new DoriService(h.config,h.runner,h.transport);await s.receive("test",event);await s.tick();
+ expect(s.inbox.get(id)).toMatchObject({state:"sent",turnId:"running-turn"});expect(h.prompts()).toHaveLength(1);
+});
+
+test("concurrent working input retries produce one TUI submission and one exact receipt",async()=>{
+ const h=await externalFixture();h.busy();const args={key:"lead",text:"one submission",operationId:"concurrent-working"},caller={role:"admin" as const};
+ expect(await Promise.all([s.handle("input",args,caller),s.handle("input",args,caller)])).toEqual([{turnId:"running-turn"},{turnId:"running-turn"}]);
+ expect(h.prompts()).toHaveLength(1);expect(h.queues()).toHaveLength(0);expect(h.turns[0].items).toHaveLength(1);expect(h.turns[0].status).toBe("inProgress");
+});
+
+for(const holdReason of ["owner-pause","done-review"] as const)test(`working intake preserves ${holdReason}`,async()=>{
+ const h=await externalFixture();h.busy();await s.registry.update("lead",lane=>({...lane,dispatchBlocked:true,holdReason,runtime:{...lane.runtime!,held:true}}));
+ expect(await s.handle("input",{key:"lead",text:"saved",operationId:"held-working"},{role:"admin"})).toMatchObject({queued:true});
+ await s.tick();expect(s.inbox.get("held-working")?.state).toBe("queued");expect(h.prompts()).toHaveLength(0);expect(h.queues()).toHaveLength(0);
+ expect(await s.registry.read("lead")).toMatchObject({dispatchBlocked:true,holdReason});
+});
+
+for(const flag of ["waitingOnApproval","waitingOnUserInput"])test(`working intake remains queued during ${flag}`,async()=>{
+ const h=await externalFixture();h.busy();h.waiting(flag);
+ expect(await s.handle("input",{key:"lead",text:"saved",operationId:"waiting-working"},{role:"admin"})).toMatchObject({queued:true});
+ await s.tick();expect(s.inbox.get("waiting-working")?.state).toBe("queued");expect(h.prompts()).toHaveLength(0);expect(h.queues()).toHaveLength(0);
+});
+
+test("working dispatch preserves excluded, old-generation and uncertain mail boundaries",async()=>{
+ const h=await externalFixture();h.busy();const saved=h.attachment();saved.excludedInboxIds.push("history");atomicJson(join(state.dir,"attachments/lead.json"),saved);
+ for(const id of ["history","old","unknown","sending","current"])s.inbox.put({id,target:"lead",text:id,state:id==="unknown"||id==="sending"?id:"queued",attachmentInstance:id==="old"?"old-instance":saved.instance,at:"2020-01-01"});
+ await s.tick();expect(s.inbox.get("current")).toMatchObject({state:"sent",turnId:"running-turn"});
+ for(const id of ["history","old"])expect(s.inbox.get(id)?.state).toBe("queued");
+ expect(s.inbox.get("unknown")?.state).toBe("unknown");expect(s.inbox.get("sending")?.state).toBe("sending");expect(h.prompts()).toHaveLength(1);expect(h.queues()).toHaveLength(0);
+});
+
+test("unconfirmed working submission becomes unknown and restart cannot replay either transport",async()=>{
+ const h=await externalFixture();h.busy();h.noReceipt();
+ await expect(s.handle("input",{key:"lead",text:"uncertain",operationId:"working-unknown"},{role:"admin"})).rejects.toThrow("receipt unknown");
+ expect(s.inbox.get("working-unknown")?.state).toBe("unknown");
+ s=new DoriService(h.config,h.runner,h.transport);await s.tick();
+ await expect(s.handle("input",{key:"lead",text:"uncertain",operationId:"working-unknown"},{role:"admin"})).rejects.toThrow("Delivery unknown");
+ expect(h.prompts()).toHaveLength(1);expect(h.queues()).toHaveLength(0);
+});
 
 test("automatic upgrade reconnect preserves capability and exclusions and delivers only eligible queued mail once",async()=>{
  const h=await externalFixture(),old=h.attachment();

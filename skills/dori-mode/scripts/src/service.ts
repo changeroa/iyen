@@ -92,7 +92,7 @@ export class DoriService {
         if (lane.runtime?.backend === "external-current-session") {
           if (mail.attachmentInstance && mail.attachmentInstance !== lane.runtime.hostInstanceId) throw new DeliveryDeferred("Mail belongs to a previous lead attachment");
           if (this.attachment(lane).excludedInboxIds.includes(mail.id)) throw new DeliveryDeferred("Historical mail is held for explicit reconciliation");
-          if (mail.state === "queued" && (await call<RuntimeSnapshot>(key, "inspect")).state !== "idle") throw new DeliveryDeferred("Attached session busy; input remains queued");
+          if (mail.state === "queued" && !["idle", "running"].includes((await call<RuntimeSnapshot>(key, "inspect")).state)) throw new DeliveryDeferred("Attached session requires approval or input; dispatch held");
           if (mail.state === "queued") this.inbox.mark(mail.id, { attachmentInstance: lane.runtime.hostInstanceId });
         }
         const delivered = await this.inbox.deliver(mail.id, async row => {
@@ -971,7 +971,6 @@ export class DoriService {
           if (lane.runtime?.backend === "external-current-session" && this.attachment(lane).excludedInboxIds.includes(row.id)) continue;
           const snapshot = await this.deps.runtime.inspect(lane.key).catch(() => null);
           if (!snapshot || !["idle", "running"].includes(snapshot.state)) continue;
-          if (lane.runtime?.backend === "external-current-session" && snapshot.state !== "idle") continue;
           await this.deps.runtime.input(lane.key, row.text, row.id).catch(() => {});
         }
       }),
