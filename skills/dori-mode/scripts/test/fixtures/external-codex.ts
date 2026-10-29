@@ -7,6 +7,8 @@ appendFileSync(join(dir, "external-codex-calls.jsonl"), JSON.stringify(args) + "
 if (args.join(" ") === "app-server daemon version") {
   const { socketPath, serverVersion = "0.163.0" } = await Bun.file(join(dir, "external-state.json")).json();
   console.log(JSON.stringify({ status: "running", cliVersion: process.env.DORI_EXTERNAL_FIXTURE_VERSION ?? "0.163.0", appServerVersion: serverVersion, socketPath }));
+} else if (args.join(" ") === "queue --help") {
+  console.log("Queue a message for an existing session\n  --thread <ID>\n  --message <TEXT>");
 } else if (args[0] === "queue" && args[1] === "--thread" && args[3] === "--message") {
   const state = await Bun.file(join(dir, "external-state.json")).json();
   if (args[2] !== state.thread.id || state.thread.status.type !== "idle") throw new Error("fixture queue thread not idle");

@@ -70,12 +70,32 @@ session and shared Codex daemon; the service does not restart or kill them. If t
 session is closed or its identity changes, delivery is held until an explicit
 verified activation. Do not describe a held delivery queue as a paused Codex task.
 
-After a supported Codex daemon update, run `start` again with this same verified
-session and pane. Explicit reattachment validates the new client/daemon pair and
-preserves the existing attachment and its eligible queued messages. Do not detach
-first: a new attachment excludes old inbox entries. Inspect
-`runtime.external.holdReason` when status is held. A receipt acknowledgment from
-the messenger confirms inbox storage, not delivery to this conversation.
+After a compatible Codex daemon update or temporary disconnection, the service
+rediscovers the configured external CLI and reconnects the same verified session
+with bounded retries. It preserves the attachment and eligible queued messages.
+Required capabilities and the CLI/daemon pairing must validate; a different
+pane/thread/cwd or daemon socket is not automatically adopted. Use `start` for an
+explicit same-session retry when needed. Do not detach merely to update versions:
+a fresh attachment excludes old inbox entries. Use `BRIDGE health` and inspect the
+latest `runtime.external.holdReason` when held. A messenger acknowledgment confirms
+inbox storage, not delivery to this conversation.
+
+For an owner-authorized change to a different lead session, preview the handoff
+before applying it. Verify the target UUID and pane as for ordinary activation:
+
+```sh
+python3 /absolute/path/to/iyen/scripts/activate.py handoff-preview --session CURRENT_UUID --pane VERIFIED_PANE --from-session PREVIOUS_UUID
+python3 /absolute/path/to/iyen/scripts/activate.py handoff --session CURRENT_UUID --pane VERIFIED_PANE --from-session PREVIOUS_UUID --operation-id STABLE_ID --mail-id SELECTED_QUEUED_ID
+```
+
+Repeat `--mail-id` for each selected eligible message, or pass `--no-mail` to move
+the lead without transferring messages. Never choose all history implicitly.
+Sent, uncertain, attempted or reconciled messages are not eligible for this
+handoff. Reuse the same operation ID and selection after interruption; never
+invent another ID to work around an uncertain result. The old bridge is revoked
+when the replacement commits; neither Codex conversation is killed. Confirm the
+returned scoped bridge before claiming activation. Handoff does not authorize
+executing stale requests that the owner has withdrawn or replying to other people.
 
 ## Status and stop
 

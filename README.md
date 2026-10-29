@@ -8,7 +8,9 @@ Activation requires the current Herdr session to be loaded in the running local 
 
 ## Install and start
 
-Requirements: Bun 1.3+, Herdr, git, and Codex CLI. Attached leads support matching CLI/daemon versions **0.163.0**, **0.164.0** or **0.165.0**; managed workers retain their configured version pin (default **0.163.0**). Use gh for GitHub Done signals and npm for published-package signals. Use the existing messenger integration or an ACK/replay adapter described below.
+Requirements: Bun 1.3+, Herdr, git, and Codex CLI. Attached leads validate the matching CLI/daemon pair and required messaging capabilities instead of requiring each release in a version allowlist. Managed workers retain their configured version pin (default **0.163.0**). Use gh for GitHub Done signals and npm for published-package signals. Use the existing messenger integration or an ACK/replay adapter described below.
+
+For attached leads, Herdr identifies the pane/session and supplies execution status; the Codex adapter verifies loaded identity and actual delivery receipts. Compatible updates reconnect the same session automatically using `runtime.externalBinary`. A different session requires an explicit handoff. `dori health` distinguishes service recovery, ingress activity and held delivery; a stored messenger acknowledgment is not a turn receipt. See [runtime recovery and handoff](skills/dori-mode/references/setup.md).
 
 ```sh
 cd skills/dori-mode/scripts

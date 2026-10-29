@@ -71,6 +71,21 @@ def activate(args):
         raise ActivationError("--session must be the current Codex session UUID") from exc
     if os.environ.get("DORI_CONTEXT") or os.environ.get("DORI_LANE_KEY"):
         raise ActivationError("Managed Dori sessions must use scoped controls; activation cannot elevate a lane")
+    handoff = args.action in ("handoff-preview", "handoff")
+    if handoff:
+        try:
+            source_session = str(uuid.UUID(getattr(args, "from_session", "") or ""))
+        except ValueError as exc:
+            raise ActivationError("--from-session must identify the registered previous lead") from exc
+        mail_ids = getattr(args, "mail_id", None) or []
+        no_mail = getattr(args, "no_mail", False)
+        if no_mail and mail_ids:
+            raise ActivationError("Choose --mail-id or --no-mail, not both")
+        if args.action == "handoff":
+            if not getattr(args, "operation_id", None):
+                raise ActivationError("--operation-id is required for repeatable handoff")
+            if not mail_ids and not no_mail:
+                raise ActivationError("Explicit --mail-id selections or --no-mail required")
     config = Path(args.config).expanduser().resolve() if args.config else Path.home() / ".dori-codex" / "config.json"
     if not config.is_file():
         raise ActivationError(f"Existing Iyen service configuration not found: {config}")
@@ -84,12 +99,27 @@ def activate(args):
     env["DORI_CONFIG"] = str(config)
     base = [bun, str(cli)]
     pane = current_pane(session, args.pane)
+    if handoff:
+        argv = base + ["lead-" + args.action, "--from-thread-id", source_session,
+                       "--thread-id", session, "--pane", pane,
+                       "--cwd", str(Path.cwd().resolve())]
+        for mail_id in mail_ids:
+            argv.extend(["--mail-id", mail_id])
+        if args.action == "handoff":
+            argv.extend(["--operation-id", args.operation_id])
+            if no_mail:
+                argv.append("--no-mail")
+        result = command(argv, env, timeout=60)
+        if args.action == "handoff-preview":
+            return {"status": "preview", "session": session, "pane": pane,
+                    "from_session": source_session, "result": result}
     if args.action == "stop":
         result = command(base + ["lead-detach", "--thread-id", session], env)
         return {"status": "detached", "session": session, "pane": pane, "result": result}
-    if args.action == "start":
-        result = command(base + ["lead-attach", "--thread-id", session, "--pane", pane,
-                                 "--cwd", str(Path.cwd().resolve())], env, timeout=60)
+    if args.action in ("start", "handoff"):
+        if args.action == "start":
+            result = command(base + ["lead-attach", "--thread-id", session, "--pane", pane,
+                                     "--cwd", str(Path.cwd().resolve())], env, timeout=60)
         if result.get("attached") is not True:
             raise ActivationError("Service did not confirm attachment")
         lead = result.get("lead")
@@ -110,10 +140,14 @@ def activate(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("start", "status", "stop"), nargs="?", default="start")
+    parser.add_argument("action", choices=("start", "status", "stop", "handoff-preview", "handoff"), nargs="?", default="start")
     parser.add_argument("--session", required=True, help="Explicit current Codex UUID; never infer from focus")
     parser.add_argument("--pane", help="Verified pane ID; otherwise resolve uniquely by session")
     parser.add_argument("--config", help="Existing config; defaults to ~/.dori-codex/config.json")
+    parser.add_argument("--from-session", help="Expected previous lead UUID for explicit handoff")
+    parser.add_argument("--operation-id", help="Stable ID reused when retrying the same handoff")
+    parser.add_argument("--mail-id", action="append", help="Explicit queued message ID to transfer; repeat for each message")
+    parser.add_argument("--no-mail", action="store_true", help="Explicitly hand off without transferring messages")
     args = parser.parse_args(argv)
     try:
         print(json.dumps(activate(args), ensure_ascii=False))

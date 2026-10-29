@@ -1,6 +1,14 @@
 # Codex setup
 
-Keep the owner's bot name, messenger account, memory and onboarding consent. Managed work lanes use the configured Codex version pin (default **0.163.0**). Attached leads support matching CLI/daemon pairs **0.163.0/0.163.0**, **0.164.0/0.164.0** and **0.165.0/0.165.0**, validated against the local protocol and attachment tests. Other pairs remain held. Use `runtime.externalBinary` for the shared daemon CLI when managed `runtime.binary` points to a pinned release. Changing externalBinary does not alter managed startup. After a supported daemon update, explicitly attach the same session again; do not detach first, because eligible pending input belongs to the existing attachment.
+Keep the owner's bot name, messenger account, memory and onboarding consent. Managed work lanes use the configured Codex version pin (default **0.163.0**). Attached leads validate matching CLI/daemon versions, the queue command and required read-only API response contracts instead of a release allowlist. Optional goal observation can degrade without blocking otherwise verified messaging. Use a stable `runtime.externalBinary` path for the shared daemon CLI when managed `runtime.binary` points to a pinned release. Changing externalBinary does not alter managed startup.
+
+Compatible updates reconnect the same verified Herdr pane/thread/cwd and daemon socket automatically, preserving the existing attachment and eligible pending input. Failed reconnects use bounded retries; identity changes and operator holds require explicit intervention. `lead-attach` remains an explicit same-session retry. Do not detach just to update Codex. The service never upgrades, starts, stops or replaces the owner's daemon.
+
+For a different lead session, an operator first runs `lead-handoff-preview --from-thread-id OLD --thread-id NEW --pane PANE --cwd DIR`. Apply with `lead-handoff` using the same identities, a stable `--operation-id`, and repeated `--mail-id` selections (or explicit `--no-mail`). Preview is read-only. Only selected eligible queued messages transfer; sent, sending, unknown, receipted and reconciled messages remain untouched. The operation is durable and repeatable with the same ID and arguments. Never automatically replace another live lead or replay uncertain messages.
+
+`dori health` reports service startup/recovery and delivery health separately. Before RPC is available, the operator CLI can read sanitized startup progress; a live PID or saved ready state is not proof of readiness. Scoped clients must authenticate and cannot use this local fallback. Ingress process status is not a claim that Slack's network connection is healthy; inspect recent accepted events and delivery backlog separately.
+
+Registry updates that do not change state do not append snapshots. Startup reads records incrementally and restores each lane once; automatic durable compaction bounds retained state. Do not delete journal or mailbox files to speed up a restart. Preserve backups before operating on durable state.
 
 ## Install
 

@@ -17,7 +17,7 @@ Reuse the existing owner-selected identity. For a genuinely new installation wit
 
 These are new-installation steps only. An assigned worker executes its brief and does not onboard the owner, start a service, or activate a lead. Existing installations keep their identity and messenger configuration. Details: `references/setup.md`.
 
-1. Use Codex CLI 0.163.0 and Herdr. Start Iyen in the existing conversation with the `iyen` activation skill. A separate lead session is never created. Worker lanes use their own managed Codex TUIs and protected app-server endpoints.
+1. Use Codex CLI and Herdr. Attached leads validate matching CLI/daemon versions and required messaging capabilities; managed workers retain their configured version pin (default 0.163.0). Start Iyen in the existing conversation with the `iyen` activation skill. A separate lead session is never created. Worker lanes use their own managed Codex TUIs and protected app-server endpoints.
 2. Install agent-messenger, ask the owner which platform (Telegram, Discord, Slack, ...), and wait for the answer. If it is Slack, also ask: user token (a real member with a paid seat the owner pays for, sees everything that member sees, can show online) or bot token (an app, no seat cost, only invited channels and its scopes). Give that trade-off in one short list and wait.
 3. Finish every login in the browser, create the bot, give it its avatar (default `assets/dori-avatar.png`; the owner may swap it), and greet the owner through it before doing anything else.
 4. Install the scripts in `scripts/` (one command, see `references/setup.md`) and write `~/.dori/config.json` from `references/config.example.json`.
