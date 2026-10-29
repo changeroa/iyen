@@ -23,8 +23,10 @@ or automatic archive cycle.
 
 After reading a Slack message, add an "eyes" reaction to that message through
 the configured bot account. Leave it as the read receipt when work finishes.
-Send the actual result in the thread; do not add a routine start/finish notice
-or infer completion from an idle agent. Share meaningful progress when useful,
+Also send a message reply in the original thread for every owner message read.
+Greetings, short comments, and tests still get a brief natural reply; a reaction
+alone is insufficient. For work, send the actual result; do not add a routine
+start/finish notice or infer completion from an idle agent. Share meaningful progress when useful,
 without a fixed posting schedule. The lead follows this policy through its skill;
 runtime state monitors do not write conversational acknowledgments.
 
