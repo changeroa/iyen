@@ -228,7 +228,7 @@ test("owner ingress arriving during the activation turn reaches this same lead w
   expect(h.getTurns()[0].status).toBe("inProgress"); expect(h.agent.agent_status).toBe("working");
   const restarted = new DoriService(h.config, h.run); await restarted.tick();
   expect(restarted.inbox.get(id)).toMatchObject({ state: "sent", turnId: "owner-turn" }); expect(promptCalls()).toHaveLength(1);
-  expect(promptCalls()[0]?.[4]).toBe(operationText("Owner message in chat:owner:\nContinue the authorized task", id));
+  expect(promptCalls()[0]?.[4]).toBe(operationText("Owner message in chat:owner:\nSource message ID: owner-message\nContinue the authorized task", id));
 });
 
 test("queued input bound to an older generation is never sent to a newer attachment", async () => {
@@ -373,19 +373,19 @@ test("restart automatically revalidates and rebinds a matching runtime upgrade",
   expect(queueCalls()).toHaveLength(0);
 });
 
-test("held, detached, missing and unavailable lead ACKs promise saved intake and waiting reconnection", async () => {
+test("held, detached, missing and unavailable lead intake stays durable without ACK prose", async () => {
   const receive = (id: string) => h.s.receive("test", { id, user: "owner", thread: "chat:owner", text: "continue" });
-  const ack = (id: string) => h.s.outbox.get(`ack:inbound:test:chat:owner:${id}`)?.text;
-  await receive("missing"); expect(ack("missing")).toBe("Received and saved. Delivery is waiting for the lead to reconnect.");
-  await attach(); await receive("active"); expect(ack("active")).toBeUndefined();
-  h.versions("0.163.0", "0.164.0"); await receive("held"); expect(ack("held")).toBe(ack("missing"));
+  await receive("missing");
+  await attach(); await receive("active");
+  h.versions("0.163.0", "0.164.0"); await receive("held");
   const status = await h.s.handle("status", { key: "lead" }, { role: "admin" });
   expect(status.runtime.external.holdReason).toMatchObject({ code: "runtime-version-changed", at: expect.any(String) });
-  await h.s.handle("lead-detach", { threadId }, { role: "admin" }); await receive("detached"); expect(ack("detached")).toBe(ack("missing"));
-  h.versions("0.164.0"); await attach(); h.unavailable(); await receive("unavailable"); expect(ack("unavailable")).toBe(ack("missing"));
-  expect(h.s.inbox.get("inbound:test:chat:owner:unavailable")?.state).toBe("queued");
+  await h.s.handle("lead-detach", { threadId }, { role: "admin" }); await receive("detached");
+  h.versions("0.164.0"); await attach(); h.unavailable(); await receive("unavailable");
+  for (const id of ["missing", "active", "held", "detached", "unavailable"])
+    expect(h.s.inbox.get(`inbound:test:chat:owner:${id}`)?.state).toBe("queued");
   expect(await h.s.handle("status", { key: "lead" }, { role: "admin" })).toMatchObject({ readiness: "held", runtime: { external: { holdReason: { code: "runtime-unavailable" } } } });
-  expect(JSON.stringify(h.s.outbox.list())).not.toMatch(/private-token|private\/socket|Bearer/); expect(queueCalls()).toHaveLength(0);
+  expect(h.s.outbox.list()).toEqual([]); expect(h.calls.filter(argv => argv[0] === "notify")).toEqual([]); expect(queueCalls()).toHaveLength(0);
 });
 
 
@@ -471,7 +471,7 @@ test("candidate rebind requires every identity read to succeed before changing p
   expect((await h.s.registry.read("lead"))!.runtime!.binaryVersion).toBe("0.163.0"); expect(queueCalls()).toHaveLength(0);
 });
 
-test("untrusted version output and observer connection failure leave sanitized holds and saved ACKs", async () => {
+test("untrusted version output and observer connection failure leave sanitized holds and silent durable intake", async () => {
   await attach(); h.versions("Bearer private-token /private/socket");
   const unsupported = await h.s.handle("status", { key: "lead" }, { role: "admin" });
   expect(unsupported.runtime.external.holdReason).toMatchObject({ code: "runtime-incompatible", message: expect.stringContaining("unrecognized") });
@@ -479,7 +479,7 @@ test("untrusted version output and observer connection failure leave sanitized h
   h.versions("0.163.0"); await attach(); h.server.stop(true);
   await h.s.receive("test", { id: "offline", user: "owner", thread: "chat:owner", text: "save while unavailable" });
   expect(h.s.inbox.get("inbound:test:chat:owner:offline")?.state).toBe("queued");
-  expect(h.s.outbox.get("ack:inbound:test:chat:owner:offline")?.text).toContain("Delivery is waiting");
+  expect(h.s.outbox.list()).toEqual([]); expect(h.calls.filter(argv => argv[0] === "notify")).toEqual([]);
   expect(await h.s.handle("status", { key: "lead" }, { role: "admin" })).toMatchObject({ readiness: "held", runtime: { external: { holdReason: { code: "runtime-unavailable" } } } });
   expect(queueCalls()).toHaveLength(0);
 });
