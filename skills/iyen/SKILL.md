@@ -64,8 +64,10 @@ running session. Existing sandbox and approval constraints still apply.
 - Inspect `mail list` for uncertain operations. A queued prompt is not a delivery
   receipt. Never automatically replay an unknown message or launch.
 
-The service retains messages while this conversation is busy. It delivers when
-this session is ready and verifies the actual turn receipt. The user owns the
+The service delivers eligible messages to this conversation while it is idle or
+working. Working-session input goes through the verified Herdr TUI and can join
+the current turn; the service verifies its exact operation receipt. Approval,
+user-input and explicit holds still defer delivery. The user owns the
 session and shared Codex daemon; the service does not restart or kill them. If the
 session is closed or its identity changes, delivery is held until an explicit
 verified activation. Do not describe a held delivery queue as a paused Codex task.

@@ -28,7 +28,7 @@ dori serve
 python3 /path/to/iyen/skills/iyen/scripts/activate.py start --session UUID --pane PANE
 ```
 
-`skills/iyen` 폴더를 `~/.codex/skills/iyen`에 연결하면 시작 스킬을 사용할 수 있습니다. 리드 제어에는 시작 결과의 `bridge` 실행 경로를 사용합니다. `stop --session UUID`는 이연 연결만 해제하고 현재 대화는 유지합니다. 대화가 작업 중이면 메시지는 대기하며, 세션을 닫으면 전달이 보류됩니다.
+`skills/iyen` 폴더를 `~/.codex/skills/iyen`에 연결하면 시작 스킬을 사용할 수 있습니다. 리드 제어에는 시작 결과의 `bridge` 실행 경로를 사용합니다. `stop --session UUID`는 이연 연결만 해제하고 현재 대화는 유지합니다. 작업 중에도 전달 가능한 메시지는 신원이 확인된 Herdr TUI를 통해 현재 응답이 끝나기 전에 입력됩니다. 세션에 연결할 수 없거나 승인·사용자 입력을 기다리는 상태, 명시적으로 보류한 상태에서는 전달을 보류합니다.
 
 `doctor`는 버전·프로토콜·인증 상태·모델을 확인하며 모델 추론을 호출하지 않습니다. Codex의 기존 로그인을 사용하고, 토큰을 설정 파일에 저장하지 않습니다.
 

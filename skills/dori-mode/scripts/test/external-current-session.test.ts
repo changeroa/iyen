@@ -32,6 +32,12 @@ function fixture() {
     calls.push([...argv]); const ok = (result: unknown) => ({ code: 0, err: "", out: JSON.stringify(result) });
     if (argv[0] === "notify") return ok({});
     if (argv[0] === "herdr") {
+      if (argv[1] === "agent" && argv[2] === "prompt") {
+        if (accept) turns.find(t => t.status === "inProgress")!.items.push({ type: "userMessage", content: [{ type: "text", text: argv[4] }] });
+        if (loseOnQueue) agent.agent_session.value = otherId;
+        if (queueThrows) throw new Error("transport disconnect");
+        return { code: queueCode, err: "", out: "submitted" };
+      }
       if (argv[1] === "agent" && argv[2] === "get") { if (++getCount >= driftAtGet) agent.agent_session.value = otherId; return ok({ result: { agent } }); }
       if (argv[1] === "agent" && argv[2] === "list") return ok({ result: { agents: [agent] } });
       if (argv[1] === "pane" && argv[2] === "list") return ok({ result: { panes: [agent] } });
@@ -51,8 +57,8 @@ function fixture() {
   return { state, s, args, config, run, calls, reads, thread, agent, server,
     versions(client: string, daemon = client) { cliVersion = client; serverVersion = daemon; },
     socket(value: string) { reportedSocket = value; }, unavailable(value = true) { unavailable = value; }, setTurns: (v: any[]) => turns = v, getTurns: () => turns, failQueuedTurn: () => failQueuedTurn = true,
-    busy() { thread.status = { type: "active", activeFlags: [] }; turns = [{ id: "owner-turn", status: "inProgress", items: [] }]; },
-    idle() { thread.status = { type: "idle" }; turns = turns.map(t => ({ ...t, status: "completed" })); },
+    busy() { agent.agent_status = "working"; thread.status = { type: "active", activeFlags: [] }; turns = [{ id: "owner-turn", status: "inProgress", items: [] }]; },
+    idle() { agent.agent_status = "idle"; thread.status = { type: "idle" }; turns = turns.map(t => ({ ...t, status: "completed" })); },
     unloaded() { loaded = false; thread.status = { type: "notLoaded" }; }, noReceipt() { accept = false; },
     queueFailure() { queueCode = 1; }, queueDisconnect() { queueThrows = true; }, loseOnQueue() { loseOnQueue = true; },
     driftBeforeSend() { driftAtGet = getCount + 3; }, done() { s.stop(); server.stop(true); state.done(); } };
@@ -62,6 +68,7 @@ afterEach(() => h.done());
 const attach = () => h.s.handle("lead-attach", h.args, { role: "admin" });
 const input = (id = "owner-input", text = "literal $(x) `x`") => h.s.handle("input", { key: "lead", text, operationId: id }, { role: "admin" });
 const queueCalls = () => h.calls.filter(a => a[1] === "queue" && a[2] !== "--help");
+const promptCalls = () => h.calls.filter(a => a[0] === "herdr" && a[2] === "prompt");
 
 test("attach current running session retains identity/model/effort, uses no TUI/backend launch, and is idempotent", async () => {
   h.busy(); const first = await attach(), second = await attach();
@@ -107,11 +114,12 @@ test("user model and effort changes are observed without changing settings or in
   expect(h.thread.model).toBe("user-selected-model"); expect(h.thread.reasoningEffort).toBeNull();
 });
 
-test("busy inputs remain queued, then deliver exact operation receipt to the same thread once", async () => {
-  h.busy(); await attach(); expect(await input()).toMatchObject({ queued: true }); expect(h.s.inbox.get("owner-input")?.state).toBe("queued"); expect(queueCalls()).toHaveLength(0);
-  h.idle(); await h.s.tick(); expect(h.s.inbox.get("owner-input")).toMatchObject({ state: "sent", turnId: "real-turn-id" });
-  expect(queueCalls()[0]?.slice(1)).toEqual(["queue", "--thread", threadId, "--message", operationText("literal $(x) `x`", "owner-input")]);
-  await input(); expect(queueCalls()).toHaveLength(1);
+test("working inputs steer the same active turn with an exact operation receipt once", async () => {
+  h.busy(); await attach(); expect(await input()).toEqual({ turnId: "owner-turn" });
+  expect(h.s.inbox.get("owner-input")).toMatchObject({ state: "sent", turnId: "owner-turn" }); expect(queueCalls()).toHaveLength(0);
+  expect(promptCalls()[0]).toEqual(["herdr", "agent", "prompt", h.args.pane, operationText("literal $(x) `x`", "owner-input")]);
+  expect(h.getTurns()).toHaveLength(1); expect(h.getTurns()[0].status).toBe("inProgress"); expect(h.agent.agent_status).toBe("working");
+  await input(); await h.s.tick(); expect(promptCalls()).toHaveLength(1); expect(queueCalls()).toHaveLength(0);
 });
 
 test("unconfirmed queue attempt stays unknown across restart and is never replayed", async () => {
@@ -211,14 +219,16 @@ test("the internal managed-host entrypoints cannot boot an old lead credential",
   expect(h.calls).toHaveLength(0);
 });
 
-test("owner ingress arriving during the activation turn remains queued and reaches this same lead once idle", async () => {
+test("owner ingress arriving during the activation turn reaches this same lead while working", async () => {
   h.busy(); await attach(); const event = { id: "owner-message", user: "owner", thread: "chat:owner", text: "Continue the authorized task" };
-  await h.s.receive("test", event); await h.s.tick(); expect(queueCalls()).toHaveLength(0);
+  await h.s.receive("test", event);
   const id = "inbound:test:chat:owner:owner-message"; expect(h.s.inbox.get(id)).toMatchObject({ state: "queued", target: "lead" });
-  h.idle(); // A fresh service represents the next inbox tick without wall-clock waiting.
+  await h.s.tick();
+  expect(h.s.inbox.get(id)).toMatchObject({ state: "sent", turnId: "owner-turn" }); expect(promptCalls()).toHaveLength(1); expect(queueCalls()).toHaveLength(0);
+  expect(h.getTurns()[0].status).toBe("inProgress"); expect(h.agent.agent_status).toBe("working");
   const restarted = new DoriService(h.config, h.run); await restarted.tick();
-  expect(restarted.inbox.get(id)).toMatchObject({ state: "sent", turnId: "real-turn-id" }); expect(queueCalls()).toHaveLength(1);
-  expect(queueCalls()[0]?.[5]).toBe(operationText("Owner message in chat:owner:\nContinue the authorized task", id));
+  expect(restarted.inbox.get(id)).toMatchObject({ state: "sent", turnId: "owner-turn" }); expect(promptCalls()).toHaveLength(1);
+  expect(promptCalls()[0]?.[4]).toBe(operationText("Owner message in chat:owner:\nContinue the authorized task", id));
 });
 
 test("queued input bound to an older generation is never sent to a newer attachment", async () => {
@@ -308,7 +318,7 @@ test("external support accepts matching pairs independent of the managed version
 
 for (const upgradeVersion of ["0.164.0", "0.165.0"]) test(`same-session 163 to ${upgradeVersion} reattach preserves accepted mail, capability and historical exclusions`, async () => {
   h.s.inbox.put({ id: "history", target: "lead", text: "old", state: "queued", at: "2020-01-01" });
-  h.busy(); await attach();
+  h.busy(); h.thread.status.activeFlags = ["waitingOnApproval"]; await attach();
   const path = join(h.state.dir, "attachments/lead.json"), saved = readJson<any>(path);
   // Represent the resolved release executable changing without a live daemon.
   saved.binary = "/fixture/codex-163"; atomicJson(path, saved);
@@ -417,7 +427,7 @@ test("old in-flight observation settles before rebind and cannot re-hold the con
 
 for (const boundary of ["intent", "attachment"] as const) test(`interrupted rebind after ${boundary} keeps capability and repairs automatically`, async () => {
   h.s.inbox.put({ id: "historic-rebind", target: "lead", text: "history", state: "queued", at: "2020-01-01" });
-  h.busy(); await attach();
+  h.busy(); h.thread.status.activeFlags = ["waitingOnApproval"]; await attach();
   const path = join(h.state.dir, "attachments/lead.json"), saved = readJson<any>(path);
   await input("eligible-rebind"); const before = structuredClone(h.s.inbox.list());
   h.versions("0.164.0");

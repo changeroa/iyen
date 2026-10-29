@@ -23,6 +23,7 @@ function fixture() {
   let turns: any[] = [], loaded: any = { data: [threadId], nextCursor: null }, goal: any = { goal: null };
   let failMethod: string | undefined, failCode = -32601, gets = 0, driftAt = Infinity;
   let onQueue = (_argv: readonly string[]) => {};
+  let onPrompt = (_argv: readonly string[]) => {};
   const observer = observerFor(method => {
     if (method === failMethod) throw new RpcError("Bearer secret private response", failCode);
     if (method === "thread/read") return { thread };
@@ -38,6 +39,7 @@ function fixture() {
       return ok({ result: { agent } });
     }
     if (argv[1] === "queue") { onQueue(argv); return ok({}); }
+    if (argv[0] === "herdr" && argv[2] === "prompt") { onPrompt(argv); return ok({}); }
     throw new Error("Unexpected command");
   };
   const clock = { at: 0, now: () => clock.at, sleep: async (ms: number) => { clock.at += ms; } };
@@ -45,7 +47,7 @@ function fixture() {
   return { session, observer, thread, agent, calls, lost, onLoss: async (error: unknown) => { lost.push(error); },
     setTurns(value: any[]) { turns = value; }, setLoaded(value: any) { loaded = value; }, setGoal(value: any) { goal = value; },
     fail(method: string, code = -32601) { failMethod = method; failCode = code; },
-    driftAt(get: number) { driftAt = get; }, onQueue(fn: typeof onQueue) { onQueue = fn; },
+    driftAt(get: number) { driftAt = get; }, onQueue(fn: typeof onQueue) { onQueue = fn; }, onPrompt(fn: typeof onPrompt) { onPrompt = fn; },
   };
 }
 
@@ -191,11 +193,15 @@ test("valid multiple pages retain full exact receipt evidence", async () => {
   expect(receiptInTurns(await readTurns(observer, threadId), marked)).toBe("older");
 });
 
-test("Codex active turns and approval/input flags remain dispatch safety gates", async () => {
+test("Codex active turns steer while approval/input flags remain dispatch safety gates", async () => {
   for (const [flags, state] of [[[], "running"], [["waitingOnApproval"], "waiting_approval"], [["waitingOnUserInput"], "waiting_input"]] as const) {
     const h = fixture(); h.thread.status = { type: "active", activeFlags: flags }; h.setTurns([{ ...turn("active"), status: "inProgress" }]);
     expect(await h.session.inspect()).toMatchObject({ state, activeTurnId: "active" });
-    await expect(h.session.input("task", "codex-active", h.onLoss)).rejects.toBeInstanceOf(DeliveryDeferred);
+    if (state === "running") {
+      h.onPrompt(argv => h.setTurns([{ ...turn("active", argv[4]), status: "inProgress" }]));
+      expect(await h.session.input("task", "codex-active", h.onLoss)).toEqual({ turnId: "active" });
+      expect(h.calls.filter(argv => argv[2] === "prompt")).toHaveLength(1);
+    } else await expect(h.session.input("task", "codex-active", h.onLoss)).rejects.toBeInstanceOf(DeliveryDeferred);
     expect(h.calls.some(argv => argv[1] === "queue")).toBe(false);
   }
   const h = fixture(); h.setTurns([{ ...turn("active"), status: "inProgress" }]);
@@ -236,12 +242,14 @@ test("missing cwd diagnostics never echo an untrusted path", async () => {
   expect(error.code).toBe("runtime-unavailable"); expect(error.message).not.toMatch(/secret|private/);
 });
 
-test("Herdr done dispatches only after exact loaded idle Codex identity and no active turn verify", async () => {
+test("Herdr done steers a verified Codex active turn and queues only after Codex becomes idle", async () => {
   const h = fixture(); h.agent.agent_status = "done";
   expect(await h.session.inspect()).toMatchObject({ state: "idle" });
   h.setTurns([{ ...turn("active"), status: "inProgress" }]);
   expect(await h.session.inspect()).toMatchObject({ state: "running", activeTurnId: "active" });
-  await expect(h.session.input("task", "done-active", h.onLoss)).rejects.toBeInstanceOf(DeliveryDeferred);
+  h.onPrompt(argv => h.setTurns([{ ...turn("active", argv[4]), status: "inProgress" }]));
+  expect(await h.session.input("task", "done-active", h.onLoss)).toEqual({ turnId: "active" });
+  expect(h.calls.filter(argv => argv[2] === "prompt")).toHaveLength(1);
   expect(h.calls.some(argv => argv[1] === "queue")).toBe(false);
   h.thread.status = { type: "active", activeFlags: ["waitingOnApproval"] };
   expect(await h.session.inspect()).toMatchObject({ state: "waiting_approval" });

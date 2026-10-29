@@ -28,7 +28,7 @@ dori serve
 python3 /path/to/iyen/skills/iyen/scripts/activate.py start --session UUID --pane PANE
 ```
 
-Install the activation skill by linking `/path/to/iyen/skills/iyen` into `~/.codex/skills/iyen`. The helper returns a scoped executable; lead commands use that path rather than an old `dori` from PATH. `stop --session UUID` detaches routing while leaving the Codex conversation open. The service holds delivery while the session is busy or unavailable.
+Install the activation skill by linking `/path/to/iyen/skills/iyen` into `~/.codex/skills/iyen`. The helper returns a scoped executable; lead commands use that path rather than an old `dori` from PATH. `stop --session UUID` detaches routing while leaving the Codex conversation open. Eligible messages reach a working session through its verified Herdr TUI without waiting for the current response to finish. Delivery remains held while the session is unavailable, awaiting approval or user input, or explicitly held.
 
 Doctor checks the pinned runtime, protocol, authentication metadata and models without calling a model. A local Codex login is used normally; secrets stay out of config and logs. No default model replacement occurs on failure.
 

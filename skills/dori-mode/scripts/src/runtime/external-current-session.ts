@@ -120,18 +120,26 @@ export class ExternalCurrentSession {
       catch (error) { await onIdentityLoss(error); throw new DeliveryDeferred("Attached identity unavailable; dispatch held"); }
     };
     const snap = await verify();
-    if (snap.state !== "idle") throw new DeliveryDeferred("Attached session busy; input remains queued");
+    if (!["idle", "running"].includes(snap.state)) throw new DeliveryDeferred("Attached session requires approval or input; dispatch held");
     const marked = operationText(text, id);
     // Read-only reconciliation is allowed; an uncertain prior send is never
     // resubmitted by this adapter. Mailbox enforces that before invoking us.
     const prior = await receipt(this.observer, this.identity.threadId, marked);
     if (prior) return { turnId: prior };
-    if ((await verify()).state !== "idle") throw new DeliveryDeferred("Attached session busy; input remains queued");
+    const ready = await verify();
+    if (!["idle", "running"].includes(ready.state) || ready.state === "running" && !ready.activeTurnId)
+      throw new DeliveryDeferred("Attached session not ready for input; dispatch held");
+    // CLI queue defers until the current turn ends. Herdr submits through the
+    // verified TUI so a working lead receives this input during its active turn.
+    // Choose once: an uncertain submission must never fall back to another path.
+    const command = ready.state === "running"
+      ? ["herdr", "agent", "prompt", this.identity.pane, marked]
+      : [this.binary, "queue", "--thread", this.identity.threadId, "--message", marked];
     let failure: unknown;
     try {
-      const result = await this.run([this.binary, "queue", "--thread", this.identity.threadId, "--message", marked], { timeoutMs: this.config.rpcTimeoutMs });
-      if (result.code !== 0) failure = new Error("Codex queue submission outcome unknown");
-    } catch { failure = new Error("Codex queue submission outcome unknown"); }
+      const result = await this.run(command, { timeoutMs: this.config.rpcTimeoutMs });
+      if (result.code !== 0) failure = new Error("Codex input submission outcome unknown");
+    } catch { failure = new Error("Codex input submission outcome unknown"); }
     const deadline = this.clock.now() + this.config.rpcTimeoutMs;
     do {
       // Verify borrowed identity before accepting any observed receipt too.
@@ -140,7 +148,7 @@ export class ExternalCurrentSession {
       if (turnId) return { turnId };
       await this.clock.sleep(100);
     } while (this.clock.now() < deadline);
-    throw failure ?? new Error("Queue receipt unknown; reconcile before retry");
+    throw failure ?? new Error("Input receipt unknown; reconcile before retry");
   }
 }
 
