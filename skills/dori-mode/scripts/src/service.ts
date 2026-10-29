@@ -10,7 +10,6 @@ import { claimDone, closeLane, objectDone, watchTick, type FlowDeps } from "./do
 import { pauseLane, resumeLane } from "./pause.ts";
 import { launchLane, quoteForPane, validateLaunch, LaunchError, type LaunchInput } from "./launch.ts";
 import { freshnessTick } from "./freshness.ts";
-import { herdrProgressTick } from "./herdr-progress.ts";
 import { deadPaneTick } from "./dead-panes.ts";
 import { syncRegistry } from "./sync.ts";
 import { sampleHost, guardTick } from "./host-guard.ts";
@@ -904,22 +903,13 @@ export class DoriService {
     }
     const target = known && statusOf(known) !== "closed" ? known.key : "lead";
     const intakeLane = target === "lead" ? await this.registry.read("lead") : null;
-    this.putInbox({ id, target, attachmentInstance: this.intakeInstance(intakeLane), thread: event.thread, text: `Owner message in ${event.thread}${known && statusOf(known) === "closed" ? ` (closed lane ${known.key}; reopen if appropriate)` : ""}:\n${event.text}`, source, state: "queued", at: new Date().toISOString() });
+    const envelope = `Owner message in ${event.thread}${known && statusOf(known) === "closed" ? ` (closed lane ${known.key}; reopen if appropriate)` : ""}:`;
+    // Retries of pre-metadata intake must retain the original operation text,
+    // including when its delivery is uncertain. New events carry the source ID.
+    const previous = this.inbox.get(id);
+    const text = previous?.text === `${envelope}\n${event.text}` ? previous.text : `${envelope}\nSource message ID: ${event.id}\n${event.text}`;
+    this.putInbox({ id, target, attachmentInstance: this.intakeInstance(intakeLane), thread: event.thread, text, source, state: "queued", at: new Date().toISOString() });
     this.ingressHealth.set(source, { process: this.ingressHealth.get(source)?.process ?? "starting", lastAcceptedAt: new Date().toISOString() });
-    if (this.config.hooks.threadReply) {
-      let waiting = false;
-      if (target === "lead") {
-        const lead = await this.registry.read("lead");
-        // Intake is already durable. Observer failure chooses an honest waiting
-        // ACK; neither acceptance nor ACK requires successful observation.
-        if (lead?.runtime?.backend === "external-current-session" && !lead.dispatchBlocked && !lead.runtime.external?.detachedAt && lead.runtime.state !== "stopped")
-          await this.deps.runtime.inspect("lead").catch(() => { waiting = true; });
-        const current = await this.registry.read("lead");
-        waiting ||= !current || Boolean(current.dispatchBlocked || current.runtime?.held || current.runtime?.external?.detachedAt) || !current.runtime || ["failed", "recovering", "stopped", "starting"].includes(current.runtime.state);
-      }
-      if (waiting) await this.deps.post!(`ack:${id}`, this.config.hooks.threadReply, { key: target, thread: event.thread,
-        text: "Received and saved. Delivery is waiting for the lead to reconnect." }).catch(() => { /* inbox acceptance does not depend on outbound delivery */ });
-    }
   }
   tick(): Promise<void> { return this.withIntake(() => this.tickScoped()); }
   private async tickScoped(): Promise<void> {
@@ -927,7 +917,7 @@ export class DoriService {
       await this.deps.runtime.inspect("lead").catch(() => {}); await this.health(); return;
     }
     const once = async (name: string, fn: () => Promise<unknown>) => {
-      const interval = name === "inbox" || name === "failures" || name === "external-observation" ? 1000 : name === "herdr-progress" ? 5000 : name === "done" ? 30000 : name === "launch-queue" ? 10000 : 60000;
+      const interval = name === "inbox" || name === "failures" || name === "external-observation" ? 1000 : name === "done" ? 30000 : name === "launch-queue" ? 10000 : 60000;
       if (this.ticks.has(name) || Date.now() - (this.lastTick.get(name) ?? 0) < interval) return;
       this.lastTick.set(name, Date.now()); this.ticks.add(name);
       try { await fn(); } catch { console.error(`MONITOR_ERROR ${name}`); } finally { this.ticks.delete(name); }
@@ -938,11 +928,6 @@ export class DoriService {
         if (lead?.runtime?.backend === "external-current-session" && lead.runtime.state !== "stopped" && !lead.runtime.external?.detachedAt) await this.deps.runtime.inspect(lead.key).catch(() => {});
       }),
       once("failures", () => this.notifyFailures()),
-      once("herdr-progress", () => herdrProgressTick(this.deps, (turnId, instance) => {
-        const threads = [...new Set(this.inbox.list().filter(row => row.target === "lead" && row.state === "sent" && row.turnId === turnId &&
-          row.attachmentInstance === instance && row.thread && row.thread !== "none").map(row => row.thread))];
-        return threads.length === 1 ? threads[0] : undefined;
-      })),
       once("done", () => watchTick(this.deps).then(lines => lines.forEach(l => console.log(l)))),
       once("freshness", () => freshnessTick(this.deps, process.env.HOME ?? "")),
       once("runtime-health", async () => {

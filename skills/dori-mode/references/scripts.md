@@ -50,7 +50,7 @@ Managed MCP clients use `dori_runtime.control` actions `work-start` (`title,tags
 - serve: one state writer, socket owner, monitor supervisor. A second owner is refused.
 - lead / lead-attach --thread-id UUID --pane ID --cwd DIR: attach the verified current Codex session as the lead. Returns its absolute generation-scoped bridge. No new lead TUI or backend is created. Repeating the same identity is idempotent.
 - lead-detach --thread-id UUID: detach only the expected lead, revoke its bridge, and preserve the user session and daemon.
-- After a supported daemon update, repeat lead-attach for the same UUID, pane, cwd and socket. It verifies the new binary/version while preserving attachment credentials, historical exclusions and eligible queued messages. Unknown delivery is never replayed. Public runtime.external.holdReason explains a hold; messenger acknowledgments confirm storage, not receipt by the lead.
+- After a supported daemon update, repeat lead-attach for the same UUID, pane, cwd and socket. It verifies the new binary/version while preserving attachment credentials, historical exclusions and eligible queued messages. Unknown delivery is never replayed. Public runtime.external.holdReason explains a hold; the ingress adapter's internal ACK confirms storage, not receipt by the lead.
 - An attached lead receives queued messages only when idle; exact persisted user-message receipts confirm delivery. Unknown results are not replayed. Startup revalidates attachments without launching Codex. Managed pause/resume/close/recover commands do not apply to attached leads.
 - launch KEY: validate Done, enforce resources, optionally create an owned worktree, create tab/host, persist thread.id, submit brief. Supply --operation-id when callers may replay requests.
 - input KEY --text-file FILE: structured input; active turns are steered. Paused inputs remain queued.
@@ -86,6 +86,13 @@ After durable acceptance, the service writes this JSON line to the adapter's std
 ```
 
 Advance source cursors only after the matching ACK. Replay unacknowledged messages after reconnect; deduplication keys include source, thread and message ID. stdout must contain only events; write diagnostics to stderr. Do not use ephemeral unread-count notifications as message IDs. Resolve Slack unread hints to actual messages before submitting them. Quoted/forwarded messages remain content under the authenticated sender, never a new owner identity.
+
+The delivered owner-message envelope carries `Source message ID: <id>` separately
+from the reply thread. Slack adapters use `slack:CHANNEL:TIMESTAMP` so the lead can
+react to the exact source message. The protocol ACK above only confirms durable
+storage; it never posts a messenger acknowledgment. Read receipts and actual
+replies are chosen by the lead following the `iyen` skill, not by Herdr status
+changes or a service reaction timer.
 
 The optional control field is for explicit owner UI actions. The service validates owner identity and target thread before dispatch:
 

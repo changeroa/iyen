@@ -31,7 +31,6 @@ export type Lane = {
   readonly resumeRefs?: Readonly<Record<string, { sha: string; branch?: string }>>;
   readonly cleanupFence?: string;
   readonly report?: { id: string; kind: string; text: string; at: number };
-  readonly herdrProgress?: { instance: string; status: "working" | "blocked" | "idle"; sequence: number; turnId?: string; thread?: string };
   readonly legacy?: { sessionId?: string };
   readonly key: string;
   readonly title: string;

@@ -17,12 +17,16 @@ Reply in the language the owner used in that thread.
 
 ## Threads
 
-Each piece of work gets its own thread (or topic) with:
+Keep replies in the owner's original thread or topic. Use a new thread when a
+separate task needs one; there is no mandatory status message, status prefix,
+or automatic archive cycle.
 
-- one status message you edit in place: `working: <work> · <time elapsed>` while working, `done: <work>` when done;
-- a status word at the start of the thread name: `[working]`, `[waiting]` (on the owner or someone else), `[done]`.
-
-When the work is done, remove your "eyes" reaction and close (archive) the thread. If the owner writes in a closed thread, reopen it, set it back to `[working]`, and carry on there. Threads the owner started get the same treatment.
+After reading a Slack message, add an "eyes" reaction to that message through
+the configured bot account. Leave it as the read receipt when work finishes.
+Send the actual result in the thread; do not add a routine start/finish notice
+or infer completion from an idle agent. Share meaningful progress when useful,
+without a fixed posting schedule. The lead follows this policy through its skill;
+runtime state monitors do not write conversational acknowledgments.
 
 ## Files
 

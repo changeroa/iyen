@@ -5,6 +5,7 @@ import { DoriService } from "../src/service.ts";
 import { readJson } from "../src/ipc.ts";
 import { atomicJson } from "../src/journal.ts";
 import { bootstrapPath } from "../src/runtime/session-host.ts";
+import { operationText } from "../src/runtime/herdr.ts";
 import type { Lane } from "../src/registry.ts";
 import { withState, fakeRunner, fakeClock, newWorld } from "./fakes.ts";
 let state:ReturnType<typeof withState>;let s:DoriService;
@@ -127,7 +128,7 @@ test("explicit operator handoff archives legacy control state, preserves old ide
 
 // A read-only observer transport keeps recovery tests in process; socket-level
 // protocol coverage belongs to the external-session and integration fixtures.
-async function externalFixture(progress = false) {
+async function externalFixture(notifications = false) {
  const { ExternalSessionError, sharedDaemon } = await import("../src/runtime/external-current-session.ts");
  const threadId="11111111-1111-4111-8111-111111111111", pane="test:pane", socketPath=join(state.dir,"exact-daemon.sock");
  let version="0.200.0", offline=false, identity=threadId, reportedSocket=socketPath, accept=true;
@@ -158,7 +159,7 @@ async function externalFixture(progress = false) {
   if(daemon.binaryVersion!==attachment.binaryVersion)throw new ExternalSessionError("runtime-version-changed","Shared Codex runtime version changed; verified reconnection required.");
   return action(observer);
  }};
- const config={...s.config,runtime:{...s.config.runtime,binary:process.execPath,rpcTimeoutMs:80},hooks:progress?{threadReply:["notify","{thread}","{text}"]}:{}};
+ const config={...s.config,runtime:{...s.config.runtime,binary:process.execPath,rpcTimeoutMs:80},hooks:notifications?{threadReply:["notify","{thread}","{text}"]}:{}};
  atomicJson(join(state.dir,"control.json"),{token:"admin"});
  s=new DoriService(config,runner,transport); const clock=fakeClock(Date.now());s.deps.clock=clock;
  const args={threadId,pane,cwd:state.dir};
@@ -166,19 +167,22 @@ async function externalFixture(progress = false) {
  const attachment=()=>readJson<any>(join(state.dir,"attachments/lead.json"));
  return {args,calls,clock,config,runner,transport,attachment,turns,
   busy(){threadStatus={type:"active",activeFlags:[]};agentStatus="working";turns.push({id:"running-turn",status:"inProgress",items:[]});},
+  status(value:string){agentStatus=value;if(value==="idle"||value==="done"){threadStatus={type:"idle"};for(const turn of turns)turn.status="completed";}},
   waiting(flag:string){threadStatus={type:"active",activeFlags:[flag]};},noReceipt(){accept=false;},
   version(v:string){version=v;},offline(v=true){offline=v;},identity(v=threadId){identity=v;},socket(v:string){reportedSocket=v;},
   prompts:()=>calls.filter(argv=>argv[0]==="herdr"&&argv[2]==="prompt"),queues:()=>calls.filter(argv=>argv[1]==="queue"&&argv[2]!=="--help")};
 }
 
 test("working Slack intake is durable before tick and steers the same active turn once across restart",async()=>{
- const h=await externalFixture();h.busy();
- const event={id:"working-slack",user:"owner",thread:"slack:owner",text:"continue while working"},id="inbound:test:slack:owner:working-slack";
+ const h=await externalFixture(true);h.busy();
+ const event={id:"slack:C:123.456",user:"owner",thread:"slack:C/100.000",text:"continue while working"},id=`inbound:test:${event.thread}:${event.id}`;
  await s.receive("test",event);expect(s.inbox.get(id)).toMatchObject({state:"queued",attachmentInstance:h.attachment().instance});
  expect(h.prompts()).toHaveLength(0);await s.tick();
  expect(s.inbox.get(id)).toMatchObject({state:"sent",turnId:"running-turn"});expect(h.turns[0].status).toBe("inProgress");
  expect(await s.deps.runtime.inspect("lead")).toMatchObject({state:"running",activeTurnId:"running-turn"});
  expect(h.prompts()).toHaveLength(1);expect(h.queues()).toHaveLength(0);
+ expect(h.prompts()[0]?.[4]).toBe(operationText("Owner message in slack:C/100.000:\nSource message ID: slack:C:123.456\ncontinue while working",id));
+ expect(s.inbox.get(id)?.thread).toBe(event.thread);expect(s.outbox.list()).toEqual([]);expect(h.calls.filter(argv=>argv[0]==="notify")).toEqual([]);
  s=new DoriService(h.config,h.runner,h.transport);await s.receive("test",event);await s.tick();
  expect(s.inbox.get(id)).toMatchObject({state:"sent",turnId:"running-turn"});expect(h.prompts()).toHaveLength(1);
 });
@@ -189,7 +193,7 @@ test("concurrent working input retries produce one TUI submission and one exact 
  expect(h.prompts()).toHaveLength(1);expect(h.queues()).toHaveLength(0);expect(h.turns[0].items).toHaveLength(1);expect(h.turns[0].status).toBe("inProgress");
 });
 
-for(const secondThread of ["slack:owner","slack:other"])test(`shared-turn progress ${secondThread==="slack:owner"?"notifies one distinct thread once":"does not route between distinct threads"}`,async()=>{
+for(const secondThread of ["slack:owner","slack:other"])test(`shared-turn Herdr status changes post no prose with reply destinations ${secondThread}`,async()=>{
  const h=await externalFixture(true);h.busy();const instance=h.attachment().instance;
  for(const [operationId,thread] of [["first-progress","slack:owner"],["second-progress",secondThread]] as const){
   expect(await s.handle("input",{key:"lead",text:operationId,operationId,thread},{role:"admin"})).toEqual({turnId:"running-turn"});
@@ -197,18 +201,59 @@ for(const secondThread of ["slack:owner","slack:other"])test(`shared-turn progre
  }
  expect(await s.deps.runtime.inspect("lead")).toMatchObject({state:"running",activeTurnId:"running-turn"});
  expect(h.turns[0].items).toHaveLength(2);expect(h.turns[0].status).toBe("inProgress");
- // These matching turn IDs must not contribute thread destinations.
- for(const [id,target,mailState,attachmentInstance] of [["wrong-target","worker","sent",instance],["not-sent","lead","unknown",instance],["old-instance","lead","sent","previous-instance"]] as const)
-  s.inbox.put({id,target,state:mailState,attachmentInstance,turnId:"running-turn",thread:"slack:decoy",text:id,at:"2020-01-01"});
- await s.tick();
- const expected=secondThread==="slack:owner"?1:0;
- expect(h.calls.filter(argv=>argv[0]==="notify")).toHaveLength(expected);expect(s.outbox.list()).toHaveLength(expected);
- if(expected){
-  expect(s.outbox.list()[0]).toMatchObject({id:`herdr-progress:lead:${instance}:1`,target:"slack:owner",state:"sent",text:"이연: 작업 진행 중입니다."});
-  expect(h.calls.find(argv=>argv[0]==="notify")).toEqual(["notify","slack:owner","이연: 작업 진행 중입니다."]);
- }else expect((await s.registry.read("lead"))!.herdrProgress).toBeUndefined();
- s=new DoriService(h.config,h.runner,h.transport);await s.tick();
- expect(h.calls.filter(argv=>argv[0]==="notify")).toHaveLength(expected);expect(s.outbox.list()).toHaveLength(expected);
+ for(const status of ["working","blocked","idle","done"]){
+  h.status(status);s=new DoriService(h.config,h.runner,h.transport);await s.tick();
+  expect(h.calls.filter(argv=>argv[0]==="notify")).toEqual([]);expect(s.outbox.list()).toEqual([]);
+ }
+});
+
+test("worker Herdr status changes post no prose while the lead is attached",async()=>{
+ const world=newWorld(),config={...s.config,hooks:{threadReply:["notify","{thread}","{text}"]}};
+ const agent={pane_id:"worker:pane",workspace_id:"w",agent:"codex",agent_status:"working",agent_session:{agent:"codex",kind:"id",value:"t1"}};
+ world.panes=[agent];
+ await s.registry.write({...lane,pane:agent.pane_id});
+ await s.registry.write({...lane,key:"lead",role:"lead",thread:"none",runtime:{...lane.runtime!,backend:"external-current-session"}});
+ for(const status of ["working","blocked","idle","done"]){
+  agent.agent_status=status;s=new DoriService(config,fakeRunner(world));
+  s.deps.runtime.inspect=async()=>({threadId:"t1",state:"idle",goal:null});
+  await s.tick();expect(world.calls.filter(argv=>argv[0]==="notify")).toEqual([]);expect(s.outbox.list()).toEqual([]);
+ }
+});
+
+test("ingress with no lead stays durable and silent; explicit replies still send once",async()=>{
+ const world=newWorld(),config={...s.config,hooks:{threadReply:["notify","{thread}","{text}"]}};
+ s=new DoriService(config,fakeRunner(world));
+ const event={id:"slack:C:123.456",thread:"slack:C/100.000",user:"owner",text:"saved request"},id=`inbound:test:${event.thread}:${event.id}`;
+ await s.receive("test",event);s=new DoriService(config,fakeRunner(world));await s.receive("test",event);
+ expect(s.inbox.list()).toHaveLength(1);expect(s.inbox.get(id)).toMatchObject({target:"lead",state:"queued",thread:event.thread});
+ expect(s.outbox.list()).toEqual([]);expect(world.calls.filter(argv=>argv[0]==="notify")).toEqual([]);
+ const reply={thread:event.thread,text:"I received your request.",operationId:"skill-reply"};
+ expect(await s.handle("reply",reply,{role:"admin"})).toEqual({sent:true});
+ s=new DoriService(config,fakeRunner(world));await s.handle("reply",reply,{role:"admin"});
+ expect(world.calls.filter(argv=>argv[0]==="notify")).toEqual([["notify",event.thread,reply.text]]);
+ expect(s.outbox.list()).toEqual([expect.objectContaining({id:"skill-reply",target:event.thread,text:reply.text,state:"sent"})]);
+ expect(s.inbox.get(id)?.state).toBe("queued");
+});
+
+for(const delivery of ["queued","sent","unknown"] as const)test(`retries of pre-metadata ingress preserve ${delivery} operation content and delivery state`,async()=>{
+ const world=newWorld(),config={...s.config,hooks:{threadReply:["notify","{thread}","{text}"]}};
+ const event={id:"slack:C:123.456",thread:"slack:C/100.000",user:"owner",text:"original request"},id=`inbound:test:${event.thread}:${event.id}`;
+ const original={id,target:"lead",thread:event.thread,text:`Owner message in ${event.thread}:\n${event.text}`,source:"test",state:delivery,at:"2026-10-01",attachmentInstance:"old-instance"};
+ s.inbox.put(original);s=new DoriService(config,fakeRunner(world));await s.receive("test",event);
+ expect(s.inbox.get(id)).toEqual(original);expect(s.outbox.list()).toEqual([]);expect(world.calls).toEqual([]);
+ await expect(s.receive("test",{...event,text:"changed request"})).rejects.toThrow("different content");
+});
+
+for(const condition of ["held","detached","offline"] as const)test(`ingress remains durable and silent when the attached lead is ${condition}`,async()=>{
+ const h=await externalFixture(true);h.busy();
+ if(condition==="held")await s.registry.update("lead",current=>({...current,dispatchBlocked:true,holdReason:"owner-pause",runtime:{...current.runtime!,held:true}}));
+ if(condition==="detached")await s.handle("lead-detach",{threadId:h.args.threadId},{role:"admin"});
+ if(condition==="offline")h.offline();
+ const event={id:`slack:C:${condition}`,thread:"slack:C/100.000",user:"owner",text:"save for later"},id=`inbound:test:${event.thread}:${event.id}`;
+ await s.receive("test",event);await s.tick();
+ expect(s.inbox.get(id)).toMatchObject({state:"queued",thread:event.thread,attachmentInstance:h.attachment().instance});
+ expect(s.outbox.list()).toEqual([]);expect(h.calls.filter(argv=>argv[0]==="notify")).toEqual([]);
+ expect(h.prompts()).toEqual([]);expect(h.queues()).toEqual([]);
 });
 
 for(const holdReason of ["owner-pause","done-review"] as const)test(`working intake preserves ${holdReason}`,async()=>{
