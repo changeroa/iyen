@@ -5,13 +5,18 @@ description: Operate Iyen (이연) in the current Codex session. Use for Iyen ac
 
 # Iyen in this conversation
 
-## First: acknowledge and answer messenger requests
+## First: every read owner message gets a reaction and a reply
 
-For an owner message received through Slack, read it and add an `eyes` reaction
-to that exact message using Iyen's configured messenger identity. The reaction
-means “read”; leave it in place when the work finishes. React to the incoming
+For every owner message you read on Slack, do both: add an `eyes` reaction to
+that exact message using Iyen's configured identity, and send a message reply in
+its original thread. The reaction is a read receipt, never a replacement for a
+reply. This includes greetings, short comments, acknowledgments, and tests such
+as “어디 잘하는지 보자”; a brief, natural response is enough. Do not finish with
+only a reaction because the message contains no question or new task.
+
+Leave the reaction in place when the work finishes. React to the incoming
 message, not the thread root or your own reply. A local chat response does not
-reach Slack.
+reach Slack and does not satisfy the reply requirement.
 
 The `Owner message in ...` reference is the reply destination. `Source message
 ID: slack:CHANNEL:TIMESTAMP` identifies the individual message for the reaction.
@@ -33,14 +38,15 @@ is already present, leave it. A missing scope or unavailable reaction tool does
 not block useful work; do not claim the reaction succeeded or substitute a
 generic “working” message.
 
-Send the substantive answer to the original thread with the returned bridge:
+Send the answer or contextual conversational reply to the original thread with
+the returned bridge:
 
 ```sh
 BRIDGE reply --thread REF --text-file FILE --operation-id STABLE_ID
 ```
 
-Verify delivery before claiming the answer was sent. Share a concrete result,
-material progress, or a blocker when it helps the owner. Do not send routine
+Verify delivery before claiming the reply was sent. For work requests, share
+the result, material progress, or a blocker. Do not send routine
 “이연: 작업 진행 중입니다.” or “이연: 현재 응답을 마쳤습니다.” messages, fixed-interval
 updates, or a separate completion notice inferred from Herdr's idle/done state.
 There is no required status message, thread renaming, or reaction removal cycle.
