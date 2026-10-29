@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { join } from "node:path";
 import { defaultConfig } from "../src/config.ts";
 import { DoriService } from "../src/service.ts";
+import { readJson } from "../src/ipc.ts";
 import { atomicJson } from "../src/journal.ts";
 import { bootstrapPath } from "../src/runtime/session-host.ts";
 import type { Lane } from "../src/registry.ts";
@@ -122,4 +123,106 @@ test("explicit operator handoff archives legacy control state, preserves old ide
  expect(current.runtimeHistory?.[0]?.threadId).toBe("t1");expect(current.runtime?.threadId).toBeUndefined();expect(current.runtime?.backend).toBe("herdr-tui");expect(current.dispatchBlocked).toBe(true);
  expect(s.inbox.get("migration1")).toMatchObject({state:"queued",target:lane.key});expect(s.inbox.get("migration1")?.text).toContain("Confirmed A");expect(s.inbox.get("uncertain")?.state).toBe("unknown");
  expect(await Bun.file(join(state.dir,"hosts/history/service-lane-1-t1/service-lane.json")).json()).toMatchObject({instance:"host1"});
+});
+
+// A read-only observer transport keeps recovery tests in process; socket-level
+// protocol coverage belongs to the external-session and integration fixtures.
+async function externalFixture() {
+ const { ExternalSessionError, sharedDaemon } = await import("../src/runtime/external-current-session.ts");
+ const threadId="11111111-1111-4111-8111-111111111111", pane="test:pane", socketPath=join(state.dir,"exact-daemon.sock");
+ let version="0.200.0", offline=false, identity=threadId, reportedSocket=socketPath;
+ const calls:string[][]=[],turns:any[]=[];
+ const observer={close(){},async read<T>(method:string):Promise<T>{
+  return (method==="thread/read"?{thread:{id:threadId,cwd:state.dir,status:{type:"idle"}}}:method==="thread/loaded/list"?{data:[threadId],nextCursor:null}:method==="thread/turns/list"?{data:turns,nextCursor:null}:{goal:null}) as T;
+ }};
+ const runner:import("../src/run.ts").Runner=async argv=>{
+  calls.push([...argv]);
+  if(argv[1]==="app-server") {if(offline)throw new Error("Bearer secret-token /private/socket");return {code:0,err:"",out:JSON.stringify({status:"running",cliVersion:version,appServerVersion:version,socketPath:reportedSocket})};}
+  if(argv[1]==="queue"&&argv[2]==="--help")return {code:0,err:"",out:"queue --thread <ID> --message <TEXT>"};
+  if(argv[0]==="herdr")return {code:0,err:"",out:JSON.stringify({result:{agent:{agent:"codex",pane_id:pane,agent_status:"idle",agent_session:{agent:"codex",kind:"id",value:identity}}}})};
+  if(argv[1]==="queue"){turns.push({id:`turn-${turns.length}`,status:"completed",items:[{type:"userMessage",content:[{type:"text",text:argv[5]}]}]});return {code:0,err:"",out:"queued"};}
+  throw new Error("Unexpected mutation");
+ };
+ const transport:import("../src/service.ts").ExternalTransport={connect:async()=>observer,observe:async(run,config,attachment,action)=>{
+  const daemon=await sharedDaemon(run,attachment.binary,config);
+  if(daemon.socketPath!==attachment.socketPath)throw new ExternalSessionError("identity-unverified","Shared Codex daemon affinity changed; explicit attachment required.");
+  if(daemon.binaryVersion!==attachment.binaryVersion)throw new ExternalSessionError("runtime-version-changed","Shared Codex runtime version changed; verified reconnection required.");
+  return action(observer);
+ }};
+ const config={...s.config,runtime:{...s.config.runtime,binary:process.execPath},hooks:{}};
+ atomicJson(join(state.dir,"control.json"),{token:"admin"});
+ s=new DoriService(config,runner,transport); const clock=fakeClock(Date.now());s.deps.clock=clock;
+ const args={threadId,pane,cwd:state.dir};
+ await s.handle("lead-attach",args,{role:"admin"});
+ const attachment=()=>readJson<any>(join(state.dir,"attachments/lead.json"));
+ return {args,calls,clock,config,runner,transport,attachment,version(v:string){version=v;},offline(v=true){offline=v;},identity(v=threadId){identity=v;},socket(v:string){reportedSocket=v;},queues:()=>calls.filter(argv=>argv[1]==="queue"&&argv[2]!=="--help")};
+}
+
+test("automatic upgrade reconnect preserves capability and exclusions and delivers only eligible queued mail once",async()=>{
+ const h=await externalFixture(),old=h.attachment();
+ s.inbox.put({id:"history",target:"lead",text:"old history",state:"queued",at:"2020-01-01"});
+ old.excludedInboxIds.push("history");atomicJson(join(state.dir,"attachments/lead.json"),old);
+ for(const mailState of ["queued","unknown","sending"] as const)s.inbox.put({id:mailState,target:"lead",text:mailState,state:mailState,at:"2020-01-01",attachmentInstance:old.instance});
+ h.version("0.201.0");
+ expect(await s.handle("status",{key:"lead"},{role:"admin"})).toMatchObject({readiness:"ready",runtime:{binaryVersion:"0.201.0"}});
+ for(const key of ["instance","generation","token","bridge","socketPath","threadId","pane","cwd","excludedInboxIds"])expect(h.attachment()[key]).toEqual(old[key]);
+ expect(await s.authorize(old.token)).toMatchObject({instance:old.instance});expect(h.queues()).toHaveLength(0);
+ await s.tick();expect(s.inbox.get("queued")?.state).toBe("sent");expect(s.inbox.get("history")?.state).toBe("queued");expect(s.inbox.get("unknown")?.state).toBe("unknown");expect(s.inbox.get("sending")?.state).toBe("sending");expect(h.queues()).toHaveLength(1);
+ s=new DoriService(h.config,h.runner,h.transport);await s.tick();expect(s.inbox.get("sending")?.state).toBe("unknown");expect(h.queues()).toHaveLength(1);
+});
+
+test("offline reconnect retries use durable capped backoff and unchanged polls cause no writes or discovery",async()=>{
+ const h=await externalFixture(),old=h.attachment();h.offline();
+ expect(await s.handle("status",{key:"lead"},{role:"admin"})).toMatchObject({readiness:"held"});
+ const held=(await s.registry.read("lead"))!,count=h.calls.length;
+ await s.handle("status",{key:"lead"},{role:"admin"});expect(h.calls.length).toBe(count);expect(await s.registry.read("lead")).toEqual(held);
+ for(let attempt=0;attempt<9;attempt++){
+  h.clock.at+=120000;await s.handle("status",{key:"lead"},{role:"admin"});
+  const retry=(await s.registry.read("lead"))!.runtime!.external!.reconnect!;
+  expect(Date.parse(retry.nextAttemptAt)-h.clock.now()).toBeGreaterThan(0);expect(Date.parse(retry.nextAttemptAt)-h.clock.now()).toBeLessThanOrEqual(60000);
+ }
+ h.offline(false);h.clock.at+=120000;
+ expect(await s.handle("status",{key:"lead"},{role:"admin"})).toMatchObject({readiness:"ready"});expect(h.attachment().token).toBe(old.token);expect(h.queues()).toHaveLength(0);
+});
+
+test("identity replacement latches a manual hold even after the original session reappears",async()=>{
+ const h=await externalFixture();h.identity("22222222-2222-4222-8222-222222222222");
+ expect(await s.handle("status",{key:"lead"},{role:"admin"})).toMatchObject({readiness:"held"});h.identity();h.clock.at+=120000;
+ expect(await s.handle("status",{key:"lead"},{role:"admin"})).toMatchObject({readiness:"held",identityVerified:true});
+ expect((await s.registry.read("lead"))!.runtime!.external!.reconnectBlocked).toBe(true);
+ await s.handle("lead-attach",h.args,{role:"admin"});expect((await s.registry.read("lead"))!.dispatchBlocked).toBe(false);expect(h.queues()).toHaveLength(0);
+});
+
+for(const holdReason of ["owner-pause","done-review"] as const)test(`automatic upgrade reconnect preserves ${holdReason}`,async()=>{
+ const h=await externalFixture();await s.registry.update("lead",lane=>({...lane,dispatchBlocked:true,holdReason,runtime:{...lane.runtime!,held:true}}));
+ h.version("0.201.0");await s.handle("status",{key:"lead"},{role:"admin"});h.clock.at+=120000;await s.tick();
+ expect(await s.registry.read("lead")).toMatchObject({dispatchBlocked:true,holdReason});expect(h.queues()).toHaveLength(0);
+});
+
+test("interrupted binary rebind automatically repairs either durable side without replacing capability",async()=>{
+ const h=await externalFixture(),old=h.attachment(),update=s.registry.update.bind(s.registry);let armed=true;
+ s.registry.update=async(key,fn)=>{const result=await update(key,fn);if(armed&&result.runtime?.external?.rebind){armed=false;throw new Error("injected write failure");}return result;};
+ h.version("0.201.0");await expect(s.handle("lead-attach",h.args,{role:"admin"})).rejects.toThrow("rebind is incomplete");
+ expect(await s.authorize(old.token)).toMatchObject({instance:old.instance});
+ s=new DoriService(h.config,h.runner,h.transport);await s.tick();
+ expect(await s.handle("status",{key:"lead"},{role:"admin"})).toMatchObject({readiness:"ready",runtime:{binaryVersion:"0.201.0"}});
+ expect(h.attachment().token).toBe(old.token);expect(h.attachment().generation).toBe(old.generation);expect(h.queues()).toHaveLength(0);
+});
+
+test("health reports sanitized causes, queue age and ingress evidence without credentials",async()=>{
+ const h=await externalFixture(),old=h.attachment();h.offline();await s.handle("status",{key:"lead"},{role:"admin"});
+ s.inbox.put({id:"old",target:"lead",text:"private message",state:"queued",at:"2020-01-01"});s.inbox.put({id:"unknown-health",target:"lead",text:"private message",state:"unknown",at:"2020-01-01"});
+ s.setIngressProcess("test","running");
+ const health=await s.handle("health",{},{role:"admin"});
+ expect(health).toMatchObject({schemaVersion:1,phase:"ready",pid:process.pid,replay:{records:expect.any(Number),lanes:expect.any(Number)},delivery:{state:"held",latestCause:{code:"runtime-unavailable"}},queue:{queued:1,unknown:1,oldestQueuedAgeMs:expect.any(Number)},ingress:[{id:"test",process:"running",connection:"unverified",lastAcceptedAt:null}]});
+ expect(JSON.stringify(health)).not.toMatch(/secret-token|private message|Bearer|private\/socket/);expect(JSON.stringify(health)).not.toContain(old.token);
+ const caller=await s.authorize(old.token);expect(await s.handle("health",{},caller)).toEqual(health);
+ await expect(s.handle("health",{},{role:"lane",key:lane.key})).rejects.toThrow("Health requires");
+});
+
+test("failed normal observation followed by successful exact rebind is bounded to one recovery",async()=>{
+ const h=await externalFixture();const {ExternalSessionError}=await import("../src/runtime/external-current-session.ts");let observations=0;
+ h.transport.observe=async()=>{observations++;throw new ExternalSessionError("runtime-unavailable","Shared Codex observer unavailable; delivery is waiting for reconnection.");};
+ expect(await s.handle("status",{key:"lead"},{role:"admin"})).toMatchObject({readiness:"ready"});
+ expect(observations).toBe(1);expect(h.queues()).toHaveLength(0);
 });
