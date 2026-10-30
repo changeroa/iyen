@@ -30,7 +30,7 @@ export type ExternalTransport = { connect: typeof connectObserver; observe: type
 type OwnedFailure = Mail & { leadIntakeInstance?: string };
 const UNOWNED_LEAD = "unattached-lead";
 type HandoffArgs = { fromThreadId: string; threadId: string; pane: string; cwd: string; mailIds: string[]; operationId: string };
-type HandoffIntent = { version: 1; status: "prepared" | "committed"; args: HandoffArgs; before: Lane; beforeAttachment: Attachment; after: Lane; afterAttachment: Attachment; result: any; createdAt: string; identityHeld?: boolean; cleanupPending?: boolean };
+type HandoffIntent = { version: 1; status: "prepared" | "committed"; args: HandoffArgs; before: Lane; beforeAttachment: Attachment; after: Lane; afterAttachment: Attachment; result: any; createdAt: string; identityHeld?: boolean; cleanupPending?: boolean; activation?: boolean };
 export type HandoffIO = { removeMarker(path: string): void };
 const durableMarkerRemoval = (path: string): void => {
   // Open before unlink so an open failure leaves the recovery marker intact.
@@ -175,7 +175,7 @@ export class DoriService {
     if (this.pendingHandoff()) throw new Error("Lead handoff incomplete; mutations are held until its recorded operation finishes");
   }
   private blocksPendingMutation(action: string, args: any, caller: Caller): boolean {
-    if (["health", "status", "lead-handoff", "tick", "mail-list", "approval-list", "can-launch"].includes(action)) return false;
+    if (["health", "status", "lead-handoff", "lead-activate", "tick", "mail-list", "approval-list", "can-launch"].includes(action)) return false;
     if (["lead", "lead-attach", "lead-detach", "lead-handoff-preview"].includes(action)) return true;
     if (action === "sync") return Boolean(args.write);
     if (action === "mail-resolve") return args.box !== "outbox" && (!this.inbox.get(args.id) || this.inbox.get(args.id)?.target === "lead");
@@ -216,7 +216,7 @@ export class DoriService {
     return { fromThreadId: args.fromThreadId, threadId: args.threadId, pane: args.pane, cwd: args.cwd, ...summary,
       selectedMailIds: args.mailIds, selectionValid: args.mailIds.every(id => summary.eligibleMailIds.includes(id)), dispatches: false };
   }
-  private async applyHandoff(raw: any): Promise<any> {
+  private async applyHandoff(raw: any, activation = false): Promise<any> {
     const args = this.handoffArgs(raw, true), path = this.handoffPath(args.operationId);
     let intent: HandoffIntent;
     if (existsSync(path)) {
@@ -235,13 +235,14 @@ export class DoriService {
       const beforeAttachment = this.attachment(before), summary = this.handoffMail(beforeAttachment);
       if (args.mailIds.some(id => !summary.eligibleMailIds.includes(id))) throw new Error("Handoff selection includes attempted, reconciled, unknown or other-attachment mail");
       const { daemon, snap } = await this.validateHandoffTarget(args, beforeAttachment.socketPath);
+      if (activation) await this.assertPriorTuiGone(beforeAttachment, args);
       const excluded = [...new Set([...beforeAttachment.excludedInboxIds, ...this.inbox.list().filter(row => row.target === "lead").map(row => row.id)])].filter(id => !args.mailIds.includes(id));
       const { saved: afterAttachment, lead: after } = this.prepareAttachment(args, args.cwd, before, daemon.binary, daemon, snap, excluded);
       const protectedHold = before.holdReason === "owner-pause" || before.holdReason === "done-review" || statusOf(before) === "paused" || statusOf(before) === "done-claimed" || statusOf(before) === "verified-done";
       if (protectedHold) { Object.assign(after, { status: before.status, dispatchBlocked: true, holdReason: before.holdReason, claim: before.claim }); after.runtime!.held = true; }
       const publicLead = { ...after, mode: "external-current-session", bridge: afterAttachment.bridge, identityVerified: true,
         verifiedIdentity: { threadId: args.threadId, pane: args.pane, cwd: args.cwd, model: snap.model, effort: snap.effort }, readiness: protectedHold ? "held" : snap.state === "idle" ? "ready" : "busy" };
-      intent = { version: 1, status: "prepared", args, before, beforeAttachment, after, afterAttachment, createdAt: new Date().toISOString(),
+      intent = { version: 1, status: "prepared", args, before, beforeAttachment, after, afterAttachment, activation, createdAt: new Date().toISOString(),
         result: { attached: true, handedOff: true, operationId: args.operationId, fromThreadId: args.fromThreadId, threadId: args.threadId, mailIds: args.mailIds, bridge: afterAttachment.bridge, lead: publicLead } };
       atomicJson(path, intent);
     }
@@ -280,6 +281,9 @@ export class DoriService {
       // Every restart validates the exact recorded target before committing or
       // releasing dispatch. A different focused pane/cwd is never substituted.
       await this.validateHandoffTarget(args, beforeAttachment.socketPath);
+      // Recheck on every prepared retry, including automatic recovery, immediately
+      // before changing routing. A prior preflight cannot authorize a later TUI.
+      if (intent.activation && intent.status !== "committed") await this.assertPriorTuiGone(beforeAttachment, args);
       if (intent.identityHeld) { intent = { ...intent, identityHeld: undefined }; atomicJson(path, intent); }
       if (intent.status !== "committed") {
         await this.registry.update("lead", lane => ({ ...lane, dispatchBlocked: true, holdReason: lane.holdReason ?? "recovery", runtime: { ...lane.runtime!, held: true, state: "recovering" } }));
@@ -468,6 +472,59 @@ export class DoriService {
       verifiedIdentity: identityVerified ? { threadId: current.runtime?.threadId, pane: current.pane, cwd: current.cwd, model: current.runtime?.model, effort: current.runtime?.effort } : null,
       readiness: !stillAttached ? "detached" : !identityVerified || current.dispatchBlocked ? "held" : snap?.state === "idle" ? "ready" : "busy" };
   }
+  private async assertPriorTuiGone(source: Attachment, target: Pick<HandoffArgs, "threadId" | "pane">): Promise<void> {
+    const unknown = () => new Error("Prior lead TUI ownership is unverified; inspect Herdr and retry activation, or use explicit lead-handoff");
+    const live = () => new Error("Prior lead session still has a live Herdr TUI; use explicit lead-handoff to replace it");
+    const read = async (argv: string[]) => {
+      try {
+        const result = await this.runner(["herdr", ...argv], { timeoutMs: this.config.runtime.rpcTimeoutMs });
+        if (result.code !== 0) throw unknown();
+        return JSON.parse(result.out).result;
+      } catch { throw unknown(); }
+    };
+    const session = (row: any): string | undefined => row?.agent === "codex" && row.agent_session?.agent === "codex" &&
+      row.agent_session.kind === "id" && typeof row.agent_session.value === "string" && THREAD_UUID.test(row.agent_session.value) ? row.agent_session.value : undefined;
+    const observe = async (): Promise<string[]> => {
+      const snapshot = (await read(["api", "snapshot"]))?.snapshot;
+      if (!Array.isArray(snapshot?.panes) || !Array.isArray(snapshot?.agents)) throw unknown();
+      for (const rows of [snapshot.panes, snapshot.agents]) {
+        if (rows.some((row: any) => typeof row?.pane_id !== "string" || !row.pane_id) || new Set(rows.map((row: any) => row.pane_id)).size !== rows.length) throw unknown();
+      }
+      if (snapshot.agents.some((row: any) => !snapshot.panes.some((pane: any) => pane.pane_id === row.pane_id))) throw unknown();
+      const rows = [...snapshot.panes, ...snapshot.agents];
+      // Status (including idle/done) is never evidence that a TUI has exited.
+      if (rows.some(row => row.agent_session?.value === source.threadId)) throw live();
+      const targetRows = rows.filter(row => row.pane_id === target.pane);
+      if (targetRows.length !== 2 || targetRows.some(row => session(row) !== target.threadId) || rows.some(row => session(row) === target.threadId && row.pane_id !== target.pane)) throw unknown();
+      const priorRows = rows.filter(row => row.pane_id === source.pane);
+      if (priorRows.length && (priorRows.length !== 2 || priorRows.some(row => !session(row)) || session(priorRows[0]) !== session(priorRows[1]))) throw unknown();
+      // Absence in both complete collections proves a closed pane. Otherwise
+      // require an exact, different Codex UUID, confirmed by agent get below.
+      return [session(targetRows[0])!, ...(priorRows.length ? [session(priorRows[0])!] : [])];
+    };
+    const before = await observe();
+    for (const pane of new Set([target.pane, ...(before.length > 1 ? [source.pane] : [])])) {
+      const agent = (await read(["agent", "get", pane]))?.agent;
+      if (agent?.agent_session?.value === source.threadId) throw live();
+      if (agent?.pane_id !== pane || !session(agent) || session(agent) !== before[pane === target.pane ? 0 : 1]) throw unknown();
+    }
+    if (!sameJson(before, await observe())) throw unknown();
+  }
+  private async activateLead(raw: any): Promise<any> {
+    if (typeof raw.threadId !== "string" || !THREAD_UUID.test(raw.threadId) || typeof raw.pane !== "string" || !raw.pane.trim() || typeof raw.cwd !== "string" || !isAbsolute(raw.cwd)) throw new Error("lead-activate requires UUID thread-id, pane and absolute cwd");
+    const args = { threadId: raw.threadId, pane: raw.pane, cwd: realpathSync(raw.cwd) }, pending = this.pendingHandoff();
+    if (pending) {
+      if (!pending.activation || pending.args.threadId !== args.threadId || pending.args.pane !== args.pane || pending.args.cwd !== args.cwd) throw new Error("Another handoff is pending; retry its recorded target and operationId first");
+      return this.applyHandoff(pending.args, true);
+    }
+    const previous = await this.registry.read("lead");
+    if (previous?.runtime?.backend !== "external-current-session" || previous.runtime.external?.detachedAt || previous.runtime.state === "stopped" ||
+      previous.runtime.threadId === args.threadId && previous.pane === args.pane && previous.cwd === args.cwd) return this.attachLead(args);
+    const source = this.attachment(previous);
+    if (source.threadId === args.threadId) throw new Error("Lead session pane/cwd changed; use explicit lead-handoff or detach and attach");
+    const operationId = `lead-activate:${createHash("sha256").update(JSON.stringify([source.instance, args.threadId, args.pane, args.cwd])).digest("hex")}`;
+    return this.applyHandoff({ ...args, fromThreadId: source.threadId, mailIds: [], operationId }, true);
+  }
   private async attachLead(args: any): Promise<any> {
     if (typeof args.threadId !== "string" || !THREAD_UUID.test(args.threadId) || typeof args.pane !== "string" || !args.pane.trim() || typeof args.cwd !== "string" || !isAbsolute(args.cwd)) throw new Error("lead-attach requires UUID thread-id, pane and absolute cwd");
     const cwd = realpathSync(args.cwd), previous = await this.registry.read("lead");
@@ -630,6 +687,10 @@ export class DoriService {
     if (action === "health") {
       if (caller.role !== "admin" && !(caller.role === "lead" && caller.key === "lead" && caller.instance)) throw new Error("Health requires operator or current scoped lead capability");
       return this.health();
+    }
+    if (action === "lead-activate") {
+      if (caller.role !== "admin") throw new Error("lead-activate requires operator capability");
+      return this.launchQueue.run("lead", () => this.dispatchQueue.run("lead", () => this.activateLead(args)));
     }
     if (action === "lead-handoff-preview" || action === "lead-handoff") {
       if (caller.role !== "admin") throw new Error("Lead handoff requires operator capability");
