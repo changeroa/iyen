@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmdirSync } from "node:fs";
 import { join } from "node:path";
 import { defaultConfig } from "../src/config.ts";
 import { atomicJson } from "../src/journal.ts";
@@ -125,4 +125,27 @@ test("prepared recovery rechecks prior ownership before replacement", async () =
   await expect(h.activate(restart)).rejects.toThrow("explicit lead-handoff");
   expect(h.saved()).toEqual(old); expect((await restart.registry.read("lead"))?.runtime?.threadId).toBe(oldId);
   h.mode("closed"); expect(await h.activate(restart)).toMatchObject({ attached: true, threadId: newId });
+});
+
+test("an orphan preparation can be superseded after source revision changes without replay", async () => {
+  const h = fixture(); await h.attach(); h.mode("closed"); const old = h.saved();
+  h.s.inbox.put({ id: "old-mail", target: "lead", text: "old request", state: "queued", at: "2026-01-01", attachmentInstance: old.instance });
+  const mail = structuredClone(h.s.inbox.list()), marker = join(h.state.dir, "attachments/handoff.json");
+  // Install a failure at marker creation only after the preparation is saved.
+  const validate = (h.s as any).prepareAttachment.bind(h.s);
+  (h.s as any).prepareAttachment = (...args: any[]) => {
+    const prepared = validate(...args); mkdirSync(marker); return prepared;
+  };
+  await expect(h.activate()).rejects.toThrow();
+  rmdirSync(marker); (h.s as any).prepareAttachment = validate;
+  expect(h.saved()).toEqual(old);
+  await h.s.registry.update("lead", lane => ({ ...lane, dispatchBlocked: true, holdReason: "owner-pause", runtime: { ...lane.runtime!, held: true } }));
+  const result = await h.activate();
+  expect(result).toMatchObject({ attached: true, mailIds: [], lead: { dispatchBlocked: true, holdReason: "owner-pause" } });
+  expect(h.saved().generation).toBe(old.generation + 1);
+  expect(h.s.inbox.list()).toEqual(mail);
+  expect(h.saved().excludedInboxIds).toContain("old-mail");
+  expect(readdirSync(join(h.state.dir, "attachments/handoffs"))).toHaveLength(2);
+  await expect(h.s.authorize(old.token)).rejects.toThrow("Forbidden");
+  const attached = h.saved(); await h.activate(); expect(h.saved()).toEqual(attached);
 });

@@ -29,10 +29,11 @@ absolute config, state and persona paths without contacting the service.
 Discovery happens on every invocation. Set `IYEN_HOME` consistently for service
 startup and activation when choosing a different persistent directory.
 
-Inside that directory, `config.json` holds settings, `state/` holds durable
-service history and `persona/` holds `IDENTITY.md`, `SOUL.md`, `USER.md` and
-`MEMORY.md`. Existing `stateDir` and optional `personaDir` configuration are
-honored; relative paths resolve against the config directory. If `persona/`
+For new installations, `config.json` holds settings, an explicit `state/` store
+holds durable service history and `persona/` holds `IDENTITY.md`, `SOUL.md`,
+`USER.md` and `MEMORY.md`. Existing `stateDir` and optional `personaDir` are
+honored; existing configs omitting `stateDir` retain the historical `~/.dori/state`
+default. Relative configured paths resolve against the config directory. If `persona/`
 does not exist, an existing installation-local `memory/` is used for legacy
 compatibility. No data is moved or overwritten during activation. This home is
 separate from `CODEX_HOME`; attaching does not change the running Codex session's

@@ -68,7 +68,10 @@ export const parseConfig = (raw: Record<string, any>, home = homedir()): DoriCon
 export const loadConfig = async (path = configPath(), home = homedir()): Promise<DoriConfig> => {
   const absolute = resolve(expandHome(path, home)), root = dirname(absolute), f = Bun.file(absolute);
   const raw = await f.exists() ? await f.json() : {};
-  const config = parseConfig({ ...raw, stateDir: raw.stateDir ?? join(root, "state") }, home);
+  // Omission historically means ~/.dori/state, even for a custom config path.
+  // New installers write an explicit home-relative store; never redirect an
+  // existing installation's implicit store just because its config moved.
+  const config = parseConfig(raw, home);
   const persona = config.personaDir ?? (existsSync(join(root, "persona")) || !existsSync(join(root, "memory")) ? "persona" : "memory");
   return { ...config, stateDir: resolve(root, config.stateDir), personaDir: resolve(root, expandHome(persona, home)) };
 };

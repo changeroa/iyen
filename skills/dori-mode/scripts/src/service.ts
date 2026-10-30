@@ -545,7 +545,11 @@ export class DoriService {
       previous.runtime.threadId === args.threadId && previous.pane === args.pane && previous.cwd === args.cwd) return this.attachLead(args);
     const source = this.attachment(previous);
     if (source.threadId === args.threadId) throw new Error("Lead session pane/cwd changed; use explicit lead-handoff or detach and attach");
-    const operationId = `lead-activate:${createHash("sha256").update(JSON.stringify([source.instance, args.threadId, args.pane, args.cwd])).digest("hex")}`;
+    // A marker-present retry always uses the recorded operation above. Before
+    // that marker exists, a changed source revision needs a freshly validated
+    // intent (e.g. to preserve an owner pause after an interrupted preparation).
+    // Keep the orphan as history rather than weakening its revision guard.
+    const operationId = `lead-activate:${createHash("sha256").update(JSON.stringify([source.instance, previous.revision, args.threadId, args.pane, args.cwd])).digest("hex")}`;
     return this.applyHandoff({ ...args, fromThreadId: source.threadId, mailIds: [], operationId }, true);
   }
   private async attachLead(args: any): Promise<any> {

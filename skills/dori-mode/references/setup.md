@@ -30,8 +30,9 @@ installer and activation resolve config on each invocation: explicit helper
 existing `~/.dori-codex/config.json` or legacy `~/.dori/config.json`. Without an
 existing installation the default is `~/.dori-codex/config.json`.
 `--home` overrides inherited `DORI_CONFIG`; an explicit config wins over both.
-Set the same selector for service startup and activation. State defaults to
-`state/` beside the config; existing `stateDir` remains authoritative. Persona
+Set the same selector for service startup and activation. New installations write
+an explicit `state/` path beside the config; existing `stateDir` remains
+authoritative, and older configs omitting it retain `~/.dori/state`. Persona
 defaults to `persona/`, falling back to existing `memory/` in that same directory;
 optional `personaDir` selects another established path. Relative configured paths
 resolve beside the config. Activation returns all absolute paths and does not

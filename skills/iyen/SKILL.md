@@ -109,9 +109,11 @@ not silently replace or restart it to work around the refusal.
    `~/.dori-codex/config.json`; activation requires an existing config.
    `--home DIR` selects `DIR/config.json` and overrides inherited config selection.
    It returns `home_dir`, `config_path`, `state_dir` and `persona_dir`. Configured
-   `stateDir` and `personaDir` are preserved; otherwise data uses `state/` and
-   `persona/` in the selected home, with existing `memory/` as the legacy persona
-   fallback. Never copy or reset existing data just because a new session starts.
+   `stateDir` and `personaDir` are preserved. New installations write an explicit
+   `state/` store in their home; existing configs omitting `stateDir` retain the
+   historical `~/.dori/state` default. Persona uses installation-local `persona/`,
+   with existing `memory/` as its legacy fallback. Never copy or reset existing
+   data just because a new session starts.
    The helper
    invokes this repository's CLI by absolute path, attaches the exact current
    session, and tests the returned scoped control executable. It does not focus,

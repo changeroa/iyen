@@ -34,8 +34,8 @@ test("discovery reuses current installation, falls back to legacy, and honors ex
   expect(configPath(home)).toBe(join(home, "explicit.json"));
 });
 
-test("one persistent root supplies defaults regardless of the caller project", async () => {
-  const home = setup(), root = join(home, "persistent"), path = config(root);
+test("an installation's explicit store and default persona stay independent of the caller project", async () => {
+  const home = setup(), root = join(home, "persistent"), path = config(root, { stateDir: "state" });
   const resolved = await installationPaths(path, home);
   expect(resolved).toEqual({ config_path: path, config_exists: true, home_dir: root, state_dir: join(root, "state"), persona_dir: join(root, "persona") });
   const other = config(join(home, "other"));
@@ -43,6 +43,18 @@ test("one persistent root supplies defaults regardless of the caller project", a
   expect((await installationPaths(configPath(home), home)).home_dir).toBe(root);
   process.env.IYEN_HOME = join(home, "other");
   expect((await installationPaths(configPath(home), home)).config_path).toBe(other);
+});
+
+test("existing configs omitting stateDir retain the legacy implicit store", async () => {
+  const home = setup(), legacyState = join(home, ".dori/state");
+  mkdirSync(legacyState, { recursive: true });
+  writeFileSync(join(legacyState, "retained-history"), "existing work and mail");
+  for (const root of [join(home, ".dori-codex"), join(home, "custom")]) {
+    const path = config(root);
+    expect((await installationPaths(path, home)).state_dir).toBe(legacyState);
+    expect(await Bun.file(join(legacyState, "retained-history")).text()).toBe("existing work and mail");
+    expect(await Bun.file(join(root, "state/retained-history")).exists()).toBe(false);
+  }
 });
 
 test("configured state and persona paths are preserved and relative paths are home-relative", async () => {
