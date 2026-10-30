@@ -61,3 +61,33 @@ test("health CLI exposes boot progress without granting scoped clients a local f
     expect(scoped.code).toBe(1); expect(scoped.out).toBe("");
   } finally { state.done(); }
 });
+
+test("persistent-home CLI discovery and activation share the same installation from another cwd", async () => {
+  const state = withState(), requests: any[] = [];
+  const server = Bun.serve({ unix: serviceSocket(state.dir), async fetch(request) {
+    requests.push(await request.json()); return Response.json({ result: { attached: true } });
+  } });
+  try {
+    const config = join(state.dir, "config.json");
+    atomicJson(config, { ...defaultConfig(), stateDir: state.dir, personaDir: "memory" });
+    atomicJson(join(state.dir, "control.json"), { token: "test-operator" });
+    const run = async (args: string[], scoped = false) => {
+      const child = Bun.spawn([process.execPath, join(import.meta.dir, "../src/cli.ts"), ...args], {
+        cwd: "/", env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: state.dir, IYEN_HOME: state.dir,
+          ...(scoped ? { DORI_CONTEXT: join(state.dir, "missing-context.json") } : {}) }, stdout: "pipe", stderr: "pipe",
+      });
+      const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      return { out, err, code };
+    };
+    const paths = await run(["paths"]);
+    expect(paths.code).toBe(0);
+    expect(JSON.parse(paths.out)).toMatchObject({ config_path: config, state_dir: state.dir, persona_dir: join(state.dir, "memory") });
+    expect(requests).toHaveLength(0);
+    const args = ["lead-activate", "--thread-id", "11111111-1111-4111-8111-111111111111", "--pane", "w1:p1", "--cwd", state.dir];
+    expect((await run(args)).code).toBe(0);
+    expect(requests[0]).toMatchObject({ action: "lead-activate", args: { threadId: args[2], pane: "w1:p1", cwd: state.dir } });
+    expect((await run(args, true)).err).toContain("Scoped context cannot invoke");
+    expect((await run(["paths"], true)).err).toContain("Scoped context cannot invoke");
+    expect(requests).toHaveLength(1);
+  } finally { server.stop(true); state.done(); }
+});
