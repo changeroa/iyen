@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { parseArgs } from "node:util";
-import { loadConfig, defaultConfig } from "./config.ts";
+import { loadConfig, defaultConfig, installationPaths } from "./config.ts";
 import { serviceClient } from "./ipc.ts";
 import { serve } from "./service.ts";
 import { runSessionHost, startSessionHost } from "./runtime/session-host.ts";
@@ -13,7 +13,8 @@ import { join } from "node:path";
 import { readStartupHealth } from "./health.ts";
 const help = `dori — Codex-only messenger lead and lanes
 
-  doctor | serve | status [key] | health
+  doctor | serve | status [key] | health | paths
+  lead-activate --thread-id UUID --pane ID --cwd DIR
   lead-attach --thread-id UUID --pane ID --cwd DIR
   lead-detach --thread-id UUID
   lead-handoff-preview --from-thread-id UUID --thread-id UUID --pane ID --cwd DIR
@@ -77,6 +78,7 @@ const output = (value: unknown) => console.log(typeof value === "string" ? value
 try {
   if (scopedInvocation && !scopedCommands.has(command)) throw new Error(`Scoped context cannot invoke local command ${command || "help"}; use service commands only`);
   if (!command || values.help || command === "help") { console.log(scopedInvocation ? scopedHelp : help); process.exit(0); }
+  if (command === "paths") { output(await installationPaths()); process.exit(0); }
   if (command === "migrate") { output(await migrate(Boolean(values.apply), undefined, opt("handoff-file") ? await Bun.file(need("handoff-file")).json() : undefined)); process.exit(0); }
   if (command === "session-host") {
     const stateDir = opt("state-dir") ?? process.env.DORI_STATE_DIR ?? defaultConfig().stateDir;
@@ -104,6 +106,7 @@ try {
   const operationId = opt("operation-id") ?? crypto.randomUUID();
   let result: any;
   switch (command) {
+    case "lead-activate": result = await call(command, { threadId: need("thread-id"), pane: need("pane"), cwd: need("cwd") }); break;
     case "lead": case "lead-attach": result = await call("lead-attach", { threadId: need("thread-id"), pane: need("pane"), cwd: need("cwd") }); break;
     case "lead-detach": result = await call(command, { threadId: need("thread-id") }); break;
     case "lead-handoff-preview": case "lead-handoff": {

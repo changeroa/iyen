@@ -4,7 +4,9 @@ Keep the owner's bot name, messenger account, memory and onboarding consent. Man
 
 Compatible updates reconnect the same verified Herdr pane/thread/cwd and daemon socket automatically, preserving the existing attachment and eligible pending input. Failed reconnects use bounded retries; identity changes and operator holds require explicit intervention. `lead-attach` remains an explicit same-session retry. Do not detach just to update Codex. The service never upgrades, starts, stops or replaces the owner's daemon.
 
-For a different lead session, an operator first runs `lead-handoff-preview --from-thread-id OLD --thread-id NEW --pane PANE --cwd DIR`. Apply with `lead-handoff` using the same identities, a stable `--operation-id`, and repeated `--mail-id` selections (or explicit `--no-mail`). Preview is read-only. Only selected eligible queued messages transfer; sent, sending, unknown, receipted and reconciled messages remain untouched. The operation is durable and repeatable with the same ID and arguments. Never automatically replace another live lead or replay uncertain messages.
+For the normal reset flow, close the previous conversation, open a new one, and ask for `iyen mode`. The activation helper invokes `lead-activate`, which verifies the old TUI no longer owns that session, validates the new pane/thread/cwd and records an empty-mail handoff. Retrying resumes the same recorded operation. Persistent persona, settings and history survive; old messages are retained without replay. Idle or held status alone does not prove closure, and owner pauses are preserved.
+
+To deliberately replace a still-live lead or transfer selected old mail, an operator first runs `lead-handoff-preview --from-thread-id OLD --thread-id NEW --pane PANE --cwd DIR`. Apply with `lead-handoff` using the same identities, a stable `--operation-id`, and repeated `--mail-id` selections (or explicit `--no-mail`). Preview is read-only. Only selected eligible queued messages transfer; sent, sending, unknown, receipted and reconciled messages remain untouched. The operation is durable and repeatable with the same ID and arguments. Never automatically replace another live lead or replay uncertain messages.
 
 `dori health` reports service startup/recovery and delivery health separately. Before RPC is available, the operator CLI can read sanitized startup progress; a live PID or saved ready state is not proof of readiness. Scoped clients must authenticate and cannot use this local fallback. Ingress process status is not a claim that Slack's network connection is healthy; inspect recent accepted events and delivery backlog separately.
 
@@ -21,6 +23,21 @@ bun link
 ```
 
 Copy references/config.example.json to ~/.dori-codex/config.json only for a new installation. Set defaultCwd and an existing laneWorkspace. Set an explicit model and reasoning effort for workers; launch validates them against the installed catalog. The current-session lead retains its existing model, effort and permissions. The private sidecar inherits the established CODEX_HOME settings/tools/plugins/auth/history and adds process-scoped Dori overrides without writing global config. Set runtime.settingsHome only when selecting another established settings home. Configure sandbox and approval policy explicitly; installation never relaxes them. Preserve existing config and use migration for legacy installs.
+
+`dori paths` inspects persistent paths without contacting the service. CLI,
+installer and activation resolve config on each invocation: explicit helper
+`--config`, helper `--home`, inherited `DORI_CONFIG`, `IYEN_HOME/config.json`, then
+existing `~/.dori-codex/config.json` or legacy `~/.dori/config.json`. Without an
+existing installation the default is `~/.dori-codex/config.json`.
+`--home` overrides inherited `DORI_CONFIG`; an explicit config wins over both.
+Set the same selector for service startup and activation. New installations write
+an explicit `state/` path beside the config; existing `stateDir` remains
+authoritative, and older configs omitting it retain `~/.dori/state`. Persona
+defaults to `persona/`, falling back to existing `memory/` in that same directory;
+optional `personaDir` selects another established path. Relative configured paths
+resolve beside the config. Activation returns all absolute paths and does not
+move, overwrite, or initialize persistent data. Keep the running session's
+`CODEX_HOME` separate from this service directory.
 
 ```sh
 export DORI_CONFIG="$HOME/.dori-codex/config.json"

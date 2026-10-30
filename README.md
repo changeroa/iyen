@@ -10,7 +10,7 @@ Activation requires the current Herdr session to be loaded in the running local 
 
 Requirements: Bun 1.3+, Herdr, git, and Codex CLI. Attached leads validate the matching CLI/daemon pair and required messaging capabilities instead of requiring each release in a version allowlist. Managed workers retain their configured version pin (default **0.163.0**). Use gh for GitHub Done signals and npm for published-package signals. Use the existing messenger integration or an ACK/replay adapter described below.
 
-For attached leads, Herdr identifies the pane/session and supplies execution status; the Codex adapter verifies loaded identity and actual delivery receipts. Compatible updates reconnect the same session automatically using `runtime.externalBinary`. A different session requires an explicit handoff. `dori health` distinguishes service recovery, ingress activity and held delivery; the ingress adapter's storage ACK is not a turn receipt. See [runtime recovery and handoff](skills/dori-mode/references/setup.md).
+For attached leads, Herdr identifies the pane/session and supplies execution status; the Codex adapter verifies loaded identity and actual delivery receipts. Compatible updates reconnect the same session automatically using `runtime.externalBinary`. After closing the previous session, start a new conversation and ask for `iyen mode`: activation verifies that the old lead ended and records a handoff without replaying old mail. A still-live or unverified former lead requires explicit reconciliation. `dori health` distinguishes service recovery, ingress activity and held delivery; the ingress adapter's storage ACK is not a turn receipt. See [runtime recovery and handoff](skills/dori-mode/references/setup.md).
 
 ```sh
 cd skills/dori-mode/scripts
@@ -19,6 +19,25 @@ bun link
 ```
 
 For a new installation, copy `skills/dori-mode/references/config.example.json` to `~/.dori-codex/config.json`. Set `defaultCwd`, an existing `laneWorkspace` for workers, thread hooks and owner-filtered ingress. Existing config must be migrated, not overwritten.
+
+The installation directory persists independently of Codex conversations. CLI,
+installer and activation share config discovery: `DORI_CONFIG`, then
+`IYEN_HOME/config.json`, then existing `~/.dori-codex/config.json` or legacy
+`~/.dori/config.json` (new installations default to `~/.dori-codex`). The helper
+also accepts `--config PATH` or `--home DIR`. Run `dori paths` to see the selected
+absolute config, state and persona paths without contacting the service.
+Discovery happens on every invocation. Set `IYEN_HOME` consistently for service
+startup and activation when choosing a different persistent directory.
+
+For new installations, `config.json` holds settings, an explicit `state/` store
+holds durable service history and `persona/` holds `IDENTITY.md`, `SOUL.md`,
+`USER.md` and `MEMORY.md`. Existing `stateDir` and optional `personaDir` are
+honored; existing configs omitting `stateDir` retain the historical `~/.dori/state`
+default. Relative configured paths resolve against the config directory. If `persona/`
+does not exist, an existing installation-local `memory/` is used for legacy
+compatibility. No data is moved or overwritten during activation. This home is
+separate from `CODEX_HOME`; attaching does not change the running Codex session's
+settings or authentication.
 
 ```sh
 export DORI_CONFIG="$HOME/.dori-codex/config.json"

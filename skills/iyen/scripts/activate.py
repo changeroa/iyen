@@ -70,7 +70,7 @@ def activate(args):
         session = str(uuid.UUID(args.session))
     except ValueError as exc:
         raise ActivationError("--session must be the current Codex session UUID") from exc
-    if os.environ.get("DORI_CONTEXT") or os.environ.get("DORI_LANE_KEY"):
+    if any(name in os.environ for name in ("DORI_CONTEXT", "DORI_LANE_KEY", "DORI_LANE_TOKEN")):
         raise ActivationError("Managed Dori sessions must use scoped controls; activation cannot elevate a lane")
     handoff = args.action in ("handoff-preview", "handoff")
     if handoff:
@@ -87,9 +87,6 @@ def activate(args):
                 raise ActivationError("--operation-id is required for repeatable handoff")
             if not mail_ids and not no_mail:
                 raise ActivationError("Explicit --mail-id selections or --no-mail required")
-    config = Path(args.config).expanduser().resolve() if args.config else Path.home() / ".dori-codex" / "config.json"
-    if not config.is_file():
-        raise ActivationError(f"Existing Iyen service configuration not found: {config}")
     cli = Path(__file__).resolve().parents[3] / "skills/dori-mode/scripts/src/cli.ts"
     bun = shutil.which("bun")
     if not bun or not cli.is_file():
@@ -97,8 +94,20 @@ def activate(args):
     env = os.environ.copy()
     for name in ("DORI_STATE_DIR", "DORI_LANE_TOKEN"):
         env.pop(name, None)
-    env["DORI_CONFIG"] = str(config)
     base = [bun, str(cli)]
+    if args.config:
+        env["DORI_CONFIG"] = str(Path(args.config).expanduser().resolve())
+    elif getattr(args, "home", None):
+        env.pop("DORI_CONFIG", None)
+        env["IYEN_HOME"] = str(Path(args.home).expanduser().resolve())
+    paths = command(base + ["paths"], env)
+    for key in ("config_path", "home_dir", "state_dir", "persona_dir"):
+        if not isinstance(paths.get(key), str) or not Path(paths[key]).is_absolute():
+            raise ActivationError(f"Service returned an invalid installation path: {key}")
+    config = Path(paths["config_path"])
+    if not config.is_file():
+        raise ActivationError(f"Existing Iyen service configuration not found: {config}")
+    env["DORI_CONFIG"] = str(config)
     pane = current_pane(session, args.pane)
     if handoff:
         argv = base + ["lead-" + args.action, "--from-thread-id", source_session,
@@ -119,7 +128,7 @@ def activate(args):
         return {"status": "detached", "session": session, "pane": pane, "result": result}
     if args.action in ("start", "handoff"):
         if args.action == "start":
-            result = command(base + ["lead-attach", "--thread-id", session, "--pane", pane,
+            result = command(base + ["lead-activate", "--thread-id", session, "--pane", pane,
                                      "--cwd", str(Path.cwd().resolve())], env, timeout=60)
         if result.get("attached") is not True:
             raise ActivationError("Service did not confirm attachment")
@@ -135,7 +144,7 @@ def activate(args):
     scoped = command([bridge, "status", "lead"], env)
     verify_lead(scoped, session, pane)
     return {"status": "active", "session": session, "pane": pane, "bridge": bridge,
-            "persona_dir": str(config.parent / "persona"),
+            **paths,
             "runtime_state": scoped["runtime"]["state"]}
 
 
@@ -144,7 +153,8 @@ def main(argv=None):
     parser.add_argument("action", choices=("start", "status", "stop", "handoff-preview", "handoff"), nargs="?", default="start")
     parser.add_argument("--session", required=True, help="Explicit current Codex UUID; never infer from focus")
     parser.add_argument("--pane", help="Verified pane ID; otherwise resolve uniquely by session")
-    parser.add_argument("--config", help="Existing config; defaults to ~/.dori-codex/config.json")
+    parser.add_argument("--config", help="Existing service config; overrides home and environment discovery")
+    parser.add_argument("--home", help="Persistent Iyen directory containing config.json; defaults to IYEN_HOME or existing installation")
     parser.add_argument("--from-session", help="Expected previous lead UUID for explicit handoff")
     parser.add_argument("--operation-id", help="Stable ID reused when retrying the same handoff")
     parser.add_argument("--mail-id", action="append", help="Explicit queued message ID to transfer; repeat for each message")

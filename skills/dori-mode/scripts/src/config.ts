@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 
 export type ArgvTemplate = readonly string[];
 export type Hooks = { readonly threadReply?: ArgvTemplate; readonly threadDone?: ArgvTemplate; readonly transcribe?: ArgvTemplate };
@@ -15,7 +16,7 @@ export type RuntimeConfig = {
 };
 export type IngressConfig = { id: string; command: string[]; owners: string[] };
 export type DoriConfig = {
-  schemaVersion: 2; stateDir: string; leadWorkspace?: string; laneWorkspace: string; workspaces: readonly string[];
+  schemaVersion: 2; stateDir: string; personaDir?: string; leadWorkspace?: string; laneWorkspace: string; workspaces: readonly string[];
   ignorePanes: readonly string[]; leadPane: string; defaultCwd: string; runtime: RuntimeConfig;
   nudgeAfterMin: number; postAfterMin: number; closeAfterMin: number; workThresholdSec: number; heavySlots: number; heavyMaxLoad: number;
   guard: GuardThresholds; hooks: Hooks; ingress: IngressConfig[];
@@ -28,7 +29,12 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   nudgeAfterMin: 15, postAfterMin: 20, closeAfterMin: 5, workThresholdSec: 120, heavySlots: 1, heavyMaxLoad: 80,
   guard: { loadAlert: 150, loadOk: 80, memFreeMinPct: 20, diskFreeMinGb: 50, panesMax: 20 }, hooks: {}, ingress: [],
 });
-export const configPath = (): string => process.env.DORI_CONFIG ?? join(homedir(), ".dori", "config.json");
+export const configPath = (home = homedir()): string => {
+  if (process.env.DORI_CONFIG) return resolve(expandHome(process.env.DORI_CONFIG, home));
+  if (process.env.IYEN_HOME) return resolve(expandHome(process.env.IYEN_HOME, home), "config.json");
+  const current = join(home, ".dori-codex", "config.json"), legacy = join(home, ".dori", "config.json");
+  return existsSync(current) || !existsSync(legacy) ? current : legacy;
+};
 export const expandHome = (path: string, home = homedir()): string => path === "~" ? home : path.startsWith("~/") ? join(home, path.slice(2)) : path;
 export const legacyKeys = ["agentCommand", "defaultModel", "launchKeywords", "sessionsDir", "deadPanePatterns"] as const;
 export const parseConfig = (raw: Record<string, any>, home = homedir()): DoriConfig => {
@@ -42,6 +48,7 @@ export const parseConfig = (raw: Record<string, any>, home = homedir()): DoriCon
   if (cfg.runtime.externalBinary !== undefined && (typeof cfg.runtime.externalBinary !== "string" || !cfg.runtime.externalBinary.trim())) throw new Error("externalBinary must be a nonempty executable path or command");
   if (cfg.runtime.settingsHome !== undefined && (typeof cfg.runtime.settingsHome !== "string" || !cfg.runtime.settingsHome)) throw new Error("settingsHome must be a directory path");
   if (cfg.leadWorkspace !== undefined && typeof cfg.leadWorkspace !== "string") throw new Error("leadWorkspace must be a string");
+  if (cfg.personaDir !== undefined && (typeof cfg.personaDir !== "string" || !cfg.personaDir.trim())) throw new Error("personaDir must be a nonempty directory path");
   if (!["read-only", "workspace-write", "danger-full-access"].includes(cfg.runtime.sandbox) || !["untrusted", "on-request", "never"].includes(cfg.runtime.approvalPolicy)) throw new Error("Invalid runtime policy");
   for (const [key, value] of Object.entries(cfg.runtime)) if (key.endsWith("Ms") && (!Number.isFinite(value) || Number(value) <= 0)) throw new Error(`Invalid ${key}`);
   if (cfg.runtime.heartbeatTimeoutMs <= cfg.runtime.heartbeatIntervalMs) throw new Error("heartbeat timeout must exceed interval");
@@ -59,8 +66,20 @@ export const parseConfig = (raw: Record<string, any>, home = homedir()): DoriCon
   return { ...cfg, stateDir: expandHome(process.env.DORI_STATE_DIR ?? cfg.stateDir, home), defaultCwd: expandHome(cfg.defaultCwd, home), leadPane: process.env.DORI_LEAD_PANE ?? cfg.leadPane };
 };
 export const loadConfig = async (path = configPath(), home = homedir()): Promise<DoriConfig> => {
-  const f = Bun.file(path);
-  return parseConfig(await f.exists() ? await f.json() : {}, home);
+  const absolute = resolve(expandHome(path, home)), root = dirname(absolute), f = Bun.file(absolute);
+  const raw = await f.exists() ? await f.json() : {};
+  // Omission historically means ~/.dori/state, even for a custom config path.
+  // New installers write an explicit home-relative store; never redirect an
+  // existing installation's implicit store just because its config moved.
+  const config = parseConfig(raw, home);
+  const persona = config.personaDir ?? (existsSync(join(root, "persona")) || !existsSync(join(root, "memory")) ? "persona" : "memory");
+  return { ...config, stateDir: resolve(root, config.stateDir), personaDir: resolve(root, expandHome(persona, home)) };
+};
+// Read on each invocation: the persistent installation is independent of the
+// caller's project and of the short-lived attached Codex conversation.
+export const installationPaths = async (path = configPath(), home = homedir()) => {
+  const config_path = resolve(expandHome(path, home)), config = await loadConfig(config_path, home);
+  return { config_path, config_exists: existsSync(config_path), home_dir: dirname(config_path), state_dir: config.stateDir, persona_dir: config.personaDir! };
 };
 export const workspaceForRole = (config: DoriConfig, role = "lane"): string => role === "lead" ? config.leadWorkspace ?? config.laneWorkspace : config.laneWorkspace;
 export const fill = (template: ArgvTemplate, values: Readonly<Record<string, string>>): string[] => template.map(part => part.replace(/\{(\w+)\}/g, (whole, name: string) => values[name] ?? whole));
