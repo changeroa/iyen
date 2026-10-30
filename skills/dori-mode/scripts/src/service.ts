@@ -484,6 +484,27 @@ export class DoriService {
     };
     const session = (row: any): string | undefined => row?.agent === "codex" && row.agent_session?.agent === "codex" &&
       row.agent_session.kind === "id" && typeof row.agent_session.value === "string" && THREAD_UUID.test(row.agent_session.value) ? row.agent_session.value : undefined;
+    const emptyShell = async (): Promise<void> => {
+      const inspect = async () => {
+        const info = (await read(["pane", "process-info", "--pane", source.pane]))?.process_info;
+        const foreground = info?.foreground_processes;
+        if (info?.pane_id !== source.pane || !Number.isSafeInteger(info.shell_pid) || info.shell_pid <= 0 ||
+          info.foreground_process_group_id !== info.shell_pid || !Array.isArray(foreground) || foreground.length !== 1 ||
+          foreground[0].pid !== info.shell_pid || !["sh", "bash", "zsh", "fish", "dash", "ksh"].includes(String(foreground[0].name).split("/").at(-1)!.replace(/^-/, ""))) throw unknown();
+        return info.shell_pid as number;
+      };
+      const shell = await inspect();
+      // A foreground shell alone also describes a suspended/background Codex.
+      // Require a complete local process table with no children of this shell.
+      let result;
+      try { result = await this.runner(["ps", "-axo", "pid=,ppid="], { timeoutMs: this.config.runtime.rpcTimeoutMs }); }
+      catch { throw unknown(); }
+      if (result.code !== 0 || !result.out.trim()) throw unknown();
+      const rows = result.out.trim().split("\n").map(line => line.trim().split(/\s+/));
+      if (rows.some(row => row.length !== 2 || row.some(value => !/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)))) ||
+          new Set(rows.map(row => row[0])).size !== rows.length || !rows.some(row => Number(row[0]) === shell) ||
+          rows.some(row => Number(row[1]) === shell) || await inspect() !== shell) throw unknown();
+    };
     const observe = async (): Promise<string[]> => {
       const snapshot = (await read(["api", "snapshot"]))?.snapshot;
       if (!Array.isArray(snapshot?.panes) || !Array.isArray(snapshot?.agents)) throw unknown();
@@ -497,6 +518,7 @@ export class DoriService {
       const targetRows = rows.filter(row => row.pane_id === target.pane);
       if (targetRows.length !== 2 || targetRows.some(row => session(row) !== target.threadId) || rows.some(row => session(row) === target.threadId && row.pane_id !== target.pane)) throw unknown();
       const priorRows = rows.filter(row => row.pane_id === source.pane);
+      if (priorRows.length === 1 && !priorRows[0].agent && !priorRows[0].agent_session) return [session(targetRows[0])!, "shell"];
       if (priorRows.length && (priorRows.length !== 2 || priorRows.some(row => !session(row)) || session(priorRows[0]) !== session(priorRows[1]))) throw unknown();
       // Absence in both complete collections proves a closed pane. Otherwise
       // require an exact, different Codex UUID, confirmed by agent get below.
@@ -504,6 +526,7 @@ export class DoriService {
     };
     const before = await observe();
     for (const pane of new Set([target.pane, ...(before.length > 1 ? [source.pane] : [])])) {
+      if (pane === source.pane && before[1] === "shell") { await emptyShell(); continue; }
       const agent = (await read(["agent", "get", pane]))?.agent;
       if (agent?.agent_session?.value === source.threadId) throw live();
       if (agent?.pane_id !== pane || !session(agent) || session(agent) !== before[pane === target.pane ? 0 : 1]) throw unknown();

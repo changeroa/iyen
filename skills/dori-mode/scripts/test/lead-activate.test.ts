@@ -13,7 +13,7 @@ afterEach(() => { for (const done of cleanup.splice(0)) done(); });
 function fixture() {
   const state = withState(), calls: string[][] = [], socketPath = join(state.dir, "shared.sock");
   const config = { ...defaultConfig(), stateDir: state.dir, defaultCwd: state.dir, runtime: { ...defaultConfig().runtime, binary: process.execPath, rpcTimeoutMs: 100 } };
-  let mode = "live", same = false, snapshots = 0;
+  let mode = "live", same = false, snapshots = 0, processReads = 0;
   let onSnapshot: (count: number) => void = () => {};
   const pane = () => same ? "old:pane" : "new:pane";
   const agent = (p: string, id: string) => ({ pane_id: p, agent: "codex", agent_status: "idle", agent_session: { agent: "codex", kind: "id", value: id } });
@@ -29,6 +29,15 @@ function fixture() {
     calls.push([...argv]); const ok = (result: unknown) => ({ code: 0, out: JSON.stringify(result), err: "" });
     if (argv[1] === "app-server") return ok({ status: "running", cliVersion: "0.200.0", appServerVersion: "0.200.0", socketPath });
     if (argv[1] === "queue" && argv[2] === "--help") return { code: 0, out: "queue --thread <UUID> --message <TEXT>", err: "" };
+    if (argv[0] === "ps") {
+      if (mode === "shell-malformed") return { code: 0, out: "unreadable", err: "" };
+      if (mode === "shell-missing") return { code: 1, out: "", err: "unsupported" };
+      return { code: 0, out: `1 0\n100 1\n${mode === "shell-busy" ? "200 100\n" : ""}`, err: "" };
+    }
+    if (argv[1] === "pane" && argv[2] === "process-info") {
+      const pid = mode === "shell-race" && ++processReads > 1 ? 101 : 100;
+      return ok({ result: { process_info: { pane_id: "old:pane", shell_pid: pid, foreground_process_group_id: pid, foreground_processes: [{ pid, name: "zsh" }] } } });
+    }
     if (argv[0] === "herdr" && argv[1] === "agent" && argv[2] === "get") {
       const p = argv[3]!;
       return ok({ result: { agent: agent(p, p === pane() && (!same || mode === "replaced") && mode !== "bad-target" ? newId : oldId) } });
@@ -41,7 +50,9 @@ function fixture() {
       if (!same && ["live", "unknown"].includes(mode)) panes.push(mode === "unknown" ? { pane_id: "old:pane", agent_status: "unknown" } as any : agent("old:pane", oldId));
       if (mode === "moved") panes.push(agent("moved:pane", oldId));
       if (mode === "duplicate") panes.push(agent("duplicate:pane", newId));
-      return ok({ result: { snapshot: { panes, agents: structuredClone(panes) } } });
+      const agents = structuredClone(panes);
+      if (mode.startsWith("shell")) panes.push({ pane_id: "old:pane", agent_status: "unknown" } as any);
+      return ok({ result: { snapshot: { panes, agents } } });
     }
     throw new Error(`Unexpected mutation: ${argv.join(" ")}`);
   };
@@ -57,11 +68,11 @@ test("operator-only activation attaches first session and reuses same attachment
   expect(await h.attach()).toMatchObject({ attached: true, reused: true }); expect(h.saved()).toEqual(before);
   await expect(h.s.handle("lead-activate", { threadId: newId, pane: "new:pane", cwd: h.state.dir }, { role: "lane", key: "worker" })).rejects.toThrow("operator");
 });
-for (const mode of ["closed", "same-pane"]) test(`replaces terminated prior TUI (${mode}), no replay, revokes old bridge`, async () => {
+for (const mode of ["closed", "same-pane", "shell"]) test(`replaces terminated prior TUI (${mode}), no replay, revokes old bridge`, async () => {
   const h = fixture(); await h.attach(); const old = h.saved();
   for (const state of ["queued", "unknown", "sent"] as const) h.s.inbox.put({ id: state, target: "lead", text: state, state, at: "2026-01-01", attachmentInstance: old.instance });
   const mail = structuredClone(h.s.inbox.list());
-  if (mode === "closed") h.mode("closed"); else { h.same(); h.mode("replaced"); }
+  if (mode !== "same-pane") h.mode(mode); else { h.same(); h.mode("replaced"); }
   expect(await h.activate()).toMatchObject({ attached: true, handedOff: true, threadId: newId, mailIds: [] });
   expect(h.saved().instance).not.toBe(old.instance); expect(h.saved().generation).toBe(old.generation + 1);
   expect(h.saved().excludedInboxIds.sort()).toEqual(["queued", "sent", "unknown"]); expect(h.s.inbox.list()).toEqual(mail);
@@ -70,7 +81,7 @@ for (const mode of ["closed", "same-pane"]) test(`replaces terminated prior TUI 
   const current = h.saved(); await h.activate(); expect(h.saved()).toEqual(current);
   expect(h.calls.filter(argv => argv[1] === "queue" && argv[2] !== "--help" || argv[1] === "agent" && argv[2] !== "get")).toHaveLength(0);
 });
-for (const mode of ["live", "unknown", "malformed", "offline", "bad-target", "moved", "duplicate"]) test(`refuses ${mode} observation without mutation or revocation`, async () => {
+for (const mode of ["live", "unknown", "malformed", "offline", "bad-target", "moved", "duplicate", "shell-busy", "shell-missing", "shell-malformed", "shell-race"]) test(`refuses ${mode} observation without mutation or revocation`, async () => {
   const h = fixture(); await h.attach(); const old = h.saved(), lane = await h.s.registry.read("lead"); h.mode(mode);
   await expect(h.activate()).rejects.toThrow(); expect(h.saved()).toEqual(old); expect(await h.s.registry.read("lead")).toEqual(lane);
   expect(await h.s.authorize(old.token)).toMatchObject({ instance: old.instance });
