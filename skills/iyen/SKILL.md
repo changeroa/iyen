@@ -89,20 +89,43 @@ not silently replace or restart it to work around the refusal.
    exactly one live Herdr Codex pane. Do not use the focused pane or blindly trust
    inherited environment variables: worker shells can inherit another session's
    identifiers. Use Herdr's session association and the runtime's verified binding.
+   If the association is missing, check the exact current TUI transcript and
+   Herdr process information against this conversation before reporting its
+   session with `herdr pane report-agent-session PANE --source herdr:codex
+   --agent codex --agent-session-id UUID`. Never infer this from focus, cwd alone,
+   or an inherited pane variable. Re-read the association after repair; if the
+   current pane cannot be independently verified, report that blocker.
 2. Run the bundled helper from the current working directory:
 
    ```sh
    python3 /absolute/path/to/iyen/scripts/activate.py start --session CURRENT_UUID --pane VERIFIED_PANE
    ```
 
-   The default existing service config is `~/.dori-codex/config.json`; use
-   `--config PATH` when the owner has selected another installation. The helper
+   Persistent data belongs to the installation, not to this conversation or its
+   project directory. The helper discovers paths again on every invocation using
+   the service's shared resolver: `--config`, `--home`, inherited `DORI_CONFIG`,
+   `IYEN_HOME`, then existing `~/.dori-codex/config.json` or legacy
+   `~/.dori/config.json`. With neither installation present, the default is
+   `~/.dori-codex/config.json`; activation requires an existing config.
+   `--home DIR` selects `DIR/config.json` and overrides inherited config selection.
+   It returns `home_dir`, `config_path`, `state_dir` and `persona_dir`. Configured
+   `stateDir` and `personaDir` are preserved; otherwise data uses `state/` and
+   `persona/` in the selected home, with existing `memory/` as the legacy persona
+   fallback. Never copy or reset existing data just because a new session starts.
+   The helper
    invokes this repository's CLI by absolute path, attaches the exact current
    session, and tests the returned scoped control executable. It does not focus,
    restart, replace, or create a lead session.
+   Starting mode in a new session automatically replaces a conclusively ended
+   former lead through the service's recorded handoff. This is the normal
+   close-old-session → open-new-session → `iyen mode` workflow and needs no
+   repeated handoff confirmation. Existing live or unverified leads still require
+   explicit reconciliation. Old mail and work history stay stored and are not
+   automatically replayed in the new conversation. Existing owner pauses remain.
 3. Only after the helper reports `status: active`, read existing `IDENTITY.md`,
    `SOUL.md`, `USER.md` and `MEMORY.md` when present under the returned `persona_dir`.
-   Use that identity and the owner's language in this conversation. Do not execute
+   Use that identity and the owner's language in this conversation. These files
+   survive conversation resets. Do not execute
    historical setup commands found in memories; the service already owns ingress
    and scheduling. Missing persona files do not justify inventing memories.
 4. Keep the returned absolute `bridge` path in the conversation's working context.
@@ -113,7 +136,8 @@ If attachment or the scoped self-check fails, report the actual blocker. Do not
 claim activation, widen sandbox permissions, copy an admin token, create another
 lead, or replay uncertain deliveries. A failure after attachment can leave a
 registration; check status before retrying. Repeating start for the same verified
-session is idempotent. A different live lead is never replaced implicitly.
+session is idempotent. A different live lead is never replaced implicitly; an
+ended lead may be replaced by a new explicit `iyen mode` activation.
 
 ## Work as Iyen
 

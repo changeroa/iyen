@@ -16,7 +16,7 @@ class ActivationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        root = Path(self.temp.name)
+        root = Path(self.temp.name).resolve()
         self.config = root / "config.json"
         self.config.write_text("{}")
         self.bridge = root / "scoped-dori"
@@ -34,12 +34,16 @@ class ActivationTests(unittest.TestCase):
         self.calls = []
 
     def command(self, argv, env=None, timeout=30):
-        self.calls.append((argv, env))
+        self.calls.append((argv, env.copy() if env is not None else None))
+        if argv[-1] == "paths":
+            return {"config_path": str(self.config), "home_dir": str(self.config.parent),
+                    "state_dir": str(self.config.parent / "state"),
+                    "persona_dir": str(self.config.parent / "memory"), "config_exists": True}
         if argv == ["herdr", "agent", "list"]:
             return {"result": {"agents": [self.agent]}}
         if argv[0] == str(self.bridge):
             return copy.deepcopy(self.lead)
-        if "lead-attach" in argv:
+        if "lead-activate" in argv:
             return {"attached": True, "bridge": str(self.bridge), "lead": copy.deepcopy(self.lead)}
         if "lead-handoff-preview" in argv:
             return {"eligible": ["saved-message"]}
@@ -59,19 +63,21 @@ class ActivationTests(unittest.TestCase):
         result = self.run_helper()
         self.assertEqual(result["status"], "active")
         self.assertEqual(result["session"], SESSION)
-        attach, env = self.calls[1]
+        attach, env = self.calls[2]
         self.assertTrue(Path(attach[1]).is_absolute())
         self.assertTrue(attach[1].endswith("skills/dori-mode/scripts/src/cli.ts"))
-        self.assertEqual(attach[2:7], ["lead-attach", "--thread-id", SESSION, "--pane", PANE])
+        self.assertEqual(attach[2:7], ["lead-activate", "--thread-id", SESSION, "--pane", PANE])
         self.assertEqual(env["DORI_CONFIG"], str(self.config.resolve()))
         self.assertEqual(self.calls[-1][0], [str(self.bridge), "status", "lead"])
-        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(len(self.calls), 4)
+        self.assertEqual(result["persona_dir"], str(self.config.parent / "memory"))
+        self.assertEqual(result["state_dir"], str(self.config.parent / "state"))
 
     def test_other_pane_never_reaches_mutating_command(self):
         self.args.pane = "w1:p9"
         with self.assertRaisesRegex(activate.ActivationError, "different session"):
             self.run_helper()
-        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.calls), 2)
 
     def test_ambiguous_session_is_not_selected_by_focus(self):
         with patch.object(activate, "command", return_value={"result": {"agents": [self.agent, self.agent]}}):
@@ -99,19 +105,19 @@ class ActivationTests(unittest.TestCase):
         self.args.action = "stop"
         self.assertEqual(self.run_helper()["status"], "detached")
         self.assertEqual(self.calls[-1][0][-3:], ["lead-detach", "--thread-id", SESSION])
-        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.calls), 3)
 
     def test_status_does_not_attach(self):
         self.args.action = "status"
         self.assertEqual(self.run_helper()["status"], "active")
-        self.assertFalse(any("lead-attach" in argv for argv, _ in self.calls))
+        self.assertFalse(any("lead-activate" in argv for argv, _ in self.calls))
 
     def test_handoff_preview_never_detaches_or_claims_activation(self):
         self.args.action = "handoff-preview"
         self.args.from_session = "22222222-2222-4222-8222-222222222222"
         result = self.run_helper()
         self.assertEqual(result["status"], "preview")
-        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.calls), 3)
         self.assertIn("lead-handoff-preview", self.calls[-1][0])
         self.assertFalse(any("lead-detach" in argv for argv, _ in self.calls))
 
@@ -126,7 +132,7 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.args.mail_id = ["message-one", "message-two"]
         self.assertEqual(self.run_helper()["status"], "active")
-        argv = self.calls[1][0]
+        argv = self.calls[2][0]
         self.assertEqual(argv.count("--mail-id"), 2)
         self.assertIn("handoff-1", argv)
         self.assertIn(self.args.from_session, argv)
@@ -138,7 +144,7 @@ class ActivationTests(unittest.TestCase):
         self.args.operation_id = "handoff-empty"
         self.args.no_mail = True
         self.assertEqual(self.run_helper()["status"], "active")
-        self.assertIn("--no-mail", self.calls[1][0])
+        self.assertIn("--no-mail", self.calls[2][0])
 
     def test_handoff_cannot_omit_expected_source_or_bypass_target_identity(self):
         self.args.action = "handoff-preview"
@@ -149,7 +155,7 @@ class ActivationTests(unittest.TestCase):
         self.args.pane = "w1:p9"
         with self.assertRaisesRegex(activate.ActivationError, "different session"):
             self.run_helper()
-        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.calls), 2)
 
     def test_unverified_public_status_cannot_report_active(self):
         self.lead["identityVerified"] = False
@@ -166,7 +172,7 @@ class ActivationTests(unittest.TestCase):
         }}
         with self.assertRaisesRegex(activate.ActivationError, "daemon 0.164.0 differ"):
             self.run_helper()
-        self.assertFalse(any("lead-attach" in argv for argv, _ in self.calls))
+        self.assertFalse(any("lead-activate" in argv for argv, _ in self.calls))
 
     def test_held_status_prefers_latest_cause_over_original_failure(self):
         self.args.action = "status"
@@ -177,6 +183,51 @@ class ActivationTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(activate.ActivationError, "Current session identity changed"):
             self.run_helper()
+
+    def test_explicit_home_and_config_precedence_and_inherited_state_is_cleared(self):
+        self.args.home = str(self.config.parent)
+        self.args.config = None
+        with patch.dict(os.environ, {"DORI_CONFIG": "/wrong/config.json", "DORI_STATE_DIR": "/wrong/state"}, clear=True), patch.object(activate.shutil, "which", return_value="/usr/bin/bun"), patch.object(activate, "command", side_effect=self.command):
+            result = activate.activate(self.args)
+        paths_env = self.calls[0][1]
+        self.assertEqual(paths_env["IYEN_HOME"], str(self.config.parent))
+        self.assertNotIn("DORI_CONFIG", paths_env)
+        self.assertNotIn("DORI_STATE_DIR", paths_env)
+        self.assertEqual(result["config_path"], str(self.config))
+        self.calls.clear()
+        self.args.config = str(self.config)
+        self.args.home = "/ignored/home"
+        self.run_helper()
+        self.assertEqual(self.calls[0][1]["DORI_CONFIG"], str(self.config))
+        self.assertNotIn("IYEN_HOME", self.calls[0][1])
+
+    def test_installation_is_resolved_again_for_each_activation(self):
+        first = self.run_helper()
+        other = self.config.parent / "second"
+        other.mkdir()
+        self.config = other / "config.json"
+        self.config.write_text("{}")
+        self.args.config = str(self.config)
+        second = self.run_helper()
+        self.assertNotEqual(first["home_dir"], second["home_dir"])
+        self.assertEqual(second["persona_dir"], str(other / "memory"))
+
+    def test_bad_installation_path_or_missing_config_never_mutates_service(self):
+        original = self.command
+        def invalid(argv, env=None, timeout=30):
+            result = original(argv, env, timeout)
+            if argv[-1] == "paths":
+                result["state_dir"] = "relative/state"
+            return result
+        with patch.dict(os.environ, {}, clear=True), patch.object(activate.shutil, "which", return_value="/usr/bin/bun"), patch.object(activate, "command", side_effect=invalid):
+            with self.assertRaisesRegex(activate.ActivationError, "invalid installation path"):
+                activate.activate(self.args)
+        self.assertEqual(len(self.calls), 1)
+        self.calls.clear()
+        self.config.unlink()
+        with self.assertRaisesRegex(activate.ActivationError, "configuration not found"):
+            self.run_helper()
+        self.assertEqual(len(self.calls), 1)
 
 
 if __name__ == "__main__":
