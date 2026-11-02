@@ -1,12 +1,12 @@
 export type Ran = { readonly code: number; readonly out: string; readonly err: string };
-export type RunOptions = { readonly cwd?: string; readonly timeoutMs?: number; readonly signal?: AbortSignal };
+export type RunOptions = { readonly cwd?: string; readonly timeoutMs?: number; readonly signal?: AbortSignal; readonly env?: Record<string, string> };
 export type Runner = (argv: readonly string[], opts?: RunOptions) => Promise<Ran>;
 
 export const run: Runner = async (argv, opts = {}) => {
   if (opts.signal?.aborted) return { code: 124, out: "", err: "cancelled" };
   let p: ReturnType<typeof Bun.spawn>;
   try {
-    p = Bun.spawn([...argv], { stdout: "pipe", stderr: "pipe", ...(opts.cwd ? { cwd: opts.cwd } : {}), ...(opts.timeoutMs ? { timeout: opts.timeoutMs, killSignal: "SIGKILL" } : {}) });
+    p = Bun.spawn([...argv], { stdout: "pipe", stderr: "pipe", ...(opts.env ? { env: opts.env } : {}), ...(opts.cwd ? { cwd: opts.cwd } : {}), ...(opts.timeoutMs ? { timeout: opts.timeoutMs, killSignal: "SIGKILL" } : {}) });
   } catch (e) {
     return { code: 127, out: "", err: e instanceof Error ? e.message : String(e) };
   }

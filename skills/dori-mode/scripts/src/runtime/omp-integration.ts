@@ -16,10 +16,13 @@ import type { Bootstrap } from "./session-host.ts";
 import type { RuntimeInputReceipt, RuntimeRef, RuntimeSnapshot } from "./types.ts";
 
 /** Establish the same narrow process boundary as managed Codex, without inherited service/admin context. */
-export const ompManagedEnvironment = (settingsHome: string, pane: { pane_id: string; tab_id: string; workspace_id: string }, env: NodeJS.ProcessEnv = process.env): Record<string, string> => {
+export const ompProfileEnvironment = (settingsHome: string, env: NodeJS.ProcessEnv = process.env): Record<string, string> => {
   const safe: Record<string, string> = {};
   for (const key of ["HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "TERM", "OPENAI_API_KEY"]) if (env[key]) safe[key] = env[key]!;
-  return { ...safe, PATH: `${dirname(process.execPath)}:${env.PATH ?? "/usr/bin:/bin"}`, PI_CODING_AGENT_DIR: settingsHome,
+  return { ...safe, PATH: `${dirname(process.execPath)}:${env.PATH ?? "/usr/bin:/bin"}`, PI_CODING_AGENT_DIR: settingsHome };
+};
+export const ompManagedEnvironment = (settingsHome: string, pane: { pane_id: string; tab_id: string; workspace_id: string }, env: NodeJS.ProcessEnv = process.env): Record<string, string> => {
+  return { ...ompProfileEnvironment(settingsHome, env),
     HERDR_ENV: "1", HERDR_PANE_ID: pane.pane_id, HERDR_TAB_ID: pane.tab_id, HERDR_WORKSPACE_ID: pane.workspace_id,
     ...(env.HERDR_SOCKET_PATH ? { HERDR_SOCKET_PATH: env.HERDR_SOCKET_PATH } : {}) };
 };
@@ -58,7 +61,7 @@ export const prepareOmpHostSocket = async (stateDir: string, boot: Pick<Bootstra
 };
 export const ompSnapshot = (snap: OmpSnapshot): RuntimeSnapshot => ({ threadId: snap.identity.sessionId, state: snap.state, activeTurnId: snap.activeRunId, goal: snap.goal,
   held: snap.held, inputReady: !snap.held && snap.goal?.status !== "paused" && snap.state === "idle" && snap.capabilities.input && snap.capabilities.durableReceipts });
-export const ompVersionMatches = (output: string, version: string): boolean => output.trim() === version || output.trim() === `omp ${version}`;
+export const ompVersionMatches = (output: string, version: string): boolean => [version, `omp ${version}`, `omp/${version}`].includes(output.trim());
 export const discoverOmpSafe = async (dir: string): Promise<OmpTarget[]> => {
   try { return await discoverOmp(dir); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
@@ -138,7 +141,7 @@ const runOmpOwnedSessionHost = async (stateDir: string, boot: Bootstrap): Promis
   if (!omp || boot.role !== "lane" || boot.key === "lead") throw new Error("Invalid managed OMP host");
   const role = { ...config.runtime.roles.lane, ...(boot.model ? { model: boot.model } : {}) };
   if (!role.model || !role.effort) throw new Error("OMP requires explicit provider/model/effort");
-  const version = await run([config.runtime.binary, "--version"]);
+  const version = await run([config.runtime.binary, "--version"], { env: ompProfileEnvironment(config.runtime.settingsHome!) });
   if (version.code !== 0 || !ompVersionMatches(version.out, config.runtime.requiredVersion)) throw new Error("OMP version mismatch");
   const checkpoint = join(stateDir, "hosts", `${boot.key}.runtime.json`);
   const prior = existsSync(checkpoint) ? readJson<{ threadId: string; target: OmpTarget; held: boolean; pid?: number }>(checkpoint) : undefined;

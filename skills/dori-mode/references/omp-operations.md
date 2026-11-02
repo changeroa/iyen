@@ -46,6 +46,14 @@ External text, ambient guest conversation, transcripts and channel system prompt
 
 ## Provider readiness: record each layer separately
 
+For an OpenAI subscription deployment, use OMP's native `openai-codex` provider.
+Authenticate with `PI_CODING_AGENT_DIR=/EXACT/ISOLATED/agent /EXACT/omp login openai-codex`
+or `/login` in that same profile, then list available routes with
+`omp models openai-codex --json` under the same environment. Set `runtime.omp.provider`
+to `openai-codex` and choose an actually available model ID in `runtime.roles.lane`.
+OAuth in the isolated native store works without an `OPENAI_API_KEY` environment
+variable. Never infer successful authentication from a model listing alone.
+
 | Evidence | What it establishes | What remains unverified |
 | --- | --- | --- |
 | Exact authenticated controller identity and native provider/model/effort snapshot | Identity and selected route of that native session | Provider authentication and successful inference |
@@ -58,3 +66,17 @@ OMP doctor checks native identity, selected managed-lane model/effort and contro
 The old OMO route `anthropic-subscription/claude-opus-5-5` is historical configuration, not proof that the installed OMP supports that provider or has its credentials. The managed process environment currently preserves `OPENAI_API_KEY`; other auth may work through explicitly configured isolated settings or a supported provider wrapper. Neither fact proves all non-OpenAI authentication broken or working. This change does not copy auth stores, broaden environment inheritance, rewrite providers or inspect credential contents. If the chosen provider needs a different environment contract, verify that actual contract and both process boundaries in a separate authorized change.
 
 Record implementation tests, authenticated model/tool smoke and deployment as separate outcomes. Fixture-only tests make no model calls and send no messenger messages. Long worker failure/recovery, adapter restart and a verified merged/deployed SHA remain separate release acceptance checks.
+
+## Durable worker failure notices
+
+Managed controllers expose a paginated, session-bound terminal-failure journal.
+The host forwards sanitized model/compaction categories to the service and saves
+its cursor only after durable acceptance. Restart replay uses the same failure ID,
+so it neither duplicates a notice nor reassigns it to a newer lead attachment.
+Transient retries and explicit cancellation do not produce terminal notices;
+a genuine terminal error racing a hold remains reportable. No task is automatically
+retried. Journal/cursor corruption or a missing durable-failure capability blocks
+managed readiness instead of silently losing failures. Preserve these private
+files during recovery; retention/garbage collection is not automatic. A native
+process crash before its failure callback was durably recorded cannot be
+reconstructed by this channel and still requires ordinary disconnected recovery.

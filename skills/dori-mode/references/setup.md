@@ -94,6 +94,13 @@ Untrusted working directories retain Codex’s real folder-trust UI. Startup rep
 
 ## Opt-in OMP profile alongside Codex
 
+For worker tool instructions, deterministic legacy lead bootstrap and separate
+provider/authentication readiness checks, see [OMP operations](omp-operations.md).
+For existing Slack/Discord pane dispatchers, see [legacy compatibility](legacy-compat.md);
+the opt-in shim preserves their receive/accept/finish/outbound stack and defaults
+to installation dry-run. Source ACK, native input receipt and messenger completion
+are separate stages.
+
 The installer and `config.example.json` retain their Codex defaults. Use the
 separate [OMP example](config.omp.example.json) for an opt-in profile; leave your
 installed Codex config, service, credentials and state in place. The procedure

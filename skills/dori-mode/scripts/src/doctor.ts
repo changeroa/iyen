@@ -2,12 +2,12 @@ import { existsSync, lstatSync } from "node:fs";
 import type { DoriConfig } from "./config.ts";
 import { run } from "./run.ts";
 import { connectOmp } from "./runtime/omp/client.ts";
-import { discoverOmpSafe, ompVersionMatches, verifyOmpHerdr } from "./runtime/omp-integration.ts";
+import { discoverOmpSafe, ompProfileEnvironment, ompVersionMatches, verifyOmpHerdr } from "./runtime/omp-integration.ts";
 import { startCodex } from "./runtime/codex.ts";
 export const doctor = async (config: DoriConfig): Promise<{ ok: boolean; checks: { name: string; ok: boolean; detail: string }[] }> => {
   const checks: { name: string; ok: boolean; detail: string }[] = [];
   if (config.runtime.kind === "omp") {
-    const binary = await run([config.runtime.binary, "--version"], { timeoutMs: 10000 });
+    const binary = await run([config.runtime.binary, "--version"], { timeoutMs: 10000, env: ompProfileEnvironment(config.runtime.settingsHome!) });
     checks.push({ name: "omp", ok: binary.code === 0 && ompVersionMatches(binary.out, config.runtime.requiredVersion), detail: `requires ${config.runtime.requiredVersion}` });
     const bun = (process.versions.bun ?? "0.0.0").split(".").map(Number);
     checks.push({ name: "bun", ok: bun[0]! > 1 || bun[0] === 1 && (bun[1]! > 4 || bun[1] === 4 && bun[2]! >= 4), detail: `running ${process.versions.bun ?? "unavailable"}; OMP requires tested Bun >=1.4.4` });

@@ -6,11 +6,12 @@ import { atomicJson } from "../src/journal.ts";
 import { DoriService } from "../src/service.ts";
 import { hostSocket } from "../src/ipc.ts";
 import { bootstrapPath } from "../src/runtime/session-host.ts";
-import { ompManagedEnvironment, ompPaneCommand, verifyOmpHerdr, discoverOmpSafe, waitForOmpDetach } from "../src/runtime/omp-integration.ts";
+import { ompManagedEnvironment, ompProfileEnvironment, ompPaneCommand, ompVersionMatches, verifyOmpHerdr, discoverOmpSafe, waitForOmpDetach } from "../src/runtime/omp-integration.ts";
 import { payloadHash } from "../src/runtime/omp/contract.ts";
 import { readWatchTarget, DeliveryWatchdog } from "../src/watchdog.ts";
 import { ompFixture } from "./fixtures/omp.ts";
 import type { Runner } from "../src/run.ts";
+import { run } from "../src/run.ts";
 const profile = (dir: string): DoriConfig => ({ ...defaultConfig(dir), stateDir: join(dir, "state"), runtime: { ...defaultConfig(dir).runtime,
   kind: "omp", binary: "/fixture/omp", requiredVersion: "18.15.0", rpcTimeoutMs: 200, sandbox: "danger-full-access", settingsHome: join(dir, "profile"),
   roles: { lead: { model: null, effort: null }, lane: { model: "test", effort: "medium" } },
@@ -21,6 +22,10 @@ const association = (f: ReturnType<typeof ompFixture>): Runner => async argv => 
   return { code: 0, err: "", out: JSON.stringify({ result: { agents: [{ agent: "omp", cwd: f.identity.cwd, pane_id: f.identity.paneId, terminal_id: f.identity.terminalId,
     agent_session: { agent: "omp", kind: "path", source: "herdr:omp", value: f.identity.sessionFile } }] } }) };
 };
+test("OMP version preflight accepts native CLI version format but rejects another version or noisy output", () => {
+  for (const output of ["18.15.0", "omp 18.15.0", "omp/18.15.0\n"]) expect(ompVersionMatches(output, "18.15.0")).toBe(true);
+  for (const output of ["omp/18.15.1", "other/18.15.0", "omp/18.15.0\nunverified", "omp/118.15.0"]) expect(ompVersionMatches(output, "18.15.0")).toBe(false);
+});
 test("OMP stop waits for delayed Herdr detach and does not wait for unrelated sessions", async () => {
   let attached = true, finished = false, observed!: () => void;
   const queried = new Promise<void>(resolve => { observed = resolve; });
@@ -67,6 +72,20 @@ test("managed OMP clears pane environment, filters messenger/admin credentials, 
   for (const key of ["SLACK_BOT_TOKEN", "DORI_CONTEXT", "CODEX_HOME", "BASH_ENV"]) expect(env[key]).toBeUndefined();
   const cmd = ompPaneCommand({ cwd: "/some path", env, argv: ["/bin/omp", "literal `x` $(x)"] });
   expect(cmd).toContain("env -i "); expect(cmd).toContain("'literal `x` $(x)'"); expect(cmd).not.toContain("messenger");
+});
+test("OMP version preflight resolves the service Bun ahead of ambient PATH in the exact isolated profile", async () => {
+  const f = ompFixture();
+  try {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const bin = join(f.directory, "ambient-bin"); mkdirSync(bin);
+    writeFileSync(join(bin, "bun"), "#!/bin/sh\necho WRONG_AMBIENT_BUN\nexit 41\n", { mode: 0o700 });
+    const wrapper = join(f.directory, "omp-wrapper");
+    writeFileSync(wrapper, '#!/bin/sh\nexec bun -e \'console.log(JSON.stringify({bun:process.versions.bun,profile:process.env.PI_CODING_AGENT_DIR,leaked:!!process.env.DORI_CONTEXT}))\'\n', { mode: 0o700 });
+    const env = ompProfileEnvironment(join(f.directory, "isolated-agent"), { PATH: `${bin}:/usr/bin:/bin`, DORI_CONTEXT: "must-not-inherit" });
+    const result = await run([wrapper, "--version"], { env });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.out)).toEqual({ bun: process.versions.bun, profile: join(f.directory, "isolated-agent"), leaked: false });
+  } finally { f.cleanup(); }
 });
 test("missing new registry is empty; wrong terminal association rejects", async () => {
   const f = ompFixture(); try { expect(await discoverOmpSafe(join(f.directory, "missing"))).toEqual([]); await expect(verifyOmpHerdr({ ...f.target, terminalId: "wrong" }, association(f))).rejects.toThrow("association mismatch"); } finally { f.cleanup(); }
@@ -182,6 +201,68 @@ test("activated bridge exposes JSON receipt lookup through its real scoped CLI",
     expect(await call("input-status", ...args)).toMatchObject({ status: "received", receiptKind: "omp-session-entry" });
     expect(inputs).toBe(1);
   } finally { server.stop(true); x.f.cleanup(); }
+});
+for (const change of ["generation", "row"] as const) {
+  test(`scoped delayed receipt lookup refuses ${change} mutation before commit`, async () => {
+    let started!: () => void, finish!: () => void;
+    const queried = new Promise<void>(resolve => { started = resolve; }), response = new Promise<void>(resolve => { finish = resolve; });
+    const x = await setup(async (method, params) => {
+      if (method !== "operation") throw new Error("No input allowed");
+      started(); await response; return { status: "received", receipt: receipt(x.f, params.operationId, "work") };
+    });
+    try {
+      const attached = await x.s.handle("lead-activate", x.args, { role: "admin" }), runtime = attached.lead.runtime;
+      const caller = { role: "lead" as const, key: "lead", instance: runtime.hostInstanceId };
+      x.s.inbox.put({ id: "scoped-delayed", target: "lead", text: "work", state: "unknown", at: new Date().toISOString(), attachmentInstance: runtime.hostInstanceId,
+        ompProvenance: { target: runtime.omp.target, attachmentInstanceId: runtime.hostInstanceId, attachmentGeneration: runtime.generation } });
+      const rejected = expect(x.s.handle("input-status", { key: "lead", text: "work", operationId: "scoped-delayed" }, caller)).rejects.toThrow();
+      await queried;
+      if (change === "generation") await x.s.registry.update("lead", lane => ({ ...lane, runtime: { ...lane.runtime!, generation: lane.runtime!.generation + 1 } }));
+      else x.s.inbox.mark("scoped-delayed", { source: "concurrent-reconciliation" });
+      finish(); await rejected;
+      expect(x.s.inbox.get("scoped-delayed")?.state).toBe("unknown");
+    } finally { finish?.(); x.f.cleanup(); }
+  });
+}
+test("OMP terminal notices survive host restart and do not rebind or become approval messages", async () => {
+  const f = ompFixture(), config = profile(f.directory), runner = association(f);
+  let service = new DoriService(config, runner);
+  const streamId = crypto.randomUUID();
+  const runtime = (instance: string, generation: number) => ({ kind: "omp" as const, backend: "herdr-tui" as const, threadId: f.identity.sessionId,
+    state: "idle" as const, hostInstanceId: instance, generation, binaryVersion: f.identity.runtimeVersion,
+    omp: { kind: "omp" as const, target: f.target, attachmentInstanceId: instance, attachmentGeneration: generation, attachedAt: new Date().toISOString(), excludedInboxIds: [] } });
+  const event = (sequence: number) => ({ method: "runtime/failure", params: { runtime: "omp", streamId, sessionId: f.identity.sessionId, sessionFile: f.identity.sessionFile, laneKey: "worker",
+    failure: { sequence, failureId: `omp-failure:${streamId}:${sequence}`, sourceInstanceId: f.identity.instanceId, sourceGeneration: 1,
+      executionId: `run:${sequence}`, phase: "model", category: "authentication", observedAt: "2026-11-02T00:00:00.000Z" } } });
+  const send = (sequence: number, instance = "host1", generation = 1, payload = event(sequence)) => service.handle("host-event",
+    { key: "worker", instance, runtime: runtime(instance, generation), event: payload }, { role: "host", key: "worker" });
+  try {
+    await service.registry.write({ key: "worker", role: "lane", title: "Worker", thread: "slack:root", brief: "", done: "", cwd: f.directory, pane: f.identity.paneId,
+      openedAt: new Date().toISOString(), runtime: runtime("host1", 1) });
+    atomicJson(join(config.stateDir, "attachments/lead.json"), { instance: "lead-before" });
+    await send(1); await send(2);
+    expect(service.failures.list()).toHaveLength(2);
+    expect(service.outbox.list()).toHaveLength(0);
+    expect(service.inbox.list()).toHaveLength(0);
+    // Simulate crash after durable service ACK but before the host cursor fsync.
+    service = new DoriService(config, runner);
+    await service.registry.update("worker", lane => ({ ...lane, runtime: runtime("host2", 2) }));
+    atomicJson(join(config.stateDir, "attachments/lead.json"), { instance: "lead-after" });
+    await send(1, "host2", 2); await send(2, "host2", 2); await service.notifyFailures();
+    expect(service.failures.list()).toHaveLength(2); expect(service.inbox.list()).toHaveLength(2);
+    for (const notice of service.inbox.list()) {
+      expect(notice).toMatchObject({ target: "lead", attachmentInstance: "lead-before", thread: "slack:root" });
+      expect(notice.text).toContain("OMP model failed (authentication)");
+      expect(notice.text).not.toContain("Codex");
+    }
+    const changed = event(1); changed.params.failure.category = "runtime";
+    await expect(send(1, "host2", 2, changed)).rejects.toThrow("different content");
+    const crossSession = event(3); crossSession.params.sessionId = crypto.randomUUID();
+    await expect(send(3, "host2", 2, crossSession)).rejects.toThrow("identity");
+    const raw = event(3) as any; raw.params.failure.error = "Authorization: sk-never-store";
+    await expect(send(3, "host2", 2, raw)).rejects.toThrow("identity");
+    expect(JSON.stringify(service.failures.list())).not.toContain("sk-never-store");
+  } finally { f.cleanup(); }
 });
 test("managed service pause is not blocked behind pending input receipt", async () => {
   const f = ompFixture(), config = profile(f.directory), s = new DoriService(config, association(f));

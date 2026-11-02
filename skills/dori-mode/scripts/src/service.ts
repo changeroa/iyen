@@ -18,7 +18,7 @@ import { run, realClock, type Runner } from "./run.ts";
 import { backendSocket, bootstrapPath, type Bootstrap } from "./runtime/session-host.ts";
 import type { RuntimeInputReceipt, ExternalHoldCode, RuntimeControl, RuntimeRef, RuntimeSnapshot } from "./runtime/types.ts";
 import { WorkTimers } from "./work.ts";
-import { turnFailure } from "./turn-failure.ts";
+import { turnFailure, ompFailureGuidance } from "./turn-failure.ts";
 import { DeliveryDeferred, Mailbox, postHook, type Mail } from "./mailbox.ts";
 import { ExternalCurrentSession, ExternalSessionError, discoverExternal, observeExternal, sharedDaemon, THREAD_UUID, type Attachment as CodexAttachment } from "./runtime/external-current-session.ts";
 import { connectObserver, receiptInTurns } from "./runtime/observer.ts";
@@ -29,7 +29,7 @@ import type { Turn } from "./runtime/generated/v2/Turn.ts";
 
 import { callOmp, findOmpTarget, verifyOmpHerdr, sameOmpTarget } from "./runtime/omp-integration.ts";
 import { connectOmp } from "./runtime/omp/client.ts";
-import { sameIdentity, validReceipt, payloadHash, type OmpTarget } from "./runtime/omp/contract.ts";
+import { sameIdentity, validReceipt, payloadHash, object, exactKeys, validateFailureRecord, type OmpTarget } from "./runtime/omp/contract.ts";
 type Attachment = CodexAttachment & { omp?: OmpTarget };
 
 export type Caller = { role: "admin" | "lead" | "lane" | "host"; key?: string; instance?: string };
@@ -557,9 +557,9 @@ export class DoriService {
     const current = await this.lane(lane.key);
     const stillAttached = !current.runtime?.external?.detachedAt && current.runtime?.state !== "stopped";
     const identityVerified = Boolean(snap) && stillAttached && current.runtime?.hostInstanceId === lane.runtime.hostInstanceId;
-    const inputReady = identityVerified && !current.dispatchBlocked && !this.pendingHandoff() &&
-      !this.inbox.list().some(row => row.target === lane.key && row.attachmentInstance === current.runtime?.hostInstanceId && ["sending", "unknown"].includes(row.state)) &&
-      (current.runtime?.kind === "omp" ? snap?.inputReady === true : snap?.state === "idle");
+    const inputReady = identityVerified && !current.dispatchBlocked &&
+      (current.runtime?.kind === "omp" ? snap?.inputReady === true && !this.pendingHandoff() &&
+        !this.inbox.list().some(row => row.target === lane.key && row.attachmentInstance === current.runtime?.hostInstanceId && ["sending", "unknown"].includes(row.state)) : snap?.state === "idle");
     return { ...current, mode: "external-current-session", bridge: current.runtime?.external?.bridge, identityVerified,
       verifiedIdentity: identityVerified ? { threadId: current.runtime?.threadId, pane: current.pane, cwd: current.cwd, model: current.runtime?.model, effort: current.runtime?.effort } : null,
       inputReady, readiness: !stillAttached ? "detached" : !identityVerified || current.dispatchBlocked ? "held" : inputReady ? "ready" : "busy" };
@@ -881,6 +881,22 @@ export class DoriService {
         await verifyOmpHerdr(native, this.runner);
       }
       if (action === "host-register") atomicJson(join(this.config.stateDir, "hosts", `${lane.key}.pid.json`), { pid: args.pid, instance: args.instance });
+      if (action === "host-event" && args.event?.method === "runtime/failure") {
+        const params = args.event.params, native = args.runtime.omp?.target as OmpTarget | undefined;
+        if (args.runtime.kind !== "omp" || !native || lane.role === "lead" || !object(args.event) || !exactKeys(args.event, ["method", "params"]) ||
+          !object(params) || !exactKeys(params, ["runtime", "streamId", "sessionId", "sessionFile", "laneKey", "failure"]) || params.runtime !== "omp" ||
+          params.sessionId !== native.sessionId || params.sessionFile !== native.sessionFile || params.laneKey !== lane.key || typeof params.streamId !== "string" ||
+          !validateFailureRecord(params.failure, params.streamId)) throw new Error("Invalid OMP terminal failure identity");
+        const failure = params.failure;
+        // Keep raw native errors out of every service store. A digest detects a
+        // changed duplicate without retaining arbitrary upstream metadata.
+        const eventDigest = payloadHash(JSON.stringify([params.sessionId, params.sessionFile, params.laneKey, params.streamId,
+          failure.sequence, failure.failureId, failure.sourceInstanceId, failure.sourceGeneration, failure.executionId, failure.phase, failure.category, failure.observedAt]));
+        this.putFailure({ id: `omp-failure:${lane.key}:${params.streamId}:${failure.sequence}`, target: lane.key,
+          turnId: failure.failureId, source: params.streamId, state: "queued", at: failure.observedAt,
+          text: JSON.stringify({ runtime: "omp", phase: failure.phase, category: failure.category, guidance: ompFailureGuidance(failure.category), eventDigest }) });
+        return { accepted: true };
+      }
       await this.registry.update(lane.key, l => ({ ...l,
         ...(args.runtime.held && !l.dispatchBlocked ? { dispatchBlocked: true, holdReason: "recovery" as const } : {}),
         runtime: { ...args.runtime as RuntimeRef, lastHeartbeatAt: new Date().toISOString() } }));
@@ -1152,8 +1168,9 @@ export class DoriService {
         if (this.failures.get(failure.id)?.state !== "queued") return;
         const lane = await this.lane(failure.target);
         if (failure.attachmentInstance && (lane.runtime?.backend !== "external-current-session" || lane.runtime.hostInstanceId !== failure.attachmentInstance)) return;
-        const metadata = JSON.parse(failure.text) as ReturnType<typeof turnFailure>;
-        const text = `Codex task failed (${metadata.category}). ${metadata.guidance} The task was not automatically retried.`;
+        const metadata = JSON.parse(failure.text) as ReturnType<typeof turnFailure> & { runtime?: string; phase?: string };
+        const label = metadata.runtime === "omp" ? `OMP ${metadata.phase === "compaction" ? "compaction" : "model"}` : "Codex task";
+        const text = `${label} failed (${metadata.category}). ${metadata.guidance} The task was not automatically retried.`;
         if (lane.role !== "lead") {
           this.putInbox({ id: `notice:${failure.id}`, target: "lead", attachmentInstance: (failure as OwnedFailure).leadIntakeInstance ?? UNOWNED_LEAD, thread: lane.thread, text: `Lane ${lane.key}: ${text}`, state: "queued", at: failure.at });
         } else {
