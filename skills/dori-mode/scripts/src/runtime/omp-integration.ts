@@ -62,6 +62,19 @@ export const discoverOmpSafe = async (dir: string): Promise<OmpTarget[]> => {
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
 };
 
+/** Herdr may publish native process exit after the OS has already reaped it. */
+export const waitForOmpDetach = async (sessionFile: string, deadline: number, runner: Runner = run): Promise<void> => {
+  while (Date.now() < deadline) {
+    const result = await runner(["herdr", "agent", "list"], { timeoutMs: Math.max(1, deadline - Date.now()) });
+    if (result.code !== 0) throw new Error("OMP Herdr process association unverified; stop unconfirmed");
+    const agents = JSON.parse(result.out).result?.agents;
+    if (!Array.isArray(agents)) throw new Error("OMP Herdr process association unverified; stop unconfirmed");
+    if (!agents.some(a => a?.agent === "omp" && a.agent_session?.value === sessionFile)) return;
+    await Bun.sleep(Math.min(50, Math.max(0, deadline - Date.now())));
+  }
+  throw new Error("OMP Herdr process association still present; stop unconfirmed");
+};
+
 export const verifyOmpHerdr = async (target: OmpTarget, runner: Runner = run): Promise<void> => {
   const result = await runner(["herdr", "agent", "list"]);
   if (result.code !== 0) throw new Error("OMP Herdr association unavailable");
@@ -211,8 +224,7 @@ const runOmpOwnedSessionHost = async (stateDir: string, boot: Bootstrap): Promis
         const until = Date.now() + config.runtime.rpcTimeoutMs;
         while (processAlive(pid) && Date.now() < until) await Bun.sleep(50);
         if (processAlive(pid)) throw new Error("OMP stop intent acknowledged but process exit unconfirmed");
-        const agents = await run(["herdr", "agent", "list"]);
-        if (agents.code !== 0 || JSON.parse(agents.out).result.agents.some((a: any) => a.agent_session?.value === pinned.sessionFile && a.agent === "omp")) throw new Error("OMP Herdr process association still present; stop unconfirmed");
+        await waitForOmpDetach(pinned.sessionFile, until);
         nativeStopped = true; closing = true; result = { stopped: true };
       } else throw new Error("Unsupported OMP host action; approvals stay in the real TUI");
       return Response.json({ result });

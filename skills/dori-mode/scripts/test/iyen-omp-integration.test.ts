@@ -6,7 +6,7 @@ import { atomicJson } from "../src/journal.ts";
 import { DoriService } from "../src/service.ts";
 import { hostSocket } from "../src/ipc.ts";
 import { bootstrapPath } from "../src/runtime/session-host.ts";
-import { ompManagedEnvironment, ompPaneCommand, verifyOmpHerdr, discoverOmpSafe } from "../src/runtime/omp-integration.ts";
+import { ompManagedEnvironment, ompPaneCommand, verifyOmpHerdr, discoverOmpSafe, waitForOmpDetach } from "../src/runtime/omp-integration.ts";
 import { payloadHash } from "../src/runtime/omp/contract.ts";
 import { readWatchTarget, DeliveryWatchdog } from "../src/watchdog.ts";
 import { ompFixture } from "./fixtures/omp.ts";
@@ -21,6 +21,24 @@ const association = (f: ReturnType<typeof ompFixture>): Runner => async argv => 
   return { code: 0, err: "", out: JSON.stringify({ result: { agents: [{ agent: "omp", cwd: f.identity.cwd, pane_id: f.identity.paneId, terminal_id: f.identity.terminalId,
     agent_session: { agent: "omp", kind: "path", source: "herdr:omp", value: f.identity.sessionFile } }] } }) };
 };
+test("OMP stop waits for delayed Herdr detach and does not wait for unrelated sessions", async () => {
+  let attached = true, finished = false, observed!: () => void;
+  const queried = new Promise<void>(resolve => { observed = resolve; });
+  const runner: Runner = async () => {
+    observed();
+    return { code: 0, err: "", out: JSON.stringify({ result: { agents: [
+      { agent: "omp", agent_session: { value: attached ? "/exact.jsonl" : "/unrelated.jsonl" } }
+    ] } }) };
+  };
+  const stopping = waitForOmpDetach("/exact.jsonl", Date.now() + 1000, runner).then(() => { finished = true; });
+  await queried; await Bun.sleep(10); expect(finished).toBe(false);
+  attached = false; await stopping; expect(finished).toBe(true);
+});
+test("OMP stop remains unconfirmed when Herdr still reports the native session or cannot verify it", async () => {
+  const runner: Runner = async () => ({ code: 0, err: "", out: JSON.stringify({ result: { agents: [{ agent: "omp", agent_session: { value: "/exact.jsonl" } }] } }) });
+  await expect(waitForOmpDetach("/exact.jsonl", Date.now() + 60, runner)).rejects.toThrow("still present");
+  await expect(waitForOmpDetach("/exact.jsonl", Date.now() + 1000, async () => ({ code: 1, out: "", err: "unavailable" }))).rejects.toThrow("unverified");
+});
 async function setup(handler?: (method: string, params: any) => any) {
   const f = ompFixture(); f.transcript([]);
   Object.assign(f.identity, { role: "attached-lead", laneKey: "lead" }); Object.assign(f.target, f.identity);
