@@ -77,7 +77,7 @@ export const withStatus = (lane: Lane, status: LaneStatus, note: string, at: str
 
 export class Registry {
   readonly dir: string;
-  constructor(stateDir: string) {
+  constructor(stateDir: string, readonly mutationGate: <T>(key: string, action: () => Promise<T>) => Promise<T> = (_key, action) => action()) {
     this.dir = join(stateDir, "lanes");
   }
 
@@ -153,16 +153,16 @@ export class Registry {
   }
 
   async write(lane: Lane): Promise<void> {
-    await this.queue.run(lane.key, async () => {
+    await this.mutationGate(lane.key, () => this.queue.run(lane.key, async () => {
       const current = await this.read(lane.key);
       if ((current?.revision ?? 0) !== (lane.revision ?? 0)) throw new Error(`Revision conflict: ${lane.key}`);
       if (current && isDeepStrictEqual(laneContent(current), laneContent(lane))) return;
       this.persist({ ...lane, schemaVersion: 2, revision: (current?.revision ?? 0) + 1 });
-    });
+    }));
   }
 
   async update(key: string, fn: (lane: Lane) => Lane): Promise<Lane> {
-    return this.queue.run(key, async () => {
+    return this.mutationGate(key, () => this.queue.run(key, async () => {
       const current = await this.read(key);
       if (!current) throw new Error(`Unknown lane ${key}`);
       const before = laneContent(current);
@@ -171,7 +171,7 @@ export class Registry {
       if (next.key !== key) throw new Error("Lane identity cannot change");
       if (isDeepStrictEqual(before, laneContent(next))) return current;
       this.persist(next); return next;
-    });
+    }));
   }
 
   private persist(lane: Lane): void {

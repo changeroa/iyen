@@ -313,12 +313,12 @@ test("offline reconnect retries use durable capped backoff and unchanged polls c
  expect(await s.handle("status",{key:"lead"},{role:"admin"})).toMatchObject({readiness:"ready"});expect(h.attachment().token).toBe(old.token);expect(h.queues()).toHaveLength(0);
 });
 
-test("identity replacement latches a manual hold even after the original session reappears",async()=>{
+test("identity replacement holds dispatch until exact original identity reappears automatically",async()=>{
  const h=await externalFixture();h.identity("22222222-2222-4222-8222-222222222222");
  expect(await s.handle("status",{key:"lead"},{role:"admin"})).toMatchObject({readiness:"held"});h.identity();h.clock.at+=120000;
- expect(await s.handle("status",{key:"lead"},{role:"admin"})).toMatchObject({readiness:"held",identityVerified:true});
- expect((await s.registry.read("lead"))!.runtime!.external!.reconnectBlocked).toBe(true);
- await s.handle("lead-attach",h.args,{role:"admin"});expect((await s.registry.read("lead"))!.dispatchBlocked).toBe(false);expect(h.queues()).toHaveLength(0);
+ expect(await s.handle("status",{key:"lead"},{role:"admin"})).toMatchObject({readiness:"ready",identityVerified:true});
+ expect((await s.registry.read("lead"))!.runtime!.external!.reconnectBlocked).toBeUndefined();
+expect((await s.registry.read("lead"))!.dispatchBlocked).toBe(false);expect(h.queues()).toHaveLength(0);
 });
 
 for(const holdReason of ["owner-pause","done-review"] as const)test(`automatic upgrade reconnect preserves ${holdReason}`,async()=>{
@@ -353,4 +353,15 @@ test("failed normal observation followed by successful exact rebind is bounded t
  h.transport.observe=async()=>{observations++;throw new ExternalSessionError("runtime-unavailable","Shared Codex observer unavailable; delivery is waiting for reconnection.");};
  expect(await s.handle("status",{key:"lead"},{role:"admin"})).toMatchObject({readiness:"ready"});
  expect(observations).toBe(1);expect(h.queues()).toHaveLength(0);
+});
+
+
+test("same identity mismatch in a new episode refreshes latest diagnostic time",async()=>{
+ const h=await externalFixture();h.identity("22222222-2222-4222-8222-222222222222");
+ await s.handle("status",{key:"lead"},{role:"admin"});const first=(await s.registry.read("lead"))!.runtime!.external!.latestHoldReason!;
+ h.identity();h.clock.at+=120000;await s.handle("status",{key:"lead"},{role:"admin"});
+ h.identity("22222222-2222-4222-8222-222222222222");h.clock.at+=120000;await s.handle("status",{key:"lead"},{role:"admin"});
+ const second=(await s.registry.read("lead"))!.runtime!.external!.latestHoldReason!;
+ expect(second.code).toBe(first.code);expect(Date.parse(second.at)).toBeGreaterThan(Date.parse(first.at));
+ expect(second.evidence).toMatchObject({check:"herdr-association",observed:{threadId:"22222222-2222-4222-8222-222222222222"}});
 });

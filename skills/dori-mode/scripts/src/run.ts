@@ -1,15 +1,20 @@
 export type Ran = { readonly code: number; readonly out: string; readonly err: string };
-export type RunOptions = { readonly cwd?: string; readonly timeoutMs?: number };
+export type RunOptions = { readonly cwd?: string; readonly timeoutMs?: number; readonly signal?: AbortSignal };
 export type Runner = (argv: readonly string[], opts?: RunOptions) => Promise<Ran>;
 
 export const run: Runner = async (argv, opts = {}) => {
+  if (opts.signal?.aborted) return { code: 124, out: "", err: "cancelled" };
   let p: ReturnType<typeof Bun.spawn>;
   try {
     p = Bun.spawn([...argv], { stdout: "pipe", stderr: "pipe", ...(opts.cwd ? { cwd: opts.cwd } : {}), ...(opts.timeoutMs ? { timeout: opts.timeoutMs, killSignal: "SIGKILL" } : {}) });
   } catch (e) {
     return { code: 127, out: "", err: e instanceof Error ? e.message : String(e) };
   }
+  const cancel = () => { try { p.kill("SIGKILL"); } catch {} };
+  opts.signal?.addEventListener("abort", cancel, { once: true });
+  if (opts.signal?.aborted) cancel();
   const [out, err, code] = await Promise.all([new Response(p.stdout as ReadableStream).text(), new Response(p.stderr as ReadableStream).text(), p.exited]);
+  opts.signal?.removeEventListener("abort", cancel);
   return { code: p.signalCode ? 124 : code, out: out.trim(), err: (p.signalCode ? `killed by ${p.signalCode} (timeout)` : err).trim() };
 };
 

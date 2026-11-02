@@ -22,6 +22,8 @@ import { turnFailure } from "./turn-failure.ts";
 import { DeliveryDeferred, Mailbox, postHook, type Mail } from "./mailbox.ts";
 import { ExternalCurrentSession, ExternalSessionError, discoverExternal, observeExternal, sharedDaemon, THREAD_UUID, type Attachment } from "./runtime/external-current-session.ts";
 import { connectObserver, receiptInTurns } from "./runtime/observer.ts";
+import { withBindingFence } from "./binding-fence.ts";
+import { readWatchTarget } from "./watchdog.ts";
 import { operationText } from "./runtime/herdr.ts";
 import type { Turn } from "./runtime/generated/v2/Turn.ts";
 
@@ -38,7 +40,7 @@ const durableMarkerRemoval = (path: string): void => {
   try { unlinkSync(path); fsyncSync(directory); } finally { closeSync(directory); }
 };
 export type ServicePhase = "starting" | "replaying" | "reconciling" | "ready" | "stopping" | "failed";
-const reconnectable = (code?: ExternalHoldCode): boolean => Boolean(code && ["runtime-unavailable", "runtime-version-changed", "runtime-version-unsupported", "runtime-incompatible", "rebind-interrupted"].includes(code));
+const reconnectable = (code?: ExternalHoldCode): boolean => Boolean(code && ["identity-unverified", "runtime-unavailable", "runtime-version-changed", "runtime-version-unsupported", "runtime-incompatible", "rebind-interrupted"].includes(code));
 const sameJson = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
 export class DoriService {
   readonly registry: Registry;
@@ -63,7 +65,7 @@ export class DoriService {
   constructor(readonly config: DoriConfig, readonly runner: Runner = run, readonly externalTransport: ExternalTransport = { connect: connectObserver, observe: observeExternal }, readonly handoffIO: HandoffIO = { removeMarker: durableMarkerRemoval }) {
     this.writeHealth();
     this.phase = "replaying"; this.writeHealth();
-    this.registry = new Registry(config.stateDir);
+    this.registry = new Registry(config.stateDir, (key, action) => key === "lead" ? withBindingFence(config.stateDir, action) : action());
     try {
       this.registry.enableJournal(config.stateDir, progress => { this.replay = progress; this.writeHealth(); });
     } catch (error) { this.phase = "failed"; this.writeHealth(); throw error; }
@@ -140,8 +142,9 @@ export class DoriService {
       retry: ext?.reconnect ?? null, handoffPending: existsSync(this.activeHandoffPath()) };
     const queue = { queued: queued.length, unknown: rows.filter(row => row.state === "unknown").length, sending: rows.filter(row => row.state === "sending").length,
       oldestQueuedAt: oldest === undefined ? null : new Date(oldest).toISOString(), oldestQueuedAgeMs: oldest === undefined ? null : Math.max(0, this.deps.clock.now() - oldest) };
-    this.healthSnapshot = { delivery, queue, ingress: this.ingressStatus() }; this.writeHealth();
-    return readJson(join(this.config.stateDir, "service-health.json"));
+    const target = readWatchTarget(this.config.stateDir);
+    this.healthSnapshot = { delivery, queue, ingress: this.ingressStatus(), target: target ? { binding: target.binding, deliberateHold: target.deliberateHold, handoffPending: target.handoffPending, verified: false, source: "saved-binding" } : null }; this.writeHealth();
+    return { ...readJson<any>(join(this.config.stateDir, "service-health.json")), serviceReachable: true, sampledAt: new Date().toISOString() };
   }
   private activeHandoffPath(): string { return join(this.config.stateDir, "attachments", "handoff.json"); }
   private handoffPath(id: string): string { return join(this.config.stateDir, "attachments", "handoffs", `${createHash("sha256").update(id).digest("hex")}.json`); }
@@ -225,7 +228,7 @@ export class DoriService {
       if (intent.status === "committed" && !this.pendingHandoff()) {
         await this.assertHandoffCurrent(intent);
         if (!intent.cleanupPending) return this.completedHandoff(intent);
-        atomicJson(this.activeHandoffPath(), { operationId: args.operationId });
+        await withBindingFence(this.config.stateDir, async () => { await this.assertHandoffCurrent(intent); atomicJson(this.activeHandoffPath(), { operationId: args.operationId }); });
         return this.finishHandoff(intent);
       }
     } else {
@@ -246,15 +249,17 @@ export class DoriService {
         result: { attached: true, handedOff: true, operationId: args.operationId, fromThreadId: args.fromThreadId, threadId: args.threadId, mailIds: args.mailIds, bridge: afterAttachment.bridge, lead: publicLead } };
       atomicJson(path, intent);
     }
-    const pending = this.pendingHandoff();
-    if (pending && pending.args.operationId !== args.operationId) throw new Error("Another handoff is pending");
-    if (!pending) {
-      // An orphan prepared record means no transaction write was started. Its
-      // selected mail may have progressed meanwhile; never replay it.
-      const current = await this.lane("lead"), summary = this.handoffMail(this.attachment(current));
-      if (current.runtime?.hostInstanceId !== intent.beforeAttachment.instance || current.revision !== intent.before.revision || args.mailIds.some(id => !summary.eligibleMailIds.includes(id))) throw new Error("Handoff source or selected mail changed before intent activation");
-      atomicJson(this.activeHandoffPath(), { operationId: args.operationId });
-    }
+    await withBindingFence(this.config.stateDir, async () => {
+      const pending = this.pendingHandoff();
+      if (pending && pending.args.operationId !== args.operationId) throw new Error("Another handoff is pending");
+      if (!pending) {
+        // An orphan prepared record means no transaction write was started. Its
+        // selected mail may have progressed meanwhile; never replay it.
+        const current = await this.lane("lead"), summary = this.handoffMail(this.attachment(current));
+        if (current.runtime?.hostInstanceId !== intent.beforeAttachment.instance || current.revision !== intent.before.revision || args.mailIds.some(id => !summary.eligibleMailIds.includes(id))) throw new Error("Handoff source or selected mail changed before intent activation");
+        atomicJson(this.activeHandoffPath(), { operationId: args.operationId });
+      }
+    });
     return this.finishHandoff(intent);
   }
   private async assertHandoffCurrent(intent: HandoffIntent): Promise<Lane> {
@@ -284,39 +289,44 @@ export class DoriService {
       // Recheck on every prepared retry, including automatic recovery, immediately
       // before changing routing. A prior preflight cannot authorize a later TUI.
       if (intent.activation && intent.status !== "committed") await this.assertPriorTuiGone(beforeAttachment, args);
-      if (intent.identityHeld) { intent = { ...intent, identityHeld: undefined }; atomicJson(path, intent); }
-      if (intent.status !== "committed") {
-        await this.registry.update("lead", lane => ({ ...lane, dispatchBlocked: true, holdReason: lane.holdReason ?? "recovery", runtime: { ...lane.runtime!, held: true, state: "recovering" } }));
-        for (const id of args.mailIds) {
-          const row = this.inbox.get(id);
-          if (!row || row.target !== "lead" || row.state !== "queued" || row.turnId || row.source?.startsWith("reconciled:") || row.attachmentInstance && ![UNOWNED_LEAD, beforeAttachment.instance, afterAttachment.instance].includes(row.attachmentInstance)) throw new Error("Handoff selected mail no longer safe; operator reconciliation required");
-          if (row.attachmentInstance !== afterAttachment.instance) this.inbox.mark(id, { attachmentInstance: afterAttachment.instance });
+      await withBindingFence(this.config.stateDir, async () => {
+        const fencedCurrent = await this.lane("lead");
+        if (![beforeAttachment.instance, afterAttachment.instance].includes(fencedCurrent.runtime?.hostInstanceId ?? "")) throw new Error("Handoff source changed during validation");
+        if (intent.identityHeld) { intent = { ...intent, identityHeld: undefined }; atomicJson(path, intent); }
+        if (intent.status !== "committed") {
+          await this.registry.update("lead", lane => ({ ...lane, dispatchBlocked: true, holdReason: lane.holdReason ?? "recovery", runtime: { ...lane.runtime!, held: true, state: "recovering" } }));
+          for (const id of args.mailIds) {
+            const row = this.inbox.get(id);
+            if (!row || row.target !== "lead" || row.state !== "queued" || row.turnId || row.source?.startsWith("reconciled:") || row.attachmentInstance && ![UNOWNED_LEAD, beforeAttachment.instance, afterAttachment.instance].includes(row.attachmentInstance)) throw new Error("Handoff selected mail no longer safe; operator reconciliation required");
+            if (row.attachmentInstance !== afterAttachment.instance) this.inbox.mark(id, { attachmentInstance: afterAttachment.instance });
+          }
+          if (!sameJson(readJson(this.attachmentPath()), afterAttachment)) atomicJson(this.attachmentPath(), afterAttachment);
+          await this.registry.update("lead", lane => ({ ...lane, pane: intent.after.pane, cwd: intent.after.cwd, model: intent.after.model, runtimeHistory: intent.after.runtimeHistory,
+            dispatchBlocked: true, holdReason: lane.holdReason ?? "recovery", runtime: { ...intent.after.runtime!, held: true, state: "recovering" } }));
+          intent = { ...intent, status: "committed" }; atomicJson(path, intent);
         }
-        if (!sameJson(readJson(this.attachmentPath()), afterAttachment)) atomicJson(this.attachmentPath(), afterAttachment);
-        await this.registry.update("lead", lane => ({ ...lane, pane: intent.after.pane, cwd: intent.after.cwd, model: intent.after.model, runtimeHistory: intent.after.runtimeHistory,
-          dispatchBlocked: true, holdReason: lane.holdReason ?? "recovery", runtime: { ...intent.after.runtime!, held: true, state: "recovering" } }));
-        intent = { ...intent, status: "committed" }; atomicJson(path, intent);
-      }
-      await this.registry.update("lead", lane => {
-        const protectedHold = lane.holdReason === "owner-pause" || lane.holdReason === "done-review" || ["paused", "done-claimed", "verified-done", "closed"].includes(statusOf(lane));
-        // A committed marker left after a crash may outlive later observations.
-        // Finalize only the handoff's recovery barrier; preserve newer holds and
-        // runtime observations rather than restoring the old intent snapshot.
-        const cause = lane.runtime?.external?.holdReason?.code;
-        if (lane.runtime?.hostInstanceId === afterAttachment.instance && (!lane.dispatchBlocked || cause && cause !== "handoff-interrupted")) return lane;
-        return { ...lane, dispatchBlocked: protectedHold, holdReason: protectedHold ? lane.holdReason : undefined,
-          runtime: { ...intent.after.runtime!, held: protectedHold, state: protectedHold ? "recovering" : intent.after.runtime!.state } };
+        await this.registry.update("lead", lane => {
+          const protectedHold = lane.holdReason === "owner-pause" || lane.holdReason === "done-review" || ["paused", "done-claimed", "verified-done", "closed"].includes(statusOf(lane));
+          // A committed marker left after a crash may outlive later observations.
+          // Finalize only the handoff's recovery barrier; preserve newer holds and
+          // runtime observations rather than restoring the old intent snapshot.
+          const cause = lane.runtime?.external?.holdReason?.code;
+          if (lane.runtime?.hostInstanceId === afterAttachment.instance && (!lane.dispatchBlocked || cause && cause !== "handoff-interrupted")) return lane;
+          return { ...lane, dispatchBlocked: protectedHold, holdReason: protectedHold ? lane.holdReason : undefined,
+            runtime: { ...intent.after.runtime!, held: protectedHold, state: protectedHold ? "recovering" : intent.after.runtime!.state } };
+        });
+        // Persist cleanup intent before removing the gate. If unlink succeeds but
+        // directory fsync fails, the same operation can reconstruct the marker.
+        intent = { ...intent, cleanupPending: true }; atomicJson(path, intent);
+        this.handoffIO.removeMarker(this.activeHandoffPath());
       });
-      // Persist cleanup intent before removing the gate. If unlink succeeds but
-      // directory fsync fails, the same operation can reconstruct the marker.
-      intent = { ...intent, cleanupPending: true }; atomicJson(path, intent);
-      this.handoffIO.removeMarker(this.activeHandoffPath());
       return await this.completedHandoff(intent);
     } catch (error) {
       if (!(error instanceof DeliveryDeferred)) {
         const current = await this.registry.read("lead");
-        if (intent.cleanupPending && current?.runtime?.hostInstanceId === afterAttachment.instance && !existsSync(this.activeHandoffPath()))
-          atomicJson(this.activeHandoffPath(), { operationId: args.operationId });
+        await withBindingFence(this.config.stateDir, async () => {
+          if (intent.cleanupPending && current?.runtime?.hostInstanceId === afterAttachment.instance && !existsSync(this.activeHandoffPath())) atomicJson(this.activeHandoffPath(), { operationId: args.operationId });
+        });
         if (error instanceof ExternalSessionError && error.code === "identity-unverified") { intent = { ...intent, identityHeld: true }; atomicJson(path, intent); }
         const lane = await this.registry.read("lead");
         if (lane?.runtime) {
@@ -342,10 +352,10 @@ export class DoriService {
     await this.registry.update("lead", lane => {
       if (lane.runtime?.hostInstanceId !== instance || lane.runtime.external?.detachedAt || lane.runtime.state === "stopped") return lane;
       const ext = lane.runtime.external!;
-      const latest = ext.latestHoldReason?.code === reason.code && ext.latestHoldReason.message === reason.message ? ext.latestHoldReason : { code: reason.code, message: reason.message, at: new Date().toISOString() };
+      const latest = ext.holdReason && ext.latestHoldReason?.code === reason.code && ext.latestHoldReason.message === reason.message && sameJson(ext.latestHoldReason.evidence, reason.evidence) ? ext.latestHoldReason : { code: reason.code, message: reason.message, ...(reason.evidence ? { evidence: reason.evidence } : {}), at: new Date().toISOString() };
       const next: Lane = { ...lane, dispatchBlocked: true, holdReason: lane.holdReason ?? "recovery", runtime: { ...lane.runtime, held: true, state: "recovering", activeTurnId: undefined,
         external: { ...ext, holdReason: ext.holdReason ?? latest, firstHoldReason: ext.firstHoldReason ?? ext.holdReason ?? latest, latestHoldReason: latest,
-          reconnectBlocked: Boolean(ext.reconnectBlocked || !reconnectable(reason.code)) } } };
+          reconnectBlocked: Boolean((ext.reconnectBlocked && !reconnectable(ext.holdReason?.code)) || !reconnectable(reason.code)) } } };
       return sameJson(lane, next) ? lane : next;
     });
   }
@@ -357,31 +367,37 @@ export class DoriService {
     try { snap = await new ExternalCurrentSession(observer, this.runner, this.config.runtime, saved, daemon.binary, realClock, turns => this.recordExternalFailures(saved, turns)).inspect(); }
     finally { observer.close(); }
     if (snap.state === "failed") throw new ExternalSessionError("runtime-failed", "Attached Codex session reports a runtime failure; explicit attachment required.");
-    const protectedHold = lane.holdReason === "owner-pause" || lane.holdReason === "done-review" || statusOf(lane) === "paused" || statusOf(lane) === "done-claimed" || statusOf(lane) === "verified-done";
-    if (automatic && (protectedHold || lane.runtime?.external?.reconnectBlocked)) throw new DeliveryDeferred("Attached lead requires explicit reconciliation");
-    const changed = saved.binary !== daemon.binary || saved.binaryVersion !== daemon.binaryVersion || Boolean(lane.runtime?.external?.rebind);
-    try {
-      if (changed) {
-        // Record both sides before changing the attachment. Either side is accepted
-        // on recovery, but affinity and identity are always revalidated first.
-        await this.registry.update("lead", current => ({ ...current, dispatchBlocked: true, holdReason: current.holdReason ?? "recovery", runtime: { ...current.runtime!, held: true, state: "recovering",
-          external: { ...current.runtime!.external!, rebind: { binary: daemon.binary, binaryVersion: daemon.binaryVersion } } } }));
-        atomicJson(this.attachmentPath(), { ...saved, binary: daemon.binary, binaryVersion: daemon.binaryVersion, model: snap.model, effort: snap.effort });
+    await withBindingFence(this.config.stateDir, async () => {
+      const currentLane = await this.lane("lead");
+      if (currentLane.runtime?.hostInstanceId !== saved.instance || currentLane.runtime.generation !== saved.generation || currentLane.runtime.external?.detachedAt) throw new DeliveryDeferred("Attachment changed during revalidation");
+      lane = currentLane; this.attachment(lane);
+      const protectedHold = lane.holdReason === "owner-pause" || lane.holdReason === "done-review" || statusOf(lane) === "paused" || statusOf(lane) === "done-claimed" || statusOf(lane) === "verified-done" || statusOf(lane) === "closed";
+      if (automatic && (protectedHold || lane.runtime?.external?.reconnectBlocked && !reconnectable(lane.runtime.external.holdReason?.code))) throw new DeliveryDeferred("Attached lead requires explicit reconciliation");
+      const changed = saved.binary !== daemon.binary || saved.binaryVersion !== daemon.binaryVersion || Boolean(lane.runtime?.external?.rebind);
+      try {
+        if (changed) {
+          // Record both sides before changing the attachment. Either side is accepted
+          // on recovery, but affinity and identity are always revalidated first.
+          await this.registry.update("lead", current => ({ ...current, dispatchBlocked: true, holdReason: current.holdReason ?? "recovery", runtime: { ...current.runtime!, held: true, state: "recovering",
+            external: { ...current.runtime!.external!, rebind: { binary: daemon.binary, binaryVersion: daemon.binaryVersion } } } }));
+          atomicJson(this.attachmentPath(), { ...saved, binary: daemon.binary, binaryVersion: daemon.binaryVersion, model: snap.model, effort: snap.effort });
+        }
+        await this.registry.update("lead", current => {
+          if (current.runtime?.hostInstanceId !== saved.instance || current.runtime?.generation !== saved.generation || current.runtime.external?.detachedAt || automatic && (current.holdReason && current.holdReason !== "recovery" || ["paused", "done-claimed", "verified-done", "closed"].includes(statusOf(current)))) throw new DeliveryDeferred("Attachment changed or deliberately held during revalidation");
+          const next: Lane = { ...current, model: snap.model, dispatchBlocked: protectedHold, holdReason: protectedHold ? current.holdReason : undefined, runtime: { ...current.runtime!,
+            binaryVersion: daemon.binaryVersion, model: snap.model, effort: snap.effort, held: protectedHold, state: protectedHold ? "recovering" : snap.state, activeTurnId: snap.activeTurnId,
+            external: { ...current.runtime!.external!, binary: daemon.binary, holdReason: undefined, reconnectBlocked: undefined, reconnect: undefined, rebind: undefined } } };
+          return sameJson(current, next) ? current : next;
+        });
+      } catch {
+        throw new ExternalSessionError("rebind-interrupted", "Recorded runtime rebind is incomplete; delivery is waiting for verified reconnection.");
       }
-      await this.registry.update("lead", current => {
-        const next: Lane = { ...current, model: snap.model, dispatchBlocked: protectedHold, holdReason: protectedHold ? current.holdReason : undefined, runtime: { ...current.runtime!,
-          binaryVersion: daemon.binaryVersion, model: snap.model, effort: snap.effort, held: protectedHold, state: protectedHold ? "recovering" : snap.state, activeTurnId: snap.activeTurnId,
-          external: { ...current.runtime!.external!, binary: daemon.binary, holdReason: undefined, reconnectBlocked: undefined, reconnect: undefined, rebind: undefined } } };
-        return sameJson(current, next) ? current : next;
-      });
-    } catch {
-      throw new ExternalSessionError("rebind-interrupted", "Recorded runtime rebind is incomplete; delivery is waiting for verified reconnection.");
-    }
+    });
     return snap;
   }
   private async reconnectExternal(lane: Lane, saved: Attachment): Promise<Awaited<ReturnType<ExternalCurrentSession["inspect"]>> | null> {
     const ext = lane.runtime!.external!;
-    if (lane.holdReason && lane.holdReason !== "recovery" || ext.reconnectBlocked || !ext.rebind && !reconnectable(ext.holdReason?.code)) return null;
+    if (lane.holdReason && lane.holdReason !== "recovery" || ext.reconnectBlocked && !reconnectable(ext.holdReason?.code) || !ext.rebind && !reconnectable(ext.holdReason?.code)) return null;
     if (Date.parse(ext.reconnect?.nextAttemptAt ?? "") > this.deps.clock.now()) throw new DeliveryDeferred("Attached runtime reconnect is waiting for its next retry");
     try { return await this.rebindExternal(lane, saved, true); }
     catch (error) {
@@ -599,11 +615,16 @@ export class DoriService {
       }
       if (existsSync(this.attachmentPath())) writeFileSync(join(history, "attachment.json"), readFileSync(this.attachmentPath()), { mode: 0o600 });
     }
-    const { saved, lead } = this.prepareAttachment(args, cwd, previous, binary, daemon, snap, this.inbox.list().filter(row => row.target === "lead").map(row => row.id));
-    await this.registry.write(lead);
-    // Publish the credential only after the registry commit succeeds. A revision
-    // conflict must not revoke a previously valid attachment's capability.
-    atomicJson(this.attachmentPath(), saved);
+    const saved = await withBindingFence(this.config.stateDir, async () => {
+      const current = await this.registry.read("lead");
+      if (current?.revision !== previous?.revision || current?.runtime?.hostInstanceId !== previous?.runtime?.hostInstanceId) throw new Error("Attachment source changed during preflight");
+      const { saved, lead } = this.prepareAttachment(args, cwd, previous, binary, daemon, snap, this.inbox.list().filter(row => row.target === "lead").map(row => row.id));
+      await this.registry.write(lead);
+      // Publish the credential only after the registry commit succeeds. A revision
+      // conflict must not revoke a previously valid attachment's capability.
+      atomicJson(this.attachmentPath(), saved);
+      return saved;
+    });
     return { attached: true, bridge: saved.bridge, lead: await this.publicLane(await this.lane("lead"), true) };
   }
   private prepareAttachment(args: any, cwd: string, previous: Lane | null, binary: string,
@@ -1066,7 +1087,7 @@ const serveService = async (config: DoriConfig): Promise<void> => {
   const controlPath = join(config.stateDir, "control.json");
   if (!existsSync(controlPath)) atomicJson(controlPath, { token: crypto.randomUUID() });
   if (existsSync(socket)) unlinkSync(socket);
-  const service = new DoriService(config);
+  const service = await withBindingFence(config.stateDir, async () => new DoriService(config));
   service.setPhase("reconciling");
   for (const lane of await service.registry.open()) if (lane.runtime?.backend === "external-current-session" && lane.runtime.state !== "stopped") await service.deps.runtime.inspect(lane.key).catch(() => {});
   const server = Bun.serve({ unix: socket, async fetch(request) {
