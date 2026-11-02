@@ -64,6 +64,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, boot: (lane
 export const quoteForPane = (arg: string): string => `'${arg.replace(/'/g, `'\\''`)}'`;
 
 export const adoptLane = async (deps: FlowDeps, input: LaunchInput & { pane: string; threadId: string }): Promise<Lane> => {
+  if (deps.config.runtime.kind === "omp") throw new LaunchError("OMP adopt is unsupported; managed lanes require the verified OMP bootstrap. Use lead-attach for the current borrowed lead");
   await validateLaunch(deps, input);
   if (!input.threadId) throw new LaunchError("Explicit Codex thread ID required");
   const lane: Lane = { key: input.key, title: input.title, thread: input.thread ?? "none", pane: input.pane, brief: input.brief, done: input.done, cwd: input.cwd ?? deps.config.defaultCwd, role: "lane", status: "working", openedAt: iso(deps.clock), runtime: { kind: "codex", threadId: input.threadId, state: "idle", hostInstanceId: "adopted", generation: 0, binaryVersion: deps.config.runtime.requiredVersion } };

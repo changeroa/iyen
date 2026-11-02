@@ -58,7 +58,11 @@ test("borrowed exact attachment is idempotent, excludes historical mail, stores 
     expect(attached.lead.runtime.omp.target.terminalId).toBe(x.args.terminalId);
     expect((await x.s.handle("lead-activate", x.args, { role: "admin" })).lead.runtime.hostInstanceId).toBe(instance);
     await expect(x.s.deps.runtime.input("lead", "old", "history")).rejects.toThrow("Historical");
-    expect(await x.s.handle("input", { key: "lead", text: "work", operationId: "one" }, { role: "admin" })).toMatchObject({ receiptKind: "omp-session-entry", receipt: { entryId: "one" } });
+    const input = { key: "lead", text: "work", operationId: "one" };
+    const first = await x.s.handle("input", input, { role: "admin" });
+    expect(first).toMatchObject({ receiptKind: "omp-session-entry", receipt: { entryId: "one" } });
+    expect(await x.s.handle("input", input, { role: "admin" })).toEqual(first);
+    expect(inputs).toBe(1);
     expect(x.s.inbox.get("one")).toMatchObject({ state: "sent", attachmentInstance: instance });
     expect(readWatchTarget(x.config.stateDir)?.binding.native?.terminalId).toBe(x.args.terminalId);
     await x.s.handle("lead-detach", { threadId: x.args.threadId }, { role: "admin" }); expect(inputs).toBe(1);
@@ -141,4 +145,13 @@ test("actual MCP CLI subprocess uses OMP lane context and rejects admin/other-la
     expect(byId(5).isError).toBe(true); expect(byId(6).isError).toBe(true);
     expect((await s.registry.read("worker"))?.report?.text).toBe("scoped");
   } finally { server.stop(true); f.cleanup(); }
+});
+
+ test("OMP arbitrary adoption is refused before creating a Codex-shaped runtime", async () => {
+  const f = ompFixture(), s = new DoriService(profile(f.directory), association(f));
+  try {
+    const { adoptLane } = await import("../src/launch.ts");
+    await expect(adoptLane(s.deps, { key: "adopted", title: "outside bootstrap", brief: "/b", done: "closed a/b#1", pane: "w:p", threadId: f.identity.sessionId })).rejects.toThrow("OMP adopt is unsupported");
+    expect(await s.registry.read("adopted")).toBeNull();
+  } finally { f.cleanup(); }
 });

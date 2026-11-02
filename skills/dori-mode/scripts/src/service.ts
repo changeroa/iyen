@@ -964,7 +964,7 @@ export class DoriService {
       if (mail.state === "unknown" || mail.state === "sending") throw new Error("Delivery unknown; reconcile before retry");
       if (mail.state === "sent") {
         if (!mail.turnId) throw new Error("Missing turn receipt");
-        return { turnId: mail.turnId };
+        return { turnId: mail.turnId, ...(mail.receiptKind ? { receiptKind: mail.receiptKind, receipt: mail.receipt } : {}) };
       }
       if (lane.dispatchBlocked) return { queued: true, operationId: mail.id };
       if (lane.runtime?.backend === "external-current-session") {

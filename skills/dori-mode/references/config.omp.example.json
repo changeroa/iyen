@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 2,
+  "stateDir": "/absolute/isolated-omp/state",
+  "defaultCwd": "/absolute/project",
+  "laneWorkspace": "",
+  "hooks": {},
+  "ingress": [],
+  "runtime": {
+    "kind": "omp",
+    "binary": "/absolute/fork/omp",
+    "requiredVersion": "18.15.0",
+    "settingsHome": "/absolute/isolated-omp/agent",
+    "sandbox": "danger-full-access",
+    "roles": {
+      "lead": { "model": null, "effort": null },
+      "lane": { "model": "EXPLICIT_MODEL_ID", "effort": "medium" }
+    },
+    "omp": {
+      "registryDir": "/absolute/isolated-omp/controllers",
+      "extensionPath": "/absolute/iyen/skills/dori-mode/scripts/src/runtime/omp/extension.ts",
+      "provider": "EXPLICIT_PROVIDER_ID",
+      "approvalMode": "always-ask"
+    }
+  }
+}
