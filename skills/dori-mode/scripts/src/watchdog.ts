@@ -67,9 +67,9 @@ export const acquireWatchdog = (dir: string) => acquireFileFence(join(dir, "watc
 // Incident-only route: exact loaded UUID + canonical cwd on the attached daemon.
 // Herdr mapping remains diagnostic evidence, never a route to another session.
 const verifyObserver = async (observer: Parameters<Parameters<typeof observeExternal>[3]>[0], binding: TargetBinding) => {
-  const [{ thread }, loaded, { goal }, turns] = await Promise.all([readThread(observer, binding.threadId), readLoadedThreads(observer), readOptionalGoal(observer, binding.threadId), readTurns(observer, binding.threadId)]);
+  const [{ thread }, loaded, { goal, available }, turns] = await Promise.all([readThread(observer, binding.threadId), readLoadedThreads(observer), readOptionalGoal(observer, binding.threadId), readTurns(observer, binding.threadId)]);
   if (thread.id !== binding.threadId || !loaded.includes(binding.threadId) || realpathSync(thread.cwd) !== realpathSync(binding.cwd)) return false;
-  if (!["idle", "active"].includes(thread.status.type) || goal && goal.status !== "active") return false;
+  if (!available || !["idle", "active"].includes(thread.status.type) || goal && goal.status !== "active") return false;
   const active = turns.filter(t => t.status === "inProgress");
   return thread.status.type === "active" ? thread.status.activeFlags.length === 0 && active.length === 1 : active.length === 0;
 };

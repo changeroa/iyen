@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
-type HeldFence = { release(): Promise<void>; command(argv: readonly string[], timeoutMs: number): Promise<{ code: number; out: string; err: string }> };
+type HeldFence = { assertAlive(): void; release(): Promise<void>; command(argv: readonly string[], timeoutMs: number): Promise<{ code: number; out: string; err: string }> };
 const owned = new AsyncLocalStorage<ReadonlyMap<string, HeldFence>>();
 // A persistent file is only a lock address. The kernel owns exclusivity and
 // owner death closes stdin. A protected child finishes before the helper exits.
@@ -24,9 +24,20 @@ const acquireKernelFence = async (path: string, timeoutMs: number, signal?: Abor
   finally { clearTimeout(deadline); signal?.removeEventListener("abort", cancel); }
   // After acquisition, cancellation belongs to the action. Never kill the
   // helper while its queue child may still be submitting under this fence.
+  let releasing = false;
+  const lost = (): never => {
+    // Rejecting an action leaves its suspended continuation alive. Stop only
+    // this owning Bun process so it cannot commit or poll without exclusivity.
+    process.stderr.write("IYEN_FENCE_LOST: stopping owner after lock helper exit\n");
+    process.exit(74);
+  };
+  const assertAlive = () => { if (child.exitCode !== null || child.signalCode) lost(); };
+  void child.exited.then(code => { if (!releasing || code !== 0 || child.signalCode) lost(); });
   return {
-    release: async () => { child.stdin.end(); await child.exited; reader.releaseLock(); },
+    assertAlive,
+    release: async () => { assertAlive(); releasing = true; child.stdin.end(); await child.exited; reader.releaseLock(); },
     command: async (argv, timeoutMs) => {
+      assertAlive();
       child.stdin.write(JSON.stringify({ argv, timeoutMs }) + "\n"); child.stdin.flush();
       const result = JSON.parse(await line());
       return { code: Number.isInteger(result.code) ? result.code : 124, out: "", err: "" };
@@ -42,8 +53,9 @@ export const runBindingCommand = async (dir: string, argv: readonly string[], ti
 };
 export const withBindingFence = async <T>(dir: string, action: () => Promise<T>, signal?: AbortSignal): Promise<T> => {
   const path = fencePath(dir);
-  if (owned.getStore()?.has(path)) return action();
+  const prior = owned.getStore()?.get(path);
+  if (prior) { prior.assertAlive(); return action(); }
   const fence = await acquireKernelFence(path, 5000, signal);
-  try { return await owned.run(new Map([...(owned.getStore() ?? []), [path, fence]]), action); }
+  try { fence.assertAlive(); return await owned.run(new Map([...(owned.getStore() ?? []), [path, fence]]), action); }
   finally { await fence.release(); }
 };

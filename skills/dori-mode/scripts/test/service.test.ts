@@ -344,7 +344,10 @@ test("health reports sanitized causes, queue age and ingress evidence without cr
  const health=await s.handle("health",{},{role:"admin"});
  expect(health).toMatchObject({schemaVersion:1,phase:"ready",pid:process.pid,replay:{records:expect.any(Number),lanes:expect.any(Number)},delivery:{state:"held",latestCause:{code:"runtime-unavailable"}},queue:{queued:1,unknown:1,oldestQueuedAgeMs:expect.any(Number)},ingress:[{id:"test",process:"running",connection:"unverified",lastAcceptedAt:null}]});
  expect(JSON.stringify(health)).not.toMatch(/secret-token|private message|Bearer|private\/socket/);expect(JSON.stringify(health)).not.toContain(old.token);
- const caller=await s.authorize(old.token);expect(await s.handle("health",{},caller)).toEqual(health);
+ const caller=await s.authorize(old.token);await Bun.sleep(2);const sampled=await s.handle("health",{},caller);
+ const {sampledAt:firstSample,...stable}=health,{sampledAt:secondSample,...sampledStable}=sampled;
+ expect(sampledStable).toEqual(stable);expect(health.serviceReachable).toBe(true);
+ expect(Number.isFinite(Date.parse(firstSample))).toBe(true);expect(Date.parse(secondSample)).toBeGreaterThan(Date.parse(firstSample));
  await expect(s.handle("health",{},{role:"lane",key:lane.key})).rejects.toThrow("Health requires");
 });
 

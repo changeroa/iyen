@@ -19,9 +19,10 @@ async function fixture() {
   let onRead: (() => void) | undefined, onQueue: (() => Promise<void>) | undefined;
   const commands: string[][] = [], turns: any[] = [];
   const thread: any = { id, cwd: state.dir, status: { type: "idle" } }, agent: any = { agent: "codex", pane_id: "w:p1", agent_status: "idle", agent_session: { agent: "codex", kind: "id", value: id } };
-  let goal: any = null, loaded = true, daemonSocket = socketPath;
+  let goal: any = null, goalError: "transient" | "unsupported" | undefined, loaded = true, daemonSocket = socketPath;
   const server = Bun.serve({ unix: socketPath, fetch(req, server) { if (server.upgrade(req)) return; return new Response(null, { status: 400 }); }, websocket: { message(ws, raw) {
     const m = JSON.parse(String(raw)); if (m.id === undefined) return;
+    if (m.method === "thread/goal/get" && goalError) { ws.send(JSON.stringify({ id: m.id, error: { code: goalError === "unsupported" ? -32601 : -32000, message: "private goal error" } })); return; }
     if (m.method === "thread/read") { threadReads++; onRead?.(); }
     const result = m.method === "initialize" ? {} : m.method === "thread/read" ? { thread } : m.method === "thread/loaded/list" ? { data: loaded ? [id] : [], nextCursor: null } : m.method === "thread/goal/get" ? { goal } : m.method === "thread/turns/list" ? { data: turns, nextCursor: null } : null;
     ws.send(JSON.stringify({ id: m.id, result }));
@@ -50,7 +51,7 @@ async function fixture() {
   return { state, config, service, watchdog, opts, commands, queues, thread, agent, turns,
     advance: (ms: number) => now += ms, unavailable: () => available = false, available: () => available = true,
     noReceipt: () => accept = false, uncertain: () => queueThrow = true,
-    socket: (s: string) => daemonSocket = s, loaded: (b: boolean) => loaded = b, goal: (g: any) => goal = g,
+    socket: (s: string) => daemonSocket = s, loaded: (b: boolean) => loaded = b, goal: (g: any) => goal = g, goalError: (value?: "transient" | "unsupported") => goalError = value,
     onRead: (fn?: () => void) => { onRead = fn; threadReads = 0; }, reads: () => threadReads,
     onQueue: (fn: () => Promise<void>) => onQueue = fn,
     hold: () => service.registry.update("lead", l => ({ ...l, dispatchBlocked: true, holdReason: "recovery", runtime: { ...l.runtime!, held: true, state: "recovering", external: { ...l.runtime!.external!, latestHoldReason: { code: "identity-unverified", message: "safe", at: new Date().toISOString(), evidence: { check: "herdr-association", expected: { threadId: id, pane: "w:p1" }, observed: { threadId: other, pane: "w:p1", token: "private" } } } } } })),
@@ -258,4 +259,15 @@ test("fresh generation fault observes its own grace interval without replaying o
   const current = watchdogStatus(h.state.dir).incidents;
   expect(current[0]).toMatchObject({ id: old.id, text: old.text, binding: old.binding, notification: "unknown", supersededAt: expect.any(Number) });
   expect(current[1]!.id).not.toBe(old.id);
+});
+
+
+for (const failure of ["transient", "unsupported", "malformed"] as const) test(`unknown ${failure} goal observation stays pending until a valid observation returns`, async () => {
+  const h = await fixture(); h.unavailable();
+  if (failure === "malformed") h.goal({ status: "paused" }); else h.goalError(failure);
+  expect((await h.watchdog().poll()).incidents[0]?.notification).toBe("pending"); expect(h.queues()).toHaveLength(0);
+  h.goalError(); h.goal({ status: "paused", objective: "owner pause", tokenBudget: null });
+  await h.watchdog().poll(); expect(h.queues()).toHaveLength(0);
+  h.goal(null); expect((await h.watchdog().poll()).incidents[0]?.notification).toBe("sent");
+  await h.watchdog().poll(); expect(h.queues()).toHaveLength(1);
 });
