@@ -74,10 +74,18 @@ test("OMP launch specification uses supported explicit flags and exact file resu
   const options = { binary: "/bin/omp", registryDir: "/registry", bootstrapFile: "/bootstrap", extensionPath: "/extension.ts", cwd: "/workspace", provider: "fixture", model: "test", effort: "medium", approvalMode: "always-ask" as const, resumeSessionFile: "/session.jsonl", env: { HERDR_PANE_ID: "pane" } };
   const launch = prepareOmpLaunch(options);
   expect(launch.argv).toEqual(["/bin/omp", "--model", "fixture/test", "--thinking", "medium", "--approval-mode", "always-ask", "--extension", "/extension.ts", "--resume", "/session.jsonl"]);
+  expect(launch.argv).not.toContain("--session-dir"); expect(launch.argv).not.toContain("--continue"); expect(launch.argv).not.toContain("--restore");
   expect(prepareOmpLaunch({ ...options, provider: "iyen-fixture" }).argv.slice(1, 3)).toEqual(["--model", "iyen-fixture/test"]);
   expect(prepareOmpLaunch({ ...options, provider: "openrouter", model: "anthropic/claude" }).argv.slice(1, 3)).toEqual(["--model", "openrouter/anthropic/claude"]);
   expect(() => prepareOmpLaunch({ ...options, model: "fixture/test" })).toThrow("duplicate configured provider prefix");
   expect(launch.env.HERDR_PANE_ID).toBe("pane"); expect(launch.env.IYEN_OMP_BOOTSTRAP).toBe("/bootstrap");
   expect(() => prepareOmpLaunch({ ...options, resumeSessionFile: "latest" })).toThrow("absolute paths");
   expect(parseOmpVersion("18.15.0\n")).toBe("18.15.0"); expect(() => parseOmpVersion("prefix 18.15.0 trailing")).toThrow("Expected OMP");
+});
+test("fresh managed OMP launch explicitly selects its per-bootstrap session directory", () => {
+  const base = { binary: "/bin/omp", registryDir: "/registry", bootstrapFile: "/lanes/a/bootstrap.json", extensionPath: "/extension.ts", cwd: "/workspace", provider: "fixture", model: "test", effort: "medium", approvalMode: "always-ask" as const };
+  const fresh = prepareOmpLaunch(base), other = prepareOmpLaunch({ ...base, bootstrapFile: "/lanes/b/bootstrap.json" });
+  expect(fresh.argv.slice(-2)).toEqual(["--session-dir", "/lanes/a/bootstrap.json.sessions"]);
+  expect(other.argv.slice(-2)).toEqual(["--session-dir", "/lanes/b/bootstrap.json.sessions"]);
+  expect(fresh.argv).not.toContain("--resume"); expect(fresh.argv).not.toContain("--continue"); expect(fresh.argv).not.toContain("--restore");
 });

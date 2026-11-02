@@ -18,8 +18,9 @@ export function prepareOmpLaunch(options: OmpLaunchOptions): OmpLaunchSpec {
   if (options.resumeSessionFile && !options.resumeSessionFile.endsWith(".jsonl")) throw new OmpError("invalid-launch", "OMP resume requires an exact JSONL session file", false);
   // Qualified model selectors are deferred until extension providers have registered.
   // Native model IDs may themselves contain slashes; never strip or infer a provider from them.
+  // An explicit per-bootstrap directory selects fresh creation before OMP's ambient autoResume.
   return { argv: [options.binary, "--model", `${options.provider}/${options.model}`, "--thinking", options.effort, "--approval-mode", options.approvalMode,
-    "--extension", options.extensionPath, ...(options.resumeSessionFile ? ["--resume", options.resumeSessionFile] : [])],
+    "--extension", options.extensionPath, ...(options.resumeSessionFile ? ["--resume", options.resumeSessionFile] : ["--session-dir", `${options.bootstrapFile}.sessions`])],
     env: { ...options.env, IYEN_OMP_BOOTSTRAP: options.bootstrapFile, IYEN_OMP_REGISTRY_DIR: options.registryDir }, cwd: options.cwd };
 }
 export function parseOmpVersion(output: string): string {
