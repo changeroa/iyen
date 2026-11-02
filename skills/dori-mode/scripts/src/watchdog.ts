@@ -17,9 +17,8 @@ const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(valu
 export type TargetBinding = Pick<Attachment, "instance" | "generation" | "pane" | "threadId" | "cwd" | "socketPath">;
 export type WatchTarget = { binding: TargetBinding; attachment: Attachment; lane: Lane; deliberateHold: boolean; handoffPending: boolean };
 // Never construct Registry/Mailbox here: their recovery writes service-owned state.
-export const readWatchTarget = (dir: string): WatchTarget | null => {
+const readWatchLane = (dir: string): Lane | null => {
   try {
-    const a = read<Attachment>(join(dir, "attachments/lead.json"));
     let lane = read<Lane>(join(dir, "lanes/lead.json"));
     // A committed WAL record can be newer than a failed snapshot replacement.
     const log = join(dir, "journal/events.jsonl");
@@ -32,6 +31,17 @@ export const readWatchTarget = (dir: string): WatchTarget | null => {
         if (row.type === "lane" && row.lane?.key === "lead" && (row.lane.revision ?? 0) >= (lane?.revision ?? 0)) lane = row.lane;
       } } catch { return null; }
     }
+    return lane;
+  } catch { return null; }
+};
+const deliberateLane = (lane: Lane | null): boolean => Boolean(lane && (
+  lane.runtime?.external?.detachedAt || lane.runtime?.state === "stopped" ||
+  ["owner-pause", "done-review"].includes(lane.holdReason ?? "") ||
+  ["paused", "done-claimed", "verified-done", "closed"].includes(statusOf(lane))));
+const generationKey = (binding: TargetBinding) => hash([binding.instance, binding.generation]);
+export const readWatchTarget = (dir: string): WatchTarget | null => {
+  try {
+    const a = read<Attachment>(join(dir, "attachments/lead.json")), lane = readWatchLane(dir);
     const r = lane?.runtime, ext = r?.external;
     if (!a || !lane || !["working", "paused", "done-claimed", "verified-done", "not-done", "closed"].includes(statusOf(lane)) || r?.backend !== "external-current-session" || !ext || ext.detachedAt || r.state === "stopped" ||
       !THREAD_UUID.test(a.threadId) || !THREAD_UUID.test(a.instance) || !Number.isSafeInteger(a.generation) || a.generation < 1 ||
@@ -43,10 +53,10 @@ export const readWatchTarget = (dir: string): WatchTarget | null => {
       handoffPending: existsSync(join(dir, "attachments/handoff.json")) };
   } catch { return null; }
 };
-export type Incident = { id: string; firstSeenAt: number; lastSeenAt: number; resolvedAt?: number; reasons: string[]; binding: TargetBinding | null;
+export type Incident = { id: string; firstSeenAt: number; lastSeenAt: number; resolvedAt?: number; supersededAt?: number; reasons: string[]; binding: TargetBinding | null;
   notification: "pending" | "unknown" | "sent"; turnId?: string; text: string; firstEvidence: Evidence; evidence: Evidence };
 type Evidence = { serviceReachable: boolean; phase: string; deliveryHeld: boolean; overdue: { queued: number; sending: number; unknown: number }; ingressFailed: number; holdCode?: string; identity?: Record<string, unknown> };
-type WatchState = { version: 1; checkedAt?: number; suspectSince?: number; healthySince?: number; incidents: Incident[] };
+type WatchState = { version: 1; checkedAt?: number; suspectSince?: number; suspectScope?: string; healthySince?: number; incidents: Incident[] };
 export type WatchOptions = { graceMs?: number; recoveryGraceMs?: number; overdueMs?: number; timeoutMs?: number; now?: () => number; runner?: Runner;
   health?: () => Promise<any>; observe?: typeof observeExternal; signal?: AbortSignal };
 const statePath = (dir: string) => join(dir, "watchdog/state.json");
@@ -82,7 +92,17 @@ export class DeliveryWatchdog {
       reachable = health?.serviceReachable === true;
     } catch { health = readStartupHealth(dir); }
     finally { clearTimeout(timer); }
-    const target = readWatchTarget(dir), deliberate = target?.deliberateHold || target?.handoffPending;
+    const target = readWatchTarget(dir), authority = target?.lane ?? readWatchLane(dir);
+    const deliberate = target?.deliberateHold || deliberateLane(authority) || existsSync(join(dir, "attachments/handoff.json"));
+    // Health is fault evidence only. It can never authorize notification when
+    // attachment records cannot establish the exact current target.
+    const invalidActiveBinding = reachable && !target && !deliberate && ["held", "ready", "busy"].includes(health?.delivery?.state);
+    const scope = target ? generationKey(target.binding) : undefined;
+    if (scope) {
+      if (state.suspectScope !== scope) { state.suspectSince = undefined; state.healthySince = undefined; }
+      state.suspectScope = scope;
+      for (const incident of state.incidents) if (!incident.resolvedAt && !incident.supersededAt && incident.binding && generationKey(incident.binding) !== scope) incident.supersededAt = now;
+    }
     let eligiblePending = 0;
     const overdue = { queued: 0, sending: 0, unknown: 0 };
     const rows = read<Record<string, any>>(join(dir, "inbox.json")) ?? {};
@@ -95,12 +115,13 @@ export class DeliveryWatchdog {
     }
     const phases = ["starting", "replaying", "reconciling", "ready", "stopping", "failed", "unavailable"];
     const evidence: Evidence = { serviceReachable: reachable, phase: phases.includes(health?.phase) ? health.phase : "unavailable",
-      deliveryHeld: Boolean(target && !deliberate && (target.lane.dispatchBlocked || target.lane.runtime?.held)), overdue,
+      deliveryHeld: Boolean(!deliberate && (target?.lane.dispatchBlocked || target?.lane.runtime?.held || reachable && health?.delivery?.state === "held")), overdue,
       ingressFailed: Array.isArray(health?.ingress) ? health.ingress.filter((i: any) => i.process === "failed").length : 0,
       ...(target?.lane.runtime?.external?.latestHoldReason ? { holdCode: target.lane.runtime.external.latestHoldReason.code, identity: identityEvidence(target.lane.runtime.external.latestHoldReason.evidence) } : {}) };
     const reasons: string[] = [];
     if (!reachable || evidence.phase === "failed") reasons.push("service-unavailable");
     if (!deliberate && evidence.deliveryHeld) reasons.push("attachment-held");
+    if (invalidActiveBinding) reasons.push("binding-unverified");
     const busy = ["waiting_approval", "waiting_input"].includes(target?.lane.runtime?.state ?? "");
     if (!deliberate && !busy && Object.values(overdue).some(n => n > 0)) reasons.push("mail-overdue");
     if (evidence.ingressFailed) reasons.push("ingress-failed");
@@ -112,22 +133,24 @@ export class DeliveryWatchdog {
       if (reachable && evidence.phase === "ready" && target && !deliberate && !target.lane.dispatchBlocked && !target.lane.runtime?.held &&
         ["idle", "running"].includes(target.lane.runtime?.state ?? "") && eligiblePending === 0) {
         state.healthySince ??= now;
-        if (now - state.healthySince >= (this.opts.recoveryGraceMs ?? 10000)) for (const incident of state.incidents) if (!incident.resolvedAt) incident.resolvedAt = now;
+        if (now - state.healthySince >= (this.opts.recoveryGraceMs ?? 10000)) for (const incident of state.incidents) if (!incident.resolvedAt && !incident.supersededAt) incident.resolvedAt = now;
       } else state.healthySince = undefined;
     } else {
       state.healthySince = undefined;
       state.suspectSince ??= now;
       if (now - state.suspectSince >= (this.opts.graceMs ?? 60000)) {
-        let incident = state.incidents.find(i => !i.resolvedAt);
+        let incident = state.incidents.find(i => !i.resolvedAt && !i.supersededAt);
         if (!incident) { const id = crypto.randomUUID(); incident = { id, text: prompt(dir, id), firstEvidence: evidence, firstSeenAt: now, lastSeenAt: now, reasons, binding: target?.binding ?? null, notification: "pending", evidence }; state.incidents.push(incident); }
         incident.lastSeenAt = now; incident.reasons = reasons; incident.evidence = evidence;
       }
     }
     state.incidents = state.incidents.slice(-100);
     atomicJson(statePath(dir), state); // Persist before any external effect.
-    const incident = state.incidents.find(i => !i.resolvedAt && i.notification !== "sent") ?? state.incidents.toReversed().find(i => i.notification !== "sent");
+    const compatible = (i: Incident) => !i.supersededAt && i.notification !== "sent" && (!i.binding || scope === generationKey(i.binding));
+    const incident = state.incidents.find(i => !i.resolvedAt && compatible(i)) ?? state.incidents.toReversed().find(compatible);
     if (incident && incident.notification !== "sent" && target && !deliberate && !this.opts.signal?.aborted) {
-      // Unsent incidents follow activation; uncertain sends never change binding.
+      // Unbound pending incidents may follow activation. Superseded or uncertain
+      // attempts never acquire a different generation or replay their marker.
       if (incident.notification === "pending") incident.binding = target.binding;
       if (hash(incident.binding) !== hash(target.binding)) return state;
       const valid = () => { const current = readWatchTarget(dir); return current && !current.deliberateHold && !current.handoffPending && hash(current.binding) === hash(incident.binding); };

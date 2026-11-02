@@ -113,11 +113,18 @@ test("long running session alone is healthy but eligible overdue mail is detecte
   h.mail("eligible"); const result = await h.watchdog().poll(); expect(result.incidents[0]).toMatchObject({ reasons: ["mail-overdue"], evidence: { overdue: { queued: 1 } }, notification: "sent" });
 });
 
-test("new generation cannot replay an uncertain old notification", async () => {
+test("new generation gets a distinct incident without replaying an uncertain old notification", async () => {
   const h = await fixture(); h.unavailable(); h.noReceipt(); await h.watchdog().poll();
   const path = join(h.state.dir, "attachments/lead.json"), a = JSON.parse(readFileSync(path, "utf8")), instance = crypto.randomUUID(); atomicJson(path, { ...a, generation: 2, instance });
   await h.service.registry.update("lead", l => ({ ...l, runtime: { ...l.runtime!, hostInstanceId: instance, generation: 2 } }));
-  await h.watchdog().poll(); expect(h.queues()).toHaveLength(1);
+  await h.watchdog().poll(); expect(h.queues()).toHaveLength(2);
+  const incidents = watchdogStatus(h.state.dir).incidents;
+  expect(incidents).toHaveLength(2);
+  expect(incidents[0]).toMatchObject({ notification: "unknown", supersededAt: expect.any(Number), binding: { instance: a.instance, generation: 1 } });
+  expect(incidents[1]).toMatchObject({ notification: "unknown", binding: { instance, generation: 2 } });
+  expect(incidents[1]!.id).not.toBe(incidents[0]!.id);
+  expect(h.queues()[1]![5]).not.toBe(h.queues()[0]![5]);
+  await h.watchdog().poll(); expect(h.queues()).toHaveLength(2);
 });
 
 test("authoritative newer WAL pause beats stale lane snapshot; partial WAL fails closed without mutation", async () => {
@@ -220,4 +227,35 @@ test("killed lock helper cannot release fence while its queue child still owns i
   for (let n = 0; n < 100 && !await Bun.file(marker).exists(); n++) await Bun.sleep(5);
   expect(await Bun.file(marker).exists()).toBe(true); helper.kill("SIGKILL"); await helper.exited; reader.releaseLock();
   await expect(acquireFileFence(path, 20)).rejects.toThrow(); const release = await acquireFileFence(path, 1000); await release();
+});
+
+
+test("live held delivery with invalid attachment records a record-only binding incident", async () => {
+  const h = await fixture(); await h.hold();
+  const path = join(h.state.dir, "attachments/lead.json"), a = JSON.parse(readFileSync(path, "utf8"));
+  atomicJson(path, { ...a, generation: a.generation + 1 }); expect(readWatchTarget(h.state.dir)).toBeNull();
+  const result = await h.watchdog().poll();
+  expect(result.incidents[0]).toMatchObject({ notification: "pending", binding: null, reasons: ["attachment-held", "binding-unverified"] });
+  await h.watchdog().poll(); expect(watchdogStatus(h.state.dir).incidents).toHaveLength(1); expect(h.queues()).toHaveLength(0);
+});
+
+for (const hold of ["owner-pause", "done-review", "detached"] as const) test(`invalid binding preserves authoritative deliberate ${hold}`, async () => {
+  const h = await fixture();
+  if (hold === "detached") await h.service.handle("lead-detach", { threadId: id }, { role: "admin" });
+  else await h.service.registry.update("lead", l => ({ ...l, dispatchBlocked: true, holdReason: hold, status: hold === "owner-pause" ? "paused" : "done-claimed" }));
+  const path = join(h.state.dir, "attachments/lead.json"), a = JSON.parse(readFileSync(path, "utf8")); atomicJson(path, { ...a, generation: a.generation + 1 });
+  expect((await h.watchdog().poll()).incidents).toHaveLength(0); expect(h.queues()).toHaveLength(0);
+});
+
+test("fresh generation fault observes its own grace interval without replaying old unknown marker", async () => {
+  const h = await fixture(); h.unavailable(); h.noReceipt(); await h.watchdog().poll();
+  const old = structuredClone(watchdogStatus(h.state.dir).incidents[0]!);
+  h.opts.graceMs = 1000;
+  const path = join(h.state.dir, "attachments/lead.json"), a = JSON.parse(readFileSync(path, "utf8")), instance = crypto.randomUUID(); atomicJson(path, { ...a, generation: 2, instance });
+  await h.service.registry.update("lead", l => ({ ...l, runtime: { ...l.runtime!, hostInstanceId: instance, generation: 2 } }));
+  await h.watchdog().poll(); expect(h.queues()).toHaveLength(1);
+  h.advance(1001); await h.watchdog().poll(); expect(h.queues()).toHaveLength(2);
+  const current = watchdogStatus(h.state.dir).incidents;
+  expect(current[0]).toMatchObject({ id: old.id, text: old.text, binding: old.binding, notification: "unknown", supersededAt: expect.any(Number) });
+  expect(current[1]!.id).not.toBe(old.id);
 });
