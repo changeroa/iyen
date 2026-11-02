@@ -84,6 +84,16 @@ export const waitForOmpDetach = async (sessionFile: string, deadline: number, ru
   throw new Error("OMP Herdr process association still present; stop unconfirmed");
 };
 
+/** A retry after native exit only reaps evidence; it cannot contact a vanished controller. */
+export const stopOmpManagedProcess = async (target: OmpTarget, pid: number | undefined, config: DoriConfig, runner: Runner = run): Promise<void> => {
+  if (!pid || !Number.isSafeInteger(pid) || pid <= 0) throw new Error("OMP process exit cannot be verified; host remains held");
+  if (processAlive(pid)) await callOmp(target, "stop", {}, config, runner);
+  const deadline = Date.now() + config.runtime.rpcTimeoutMs;
+  while (processAlive(pid) && Date.now() < deadline) await Bun.sleep(50);
+  if (processAlive(pid)) throw new Error("OMP stop intent acknowledged but process exit unconfirmed");
+  await waitForOmpDetach(target.sessionFile, deadline, runner);
+};
+
 export const verifyOmpHerdr = async (target: OmpTarget, runner: Runner = run): Promise<void> => {
   const result = await runner(["herdr", "agent", "list"]);
   if (result.code !== 0) throw new Error("OMP Herdr association unavailable");
@@ -228,12 +238,7 @@ const runOmpOwnedSessionHost = async (stateDir: string, boot: Bootstrap): Promis
       else if (action === "operation") result = await callOmp(pinned, action, args, config);
       else if (action === "approvals") { const s = await inspect(); result = s.state.startsWith("waiting_") ? [{ id: `omp:${pinned.sessionId}`, request: { pane: boot.pane, message: "Inspect and answer the actual OMP TUI" } }] : []; }
       else if (action === "stop") {
-        held = true; persist(); await callOmp(pinned, "stop", args, config);
-        if (!pid) throw new Error("OMP process exit cannot be verified; host remains held");
-        const until = Date.now() + config.runtime.rpcTimeoutMs;
-        while (processAlive(pid) && Date.now() < until) await Bun.sleep(50);
-        if (processAlive(pid)) throw new Error("OMP stop intent acknowledged but process exit unconfirmed");
-        await waitForOmpDetach(pinned.sessionFile, until);
+        held = true; persist(); await stopOmpManagedProcess(pinned, pid, config);
         nativeStopped = true; closing = true; result = { stopped: true };
       } else throw new Error("Unsupported OMP host action; approvals stay in the real TUI");
       return Response.json({ result });

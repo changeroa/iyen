@@ -6,7 +6,7 @@ import { atomicJson } from "../src/journal.ts";
 import { DoriService } from "../src/service.ts";
 import { hostSocket } from "../src/ipc.ts";
 import { bootstrapPath } from "../src/runtime/session-host.ts";
-import { ompManagedEnvironment, ompProfileEnvironment, ompPaneCommand, ompVersionMatches, verifyOmpHerdr, discoverOmpSafe, waitForOmpDetach } from "../src/runtime/omp-integration.ts";
+import { ompManagedEnvironment, ompProfileEnvironment, ompPaneCommand, ompVersionMatches, verifyOmpHerdr, discoverOmpSafe, waitForOmpDetach, stopOmpManagedProcess } from "../src/runtime/omp-integration.ts";
 import { payloadHash } from "../src/runtime/omp/contract.ts";
 import { readWatchTarget, DeliveryWatchdog } from "../src/watchdog.ts";
 import { ompFixture } from "./fixtures/omp.ts";
@@ -46,6 +46,28 @@ test("OMP stop remains unconfirmed when Herdr still reports the native session o
   for (const agents of [[null], [{}], [{ agent: "omp" }], [{ agent: "omp", agent_session: { value: 42 } }]]) {
     await expect(waitForOmpDetach("/exact.jsonl", Date.now() + 1000, async () => ({ code: 0, err: "", out: JSON.stringify({ result: { agents } }) }))).rejects.toThrow("unverified");
   }
+});
+test("OMP stop retry reaps an exited native process without resending to its vanished controller", async () => {
+  const f = ompFixture(), config = profile(f.directory);
+  const child = Bun.spawn([process.execPath, "-e", "setInterval(()=>{},1000)"], { stdout: "ignore", stderr: "ignore" });
+  let stops = 0, detached = false, invalid = true;
+  await f.serve(async request => {
+    if (request.method === "inspect") return { protocol: 1, id: request.id, identity: f.identity, result: f.snapshot };
+    if (request.method !== "stop") throw new Error("Only one stop permitted");
+    stops++; child.kill("SIGTERM"); await child.exited; detached = true;
+    return { protocol: 1, id: request.id, identity: f.identity, result: { stopping: true } };
+  });
+  const runner: Runner = async argv => detached
+    ? { code: 0, err: "", out: JSON.stringify({ result: { agents: invalid ? [{ agent: "omp" }] : [] } }) }
+    : association(f)(argv);
+  try {
+    await expect(stopOmpManagedProcess(f.target, child.pid, config, runner)).rejects.toThrow("unverified");
+    expect(stops).toBe(1);
+    invalid = false;
+    await stopOmpManagedProcess(f.target, child.pid, config, runner);
+    expect(stops).toBe(1);
+    await expect(stopOmpManagedProcess(f.target, undefined, config, runner)).rejects.toThrow("exit cannot be verified");
+  } finally { child.kill(); await child.exited; f.cleanup(); }
 });
 async function setup(handler?: (method: string, params: any) => any) {
   const f = ompFixture(); f.transcript([]);
