@@ -26,9 +26,9 @@ export function durableJson(path: string, value: unknown): void {
   privateDirectory(dirname(path));
   const temporary = join(dirname(path), `.${randomUUID()}.tmp`);
   const fd = openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-  try { writeFileSync(fd, JSON.stringify(value) + "\n"); fsyncSync(fd); }
-  finally { closeSync(fd); }
   try {
+    try { writeFileSync(fd, JSON.stringify(value) + "\n"); fsyncSync(fd); }
+    finally { closeSync(fd); }
     renameSync(temporary, path);
     const directory = openSync(dirname(path), constants.O_RDONLY | constants.O_NOFOLLOW);
     try { fsyncSync(directory); } finally { closeSync(directory); }
@@ -114,6 +114,14 @@ export function persistedReceipt(identity: OmpIdentity, leafId: string | null, t
     if (!bytes.length || bytes[bytes.length - 1] !== 10) throw new ReceiptPending("OMP transcript has an incomplete trailing record");
     const lines = bytes.toString("utf8").split("\n"); lines.pop();
     const records: unknown[] = lines.map(line => JSON.parse(line));
+    const first = records[0];
+    if (object(first) && first.type === "title") {
+      // OMP18.15.0 session-title-slot.ts: one optional physical 256-byte v1 slot.
+      if (!exactKeys(first, ["type", "v", "title", "updatedAt", "pad"], ["source"]) || first.v !== 1 || typeof first.title !== "string" ||
+        typeof first.updatedAt !== "string" || typeof first.pad !== "string" || !/^ *$/.test(first.pad) ||
+        (first.source !== undefined && first.source !== "auto" && first.source !== "user") || Buffer.byteLength(lines[0]! + "\n") !== 256) throw new OmpError("invalid-title-slot", "Invalid OMP native title preamble");
+      records.shift();
+    }
     const header = records.shift();
     if (!object(header) || header.type !== "session" || header.id !== identity.sessionId || header.cwd !== identity.cwd) throw new OmpError("identity-mismatch", "OMP persisted session header mismatch");
     const entries = new Map<string, Entry>();

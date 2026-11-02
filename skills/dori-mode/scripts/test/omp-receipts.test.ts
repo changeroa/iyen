@@ -47,3 +47,17 @@ test("OMP journal fences crash cases and rejects changed content across restart"
     expect(new OperationJournal(path, f.identity).get("op", digest).status).toBe("received");
   } finally { f.cleanup(); }
 });
+test("OMP native fixed title preamble is accepted strictly before the session header", () => {
+  const f = ompFixture();
+  try {
+    const slot = { type: "title", v: 1, title: "native", updatedAt: "2026-11-02T04:45:08.293Z", pad: "" };
+    slot.pad = " ".repeat(256 - Buffer.byteLength(JSON.stringify(slot) + "\n"));
+    const entry = user("one", null, markedText("task", "op"));
+    writeFileSync(f.identity.sessionFile, [slot, f.header, entry].map(row => JSON.stringify(row) + "\n").join(""));
+    expect(persistedReceipt(f.identity, "one", "task", "op")?.entryId).toBe("one");
+    writeFileSync(f.identity.sessionFile, [ { ...slot, v: 2 }, f.header, entry ].map(row => JSON.stringify(row) + "\n").join(""));
+    expect(() => persistedReceipt(f.identity, "one", "task", "op")).toThrow("title preamble");
+    writeFileSync(f.identity.sessionFile, [{ type: "arbitrary" }, f.header, entry].map(row => JSON.stringify(row) + "\n").join(""));
+    expect(() => persistedReceipt(f.identity, "one", "task", "op")).toThrow("header mismatch");
+  } finally { f.cleanup(); }
+});

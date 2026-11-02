@@ -1,6 +1,6 @@
 import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { OmpError, assertIdentity, exactKeys, identityOf, nonempty, object, type OmpTarget } from "./contract.ts";
+import { OmpError, assertIdentity, exactKeys, identityOf, nonempty, object, payloadHash, type OmpTarget } from "./contract.ts";
 export type OmpLaunchOptions = {
   binary: string; registryDir: string; bootstrapFile: string; extensionPath: string; cwd: string;
   provider: string; model: string; effort: string; approvalMode: "always-ask" | "always-ask-cached" | "yolo";
@@ -14,8 +14,11 @@ export function prepareOmpLaunch(options: OmpLaunchOptions): OmpLaunchSpec {
   if (![options.provider, options.model, options.effort].every(value => nonempty(value) && !value.startsWith("-")) ||
     !["always-ask", "always-ask-cached", "yolo"].includes(options.approvalMode) ||
     !["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"].includes(options.effort)) throw new OmpError("invalid-launch", "Invalid explicit OMP model, effort or approval mode", false);
+  if (options.provider.includes("/") || /\s/.test(options.provider) || options.model.startsWith(`${options.provider}/`)) throw new OmpError("invalid-launch", "OMP model must be the native model ID without a duplicate configured provider prefix", false);
   if (options.resumeSessionFile && !options.resumeSessionFile.endsWith(".jsonl")) throw new OmpError("invalid-launch", "OMP resume requires an exact JSONL session file", false);
-  return { argv: [options.binary, "--provider", options.provider, "--model", options.model, "--thinking", options.effort, "--approval-mode", options.approvalMode,
+  // Qualified model selectors are deferred until extension providers have registered.
+  // Native model IDs may themselves contain slashes; never strip or infer a provider from them.
+  return { argv: [options.binary, "--model", `${options.provider}/${options.model}`, "--thinking", options.effort, "--approval-mode", options.approvalMode,
     "--extension", options.extensionPath, ...(options.resumeSessionFile ? ["--resume", options.resumeSessionFile] : [])],
     env: { ...options.env, IYEN_OMP_BOOTSTRAP: options.bootstrapFile, IYEN_OMP_REGISTRY_DIR: options.registryDir }, cwd: options.cwd };
 }
@@ -43,6 +46,7 @@ export async function discoverOmp(registryDir: string): Promise<OmpTarget[]> {
         !nonempty(value.socketPath) || !isAbsolute(value.socketPath) || !nonempty(value.tokenFile) || !isAbsolute(value.tokenFile)) throw new Error("Invalid descriptor");
       const target = value as unknown as OmpTarget;
       assertIdentity(identityOf(target));
+      if (name !== `${payloadHash(`${target.instanceId}:${target.generation}`)}.json`) throw new Error("Descriptor filename mismatch");
       // A dead PID cannot be attached. A live/reused PID is still not proof: caller must authenticate inspect.
       try { process.kill(value.pid as number, 0); } catch { continue; }
       if (!lstatSync(target.socketPath).isSocket()) continue;
