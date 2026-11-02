@@ -101,7 +101,9 @@ below creates a separate local profile with no messenger hooks or ingress. It
 is not production activation or a migration of Codex IDs/history.
 
 OMP requires the tested Bun >=1.4.4 and the configured native OMP binary/version.
-Managed lanes additionally require the Iyen OMP fork's `executionHold` API;
+Managed lanes additionally require the Iyen OMP fork's `executionHold` API
+(tested commit [`7ad84cb368`](https://github.com/changeroa/oh-my-pi/commit/7ad84cb368be527b5dacd29a2617f6712d2d027b)
+on [`feat/harness-runtime`](https://github.com/changeroa/oh-my-pi/tree/feat/harness-runtime));
 upstream 18.15.0 alone does not supply the execution barrier. Missing hold,
 release, stop or durable receipt capability blocks managed readiness. OMP does
 not implement Codex OS isolation: explicitly select `danger-full-access` and an
@@ -147,6 +149,10 @@ load from this isolated profile or its explicit OMP wrapper. Managed launch
 uses a qualified `provider/model` selector so extension registration can precede
 model resolution; config keeps provider and model ID in separate fields. The
 service verifies the actual resolved provider/model/effort after startup.
+
+Each fresh managed launch uses its own `<bootstrapFile>.sessions` directory,
+so a profile's `autoResume` preference cannot silently select an earlier
+conversation. Recovery uses the recorded native session file explicitly.
 
 ### Load the extension in the intended native TUI
 
@@ -230,6 +236,18 @@ borrowed leads. Iyen readiness/handoff delivery gates do not pause the user's
 native execution. OMP `adopt` is unsupported: managed lanes require the verified
 bootstrap and scoped `iyen_control` tool. Use service `launch` for a managed lane,
 with explicit lane model/effort and a brief; no READY prompt is used for identity.
+
+Managed pause closes execution admission and waits for supported work to settle.
+Active realtime voice (`/live` or an extension's `startLive`) requires explicit
+stop followed by a retry of pause. It is not stopped automatically: the native
+state remains `holding`, never `held`, while voice is active or closing. New
+voice starts are refused while holding. Resume only releases the execution
+barrier; it does not replay earlier input. After host recovery, reconcile any
+unknown delivery records before explicitly resuming the lane.
+
+The native extension API does not report every failed manual compaction's end.
+In that case delivery stays conservatively blocked until a confirmed native
+hold or a new observed agent run resolves the ambiguous state.
 
 For a different explicitly verified target, run from that target's actual cwd
 and reuse its native metadata. Preview is read-only; apply requires stable ID
