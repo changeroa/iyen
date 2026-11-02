@@ -69,7 +69,11 @@ export const waitForOmpDetach = async (sessionFile: string, deadline: number, ru
     if (result.code !== 0) throw new Error("OMP Herdr process association unverified; stop unconfirmed");
     const agents = JSON.parse(result.out).result?.agents;
     if (!Array.isArray(agents)) throw new Error("OMP Herdr process association unverified; stop unconfirmed");
-    if (!agents.some(a => a?.agent === "omp" && a.agent_session?.value === sessionFile)) return;
+    if (agents.some(a => !a || typeof a !== "object" || typeof a.agent !== "string" || !a.agent ||
+      (a.agent === "omp" && (typeof a.agent_session?.value !== "string" || !a.agent_session.value)))) {
+      throw new Error("OMP Herdr process association unverified; stop unconfirmed");
+    }
+    if (!agents.some(a => a.agent === "omp" && a.agent_session?.value === sessionFile)) return;
     await Bun.sleep(Math.min(50, Math.max(0, deadline - Date.now())));
   }
   throw new Error("OMP Herdr process association still present; stop unconfirmed");

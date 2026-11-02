@@ -38,6 +38,9 @@ test("OMP stop remains unconfirmed when Herdr still reports the native session o
   const runner: Runner = async () => ({ code: 0, err: "", out: JSON.stringify({ result: { agents: [{ agent: "omp", agent_session: { value: "/exact.jsonl" } }] } }) });
   await expect(waitForOmpDetach("/exact.jsonl", Date.now() + 60, runner)).rejects.toThrow("still present");
   await expect(waitForOmpDetach("/exact.jsonl", Date.now() + 1000, async () => ({ code: 1, out: "", err: "unavailable" }))).rejects.toThrow("unverified");
+  for (const agents of [[null], [{}], [{ agent: "omp" }], [{ agent: "omp", agent_session: { value: 42 } }]]) {
+    await expect(waitForOmpDetach("/exact.jsonl", Date.now() + 1000, async () => ({ code: 0, err: "", out: JSON.stringify({ result: { agents } }) }))).rejects.toThrow("unverified");
+  }
 });
 async function setup(handler?: (method: string, params: any) => any) {
   const f = ompFixture(); f.transcript([]);
