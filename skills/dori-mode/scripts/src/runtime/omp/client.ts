@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants, closeSync, fstatSync, openSync, readFileSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { isAbsolute } from "node:path";
-import { OMP_MAX_FRAME_BYTES, OmpError, assertIdentity, exactKeys, identityOf, nonempty, object, payloadHash, validReceipt, validSnapshot,
+import { OMP_MAX_FRAME_BYTES, OmpError, assertIdentity, exactKeys, identityOf, nonempty, object, payloadHash, validReceipt, validSnapshot, validFailureRequest, validateFailurePage,
   type OmpController, type OmpMethod, type OmpOperation, type OmpReceipt, type OmpSnapshot, type OmpTarget } from "./contract.ts";
 
 export async function connectOmp(target: OmpTarget, options: { timeoutMs?: number } = {}): Promise<OmpController> {
@@ -19,6 +19,7 @@ export async function connectOmp(target: OmpTarget, options: { timeoutMs?: numbe
     if (!nonempty(token)) throw new OmpError("invalid-token-file", "Empty OMP bearer token", false);
   } finally { closeSync(fd); }
   let closed = false;
+  let failureStream: string | undefined;
   const sockets = new Set<Socket>();
   // Each request has its own connection: a receipt wait cannot block hold or observation.
   const request = (method: OmpMethod, params: Record<string, unknown>): Promise<unknown> => new Promise((resolve, reject) => {
@@ -62,6 +63,13 @@ export async function connectOmp(target: OmpTarget, options: { timeoutMs?: numbe
     object(result) && exactKeys(result, ["receipt"]) && validReceipt(result.receipt, identity, operationId, digest) ? { receipt: result.receipt } : invalid();
   const controller: OmpController = {
     inspect: async () => snapshot(await request("inspect", {})),
+    failures: async (after, limit = 100) => {
+      if (!validFailureRequest(after, limit)) throw new OmpError("invalid-params", "Invalid OMP failure cursor", false);
+      const result = await request("failures", { after, limit });
+      if (!validateFailurePage(result, identity, after, limit) || (failureStream && result.streamId !== failureStream)) return invalid();
+      failureStream = result.streamId;
+      return result;
+    },
     input: async (text, operationId) => receipt(await request("input", { text, operationId, payloadHash: payloadHash(text) }), operationId, payloadHash(text)),
     operation: async (operationId, text): Promise<OmpOperation> => {
       const digest = payloadHash(text), result = await request("operation", { operationId, payloadHash: digest });

@@ -8,6 +8,7 @@ import { hostSocket, ipc, readJson, serviceSocket } from "../ipc.ts";
 import { DeliveryDeferred } from "../mailbox.ts";
 import { quoteForPane } from "../launch.ts";
 import { run, type Runner } from "../run.ts";
+import { drainOmpFailures, failureCursorPath } from "./omp/failures.ts";
 import { connectOmp } from "./omp/client.ts";
 import { discoverOmp, prepareOmpLaunch } from "./omp/launcher.ts";
 import { OmpError, sameIdentity, validReceipt, payloadHash, type OmpTarget, type OmpSnapshot, type OmpExtensionBootstrap } from "./omp/contract.ts";
@@ -192,7 +193,7 @@ const runOmpOwnedSessionHost = async (stateDir: string, boot: Bootstrap): Promis
     }
   }
   if (!target || !snap) throw new Error("OMP controller startup unconfirmed; no handshake input sent");
-  if (snap.provider !== omp.provider || snap.model !== role.model || snap.effort !== role.effort || target.runtimeVersion !== config.runtime.requiredVersion || !snap.capabilities.durableReceipts || !snap.capabilities.hold || !snap.capabilities.release || !snap.capabilities.stop) throw new Error("OMP managed capabilities/model/effort mismatch");
+  if (snap.provider !== omp.provider || snap.model !== role.model || snap.effort !== role.effort || target.runtimeVersion !== config.runtime.requiredVersion || !snap.capabilities.durableReceipts || !snap.capabilities.durableFailures || !snap.capabilities.hold || !snap.capabilities.release || !snap.capabilities.stop) throw new Error("OMP managed capabilities/model/effort mismatch");
   const pinned = target;
   let held = Boolean(boot.blocked || boot.threadId), closing = false, nativeStopped = false, lastAck = Date.now();
   if (held) snap = await callOmp(pinned, "hold", { origin: "automatic" }, config).then(async () => {
@@ -245,6 +246,9 @@ const runOmpOwnedSessionHost = async (stateDir: string, boot: Bootstrap): Promis
     while (!closing) {
       try {
         await inspect();
+        const failures = await connectOmp(pinned, { timeoutMs: config.runtime.rpcTimeoutMs });
+        try { await drainOmpFailures(failures, pinned, failureCursorPath(stateDir, pinned), event => service("host-event", { event, runtime: runtime() })); }
+        finally { failures.close(); }
         if (snap!.state.startsWith("waiting_")) {
           blockedNotice ??= `omp-wait:${pinned.sessionId}:${snap!.eventSequence}`;
           await service("host-event", { event: { id: blockedNotice, method: "tui/inputRequired", params: { pane: boot.pane, message: "Inspect and answer the actual OMP TUI; no automated approval was sent" } }, runtime: runtime() });

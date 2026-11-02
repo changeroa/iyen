@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
+import { mkdirSync, unlinkSync } from "node:fs";
 import { connectOmp } from "../src/runtime/omp/client.ts";
 import { OmpError, parseRequest, payloadHash, type OmpGoal } from "../src/runtime/omp/contract.ts";
 import { OmpControlServer, hasAsyncWork, type OmpContext, type OmpExecutionHoldState } from "../src/runtime/omp/server.ts";
@@ -138,6 +139,7 @@ test("terminal native assistant error is failed and input-fenced without invalid
   const h = harness(); const failure = { role: "assistant", stopReason: "error", timestamp: 20, errorMessage: "provider failed" };
   try {
     const accepted: any = await h.dispatch("input", { operationId: "accepted", text: "task", payloadHash: payloadHash("task") });
+    h.server.observe({ type: "agent_start" });
     h.server.observe({ type: "turn_end", message: failure, toolResults: [] }); expect(h.server.snapshot().state).toBe("recovering");
     // Native recovery can prune the terminal error from active messages.
     h.server.observe({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop", timestamp: 10 }] });
@@ -152,12 +154,14 @@ test("terminal native assistant error is failed and input-fenced without invalid
 test("retry continuation is recovering until successful final assistant and exhausted retry is failed", () => {
   const h = harness(); const failure = { role: "assistant", stopReason: "error", timestamp: 20 };
   try {
+    h.server.observe({ type: "agent_start" });
     h.server.observe({ type: "turn_end", message: failure }); h.server.observe({ type: "auto_retry_start", attempt: 1 });
     h.server.observe({ type: "agent_end", messages: [failure], willContinue: true });
     expect(h.server.snapshot().state).toBe("recovering"); expect(h.server.snapshot().capabilities.input).toBe(false);
     const success = { role: "assistant", stopReason: "stop", timestamp: 30 };
     h.server.observe({ type: "turn_end", message: success }); h.server.observe({ type: "auto_retry_end", success: true, attempt: 1 });
     h.server.observe({ type: "agent_end", messages: [failure, success] }); expect(h.server.snapshot().state).toBe("idle");
+    h.server.observe({ type: "agent_start" });
     h.server.observe({ type: "auto_retry_start", attempt: 2 });
     h.server.observe({ type: "agent_end", messages: [failure], willContinue: true });
     h.server.observe({ type: "auto_retry_end", success: false, finalError: "local continuation failed" });
@@ -197,5 +201,92 @@ test("manual compaction uncertainty clears only on native run or authoritative c
     h.server.observe({ type: "tool_execution_start", toolCallId: "a", toolName: "ask" }); expect(h.server.snapshot().state).toBe("waiting_input");
     h.server.observe({ type: "tool_execution_end", toolCallId: "a", toolName: "ask" });
     h.server.observe({ type: "tool_execution_start", toolCallId: "b", toolName: "ask_user" }); expect(h.server.snapshot().state).toBe("running");
+  } finally { h.cleanup(); }
+});
+
+test("terminal failures remain ordered after recovery, retry exhaustion commits without agent_end and duplicate end dedupes", async () => {
+  const h = harness(), error = { role: "assistant", stopReason: "error", timestamp: 10, errorMessage: "Unauthorized API key sk-secret-example https://secret.invalid" };
+  try {
+    h.server.observe({ type: "agent_start" }); h.server.observe({ type: "agent_end", messages: [error] });
+    h.server.observe({ type: "agent_end", messages: [error] });
+    h.server.observe({ type: "agent_start" }); h.server.observe({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] });
+    h.server.observe({ type: "agent_start" }); h.server.observe({ type: "turn_end", message: error });
+    h.server.observe({ type: "auto_retry_start" }); h.server.observe({ type: "agent_end", willContinue: true, messages: [error] });
+    expect((await h.dispatch("failures", { after: 0, limit: 100 }) as any).records).toHaveLength(1);
+    h.server.observe({ type: "auto_retry_end", success: false, finalError: "quota exceeded sk-secret-example" });
+    h.server.observe({ type: "agent_end", messages: [error] });
+    h.server.observe({ type: "agent_start" }); h.server.observe({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] });
+    expect(h.server.snapshot().state).toBe("idle");
+    const page: any = await h.dispatch("failures", { after: 0, limit: 100 });
+    expect(page.records.map((r: any) => [r.sequence, r.phase, r.category])).toEqual([[1, "model", "authentication"], [2, "model", "usage-limit"]]);
+    expect(page.records[0].executionId).not.toBe(page.records[1].executionId);
+    expect(JSON.stringify(page)).not.toContain("sk-secret"); expect(JSON.stringify(page)).not.toContain("https://");
+  } finally { h.cleanup(); }
+});
+
+test("transient retry success, recovered errors, cancellation, assistant abort and intentional hold create no failures", async () => {
+  const h = harness(), error = { role: "assistant", stopReason: "error", timestamp: 10 };
+  try {
+    h.server.observe({ type: "agent_start" }); h.server.observe({ type: "turn_end", message: error });
+    h.server.observe({ type: "auto_retry_start" }); h.server.observe({ type: "agent_end", awaitingAsyncWork: true, messages: [error] });
+    h.server.observe({ type: "auto_retry_end", success: true });
+    h.server.observe({ type: "agent_end", messages: [{ ...error, retryRecovery: { kind: "auto-retry", status: "recovered" } }] });
+    h.server.observe({ type: "agent_start" }); h.server.observe({ type: "auto_retry_end", success: false, finalError: "Retry cancelled" }); h.server.observe({ type: "agent_end", messages: [error] });
+    h.server.observe({ type: "agent_start" }); h.server.observe({ type: "agent_end", messages: [{ ...error, stopReason: "aborted" }] });
+    h.server.observe({ type: "agent_start" }); await h.dispatch("hold", { operationId: "hold", origin: "user" }); h.server.observe({ type: "agent_end", messages: [error] });
+    expect((await h.dispatch("failures", { after: 0, limit: 100 }) as any).records).toHaveLength(0);
+  } finally { h.cleanup(); }
+});
+
+test("compaction aliases and retries coalesce; terminal compaction and model remain distinct and sanitized", async () => {
+  const h = harness();
+  try {
+    for (const outcome of [{ willRetry: true, errorMessage: "transient" }, { aborted: true, errorMessage: "abort" }, { skipped: true, errorMessage: "skip" }]) {
+      h.server.observe({ type: "auto_compaction_start" }); h.server.observe({ type: "session.compacting" });
+      h.server.observe({ type: "auto_compaction_end", ...outcome }); h.server.observe({ type: "session_compact" });
+    }
+    h.server.observe({ type: "auto_compaction_start" }); h.server.observe({ type: "session.compacting" });
+    h.server.observe({ type: "auto_compaction_end", willRetry: true, errorMessage: "retry" });
+    h.server.observe({ type: "auto_compaction_start" }); h.server.observe({ type: "auto_compaction_end" });
+    expect(h.server.snapshot().state).toBe("idle");
+    expect((await h.dispatch("failures", { after: 0, limit: 100 }) as any).records).toHaveLength(0);
+    h.server.observe({ type: "agent_start" });
+    h.server.observe({ type: "auto_compaction_start" }); h.server.observe({ type: "session.compacting" });
+    h.server.observe({ type: "auto_compaction_end", errorMessage: "unknown model sk-secret" });
+    h.server.observe({ type: "auto_compaction_end", errorMessage: "unknown model sk-secret" });
+    h.server.observe({ type: "agent_end", messages: [{ role: "assistant", stopReason: "error", errorMessage: "provider failed sk-secret" }] });
+    const page: any = await h.dispatch("failures", { after: 0, limit: 100 });
+    expect(page.records.map((r: any) => [r.phase, r.category])).toEqual([["compaction", "configuration"], ["model", "runtime"]]);
+    expect(JSON.stringify(page)).not.toContain("sk-secret");
+  } finally { h.cleanup(); }
+});
+
+test("unobserved terminal model identity is a visible failure-channel gap and borrowed lead exposes no journal", async () => {
+  const h = harness(), lead = harness({ borrowed: true });
+  try {
+    h.server.observe({ type: "auto_retry_end", success: false, finalError: "provider failed" });
+    expect(h.server.snapshot().capabilities.durableFailures).toBe(false); expect(h.server.snapshot().capabilities.input).toBe(false);
+    await expect(h.dispatch("failures", { after: 0, limit: 100 })).rejects.toThrow("failure channel unavailable");
+    h.server.observe({ type: "agent_start" }); expect(h.server.snapshot().capabilities.durableFailures).toBe(false);
+    expect(lead.server.snapshot().capabilities.durableFailures).toBe(false);
+    await expect(lead.dispatch("failures", { after: 0, limit: 100 })).rejects.toThrow("Borrowed OMP lead");
+  } finally { h.cleanup(); lead.cleanup(); }
+});
+
+
+test("failure journal write failure disables managed input and durable failure readiness", async () => {
+  const h = harness();
+  try {
+    expect(h.server.snapshot().capabilities.durableFailures).toBe(true);
+    const path = join(h.directory, "journal", "failures.json");
+    unlinkSync(path); mkdirSync(path, { mode: 0o700 });
+    h.server.observe({ type: "agent_start" });
+    h.server.observe({ type: "agent_end", messages: [{ role: "assistant", stopReason: "error", errorMessage: "sk-secret-example" }] });
+    h.server.observe({ type: "agent_start" });
+    const snap = h.server.snapshot();
+    expect(snap.state).toBe("failed"); expect(snap.capabilities.input).toBe(false); expect(snap.capabilities.durableFailures).toBe(false);
+    await expect(h.dispatch("failures", { after: 0, limit: 100 })).rejects.toThrow("failure channel unavailable");
+    await expect(h.dispatch("input", { operationId: "next", text: "task", payloadHash: payloadHash("task") })).rejects.toThrow("blocked before submission");
+    expect(h.sends()).toBe(0);
   } finally { h.cleanup(); }
 });

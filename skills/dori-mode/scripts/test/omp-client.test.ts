@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
 import { connectOmp } from "../src/runtime/omp/client.ts";
+import { FailureJournal } from "../src/runtime/omp/failures.ts";
+import { join } from "node:path";
 import { OmpError, payloadHash } from "../src/runtime/omp/contract.ts";
 import { ompFixture } from "./fixtures/omp.ts";
 
@@ -48,4 +50,39 @@ test("OMP preserves verified pre-submit refusal without exposing server text", a
   try { let error: unknown; try { await client.input("work", "op"); } catch (e) { error = e; }
     expect((error as OmpError).attempted).toBe(false); expect((error as Error).message).not.toContain("PRIVATE");
   } finally { client.close(); f.cleanup(); }
+});
+
+
+test("OMP failure client pins stream and target, rejects malformed pages and validates cursor before sending", async () => {
+  const f = ompFixture(), journal = new FailureJournal(join(f.directory, "failures.json"), f.identity);
+  journal.append("run", "model", "authentication");
+  let changed: Record<string, unknown> = {}, requests = 0;
+  await f.serve(request => {
+    if (request.method === "failures") requests++;
+    return { protocol: 1, id: request.id, identity: f.identity, result: request.method === "inspect" ? f.snapshot : { ...journal.page(request.params.after, request.params.limit), ...changed } };
+  });
+  const client = await connectOmp(f.target);
+  try {
+    expect((await client.failures(0)).records).toHaveLength(1);
+    for (const malformed of [{ laneKey: "foreign" }, { records: [] }, { extra: true }, { through: 0 }, { streamId: "019a4190-0000-7000-8000-000000000099", records: [{ ...journal.page(0).records[0], failureId: "omp-failure:019a4190-0000-7000-8000-000000000099:1" }] }]) {
+      changed = malformed; await expect(client.failures(0)).rejects.toThrow("Invalid OMP result");
+    }
+    const before = requests;
+    await expect(client.failures(-1)).rejects.toThrow("Invalid OMP failure cursor"); await expect(client.failures(0, 101)).rejects.toThrow("Invalid OMP failure cursor");
+    expect(requests).toBe(before);
+  } finally { client.close(); f.cleanup(); }
+});
+
+test("OMP missing durableFailures capability fails strict handshake; borrowed lead permits explicit false", async () => {
+  const f = ompFixture(); let missing = true;
+  await f.serve(request => {
+    const capabilities: Record<string, unknown> = { ...f.snapshot.capabilities, durableFailures: false };
+    if (missing) delete capabilities.durableFailures;
+    return { protocol: 1, id: request.id, identity: f.identity, result: { ...f.snapshot, capabilities } };
+  });
+  try {
+    await expect(connectOmp(f.target)).rejects.toThrow("Invalid OMP result");
+    missing = false; f.identity.role = "attached-lead"; f.target.role = "attached-lead";
+    const client = await connectOmp(f.target); try { expect((await client.inspect()).capabilities.durableFailures).toBe(false); } finally { client.close(); }
+  } finally { f.cleanup(); }
 });

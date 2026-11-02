@@ -4,6 +4,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { OMP_MAX_FRAME_BYTES, OmpError, assertIdentity, exactKeys, identityOf, markedText, object, parseRequest, payloadHash,
   type OmpGoal, type OmpIdentity, type OmpOperation, type OmpRequest, type OmpSnapshot, type OmpTarget } from "./contract.ts";
+import { FailureJournal, failureCategory } from "./failures.ts";
 import { OperationJournal, ReceiptPending, durableJson, persistedReceipt, privateDirectory, readPrivateJson } from "./receipts.ts";
 
 /** Minimal structural SDK boundary, checked against the pinned native SDK separately. */
@@ -60,6 +61,10 @@ export class OmpControlServer {
   private state: ControlState;
   private sequence = 0;
   private runId?: string;
+  private settledRunId?: string;
+  private compactionId?: string;
+  private failures?: FailureJournal;
+  private failureGap = false;
   private approvals = new Set<string>();
   private inputTools = new Set<string>();
   private tools = new Set<string>();
@@ -83,6 +88,7 @@ export class OmpControlServer {
     const initial = context();
     this.observedSafeSettle = initial.isIdle() && !initial.hasPendingMessages() && !hasAsyncWork(initial.getAsyncJobSnapshot());
     this.journal = new OperationJournal(join(sessionDirectory, "operations.json"), this.identity);
+    if (this.target.role === "managed-lane") this.failures = new FailureJournal(join(sessionDirectory, "failures.json"), this.identity);
     this.controlFile = join(sessionDirectory, "control.json");
     this.state = { held: !!options.startHeld };
     try {
@@ -125,19 +131,26 @@ export class OmpControlServer {
     const nativeHeld = managed && core?.getState().status === "held";
     const pending = (nativeHeld || this.parkedData ? hasActiveAsyncExecution(ctx.getAsyncJobSnapshot()) : ctx.hasPendingMessages() || hasAsyncWork(ctx.getAsyncJobSnapshot())) || this.continuing || this.compacting || this.retrying || this.awaitingErrorSettle;
     const idle = ctx.isIdle() && this.tools.size === 0 && !pending;
-    const failed = this.modelFailed || this.compactionFailed;
+    const failureHealthy = !managed || (!!this.failures?.available && !this.failureGap);
+    const failed = this.modelFailed || this.compactionFailed || !failureHealthy;
     return { identity: this.identity, state: waiting ? "waiting_approval" : this.inputTools.size ? "waiting_input" : managed && core?.getState().status === "holding" ? "pausing" : failed ? "failed" : !this.observedSafeSettle || this.retrying || this.awaitingErrorSettle ? "recovering" : idle ? "idle" : this.state.held ? "pausing" : "running",
       held: this.state.held || (managed && !!core && core.getState().status !== "open"), activeRunId: idle ? undefined : this.runId,
       goal: this.goal(ctx), model: ctx.model?.id ?? "", provider: ctx.model?.provider ?? "", effort: this.api.getThinkingLevel(), eventSequence: this.sequence,
-      capabilities: { inspect: true, input: durable && !failed && !this.compacting && !this.retrying && !this.awaitingErrorSettle && this.observedSafeSettle && (!managed || barrier), durableReceipts: durable, hold: managed && !!modes && barrier, release: managed && !!modes && barrier, stop: managed && !!modes && barrier, goals: !!modes } };
+      capabilities: { inspect: true, input: durable && !failed && !this.compacting && !this.retrying && !this.awaitingErrorSettle && this.observedSafeSettle && (!managed || barrier), durableReceipts: durable, durableFailures: managed && failureHealthy, hold: managed && !!modes && barrier, release: managed && !!modes && barrier, stop: managed && !!modes && barrier, goals: !!modes } };
   }
   get identity(): OmpIdentity { return identityOf(this.target); }
+  private recordFailure(executionId: string | undefined, phase: "model" | "compaction", error: unknown): void {
+    if (!this.failures || this.state.held || this.state.stopping) return;
+    if (!executionId) { this.failureGap = true; this.failures.invalidate(); return; }
+    try { this.failures.append(executionId, phase, failureCategory(error)); }
+    catch { this.failureGap = true; }
+  }
   observe(event: { type: string; [key: string]: unknown }): void {
     if (this.closed) return;
     this.sequence++;
     const id = String(event.toolCallId ?? "");
     if (event.type === "agent_start") {
-      this.runId = `${this.target.instanceId}:${this.target.generation}:${this.sequence}`; this.continuing = false; this.parkedData = false;
+      this.runId = `${this.target.instanceId}:${this.target.generation}:${this.sequence}`; this.settledRunId = this.runId; this.continuing = false; this.parkedData = false;
       this.modelFailed = false; this.compactionFailed = false; this.compacting = false;
       this.lastAssistant = undefined; this.awaitingErrorSettle = false; this.retryCancelled = false; this.retryFailed = false;
     }
@@ -154,15 +167,20 @@ export class OmpControlServer {
         const prior = this.lastAssistant;
         const final = prior && (!latest || (typeof prior.timestamp === "number" && typeof latest.timestamp === "number" && prior.timestamp > latest.timestamp)) ? prior : latest ?? prior;
         this.modelFailed = !this.retryCancelled && (assistantFailed(final) || this.retryFailed);
+        if (this.modelFailed) this.recordFailure(this.settledRunId, "model", final?.errorMessage);
         this.retrying = false; this.awaitingErrorSettle = false; this.runId = undefined; this.observedSafeSettle = true;
       }
     }
-    if (event.type === "session.compacting" || event.type === "auto_compaction_start") this.compacting = true;
+    if (event.type === "session.compacting" || event.type === "auto_compaction_start") {
+      if (!this.compacting) this.compactionId = `compaction:${this.target.instanceId}:${this.target.generation}:${this.sequence}`;
+      this.compacting = true;
+    }
     if (event.type === "session_compact") { this.compacting = false; this.compactionFailed = false; }
     if (event.type === "auto_compaction_end") {
-      this.compacting = false;
-      this.compactionFailed = !event.aborted && !event.skipped && !event.willRetry && typeof event.errorMessage === "string" && !!event.errorMessage;
-      if (event.willRetry) this.continuing = true;
+      this.compactionId ??= `compaction:${this.target.instanceId}:${this.target.generation}:${this.sequence}`;
+      this.compacting = event.willRetry === true;
+      this.compactionFailed = event.aborted !== true && event.skipped !== true && event.willRetry !== true && typeof event.errorMessage === "string" && !!event.errorMessage;
+      if (this.compactionFailed) this.recordFailure(this.compactionId, "compaction", event.errorMessage);
     }
     if (event.type === "auto_retry_start") { this.retrying = true; this.modelFailed = false; this.retryCancelled = false; this.retryFailed = false; }
     if (event.type === "auto_retry_end") {
@@ -171,6 +189,7 @@ export class OmpControlServer {
       this.retryCancelled = event.success === false && event.finalError === "Retry cancelled";
       this.retryFailed = event.success === false && !this.retryCancelled;
       this.modelFailed = this.retryFailed;
+      if (this.retryFailed) this.recordFailure(this.settledRunId, "model", event.finalError);
       if (event.success === false) this.continuing = false;
       if (event.success === true || this.retryCancelled) this.awaitingErrorSettle = false;
     }
@@ -200,6 +219,10 @@ export class OmpControlServer {
     assertIdentity(request.target, this.identity); this.live(); await this.options.verifyAssociation?.(); this.live();
     const p = request.params, id = p.operationId as string, digest = p.payloadHash as string;
     if (request.method === "inspect") return this.snapshot();
+    if (request.method === "failures") {
+      if (!this.failures) throw new OmpError("role-forbidden", "Borrowed OMP lead does not expose failures", false);
+      return this.failures.page(p.after as number, p.limit as number);
+    }
     if (request.method === "operation") return this.reconcile(id, digest);
     if (request.method === "input") {
       await this.mutation(() => {

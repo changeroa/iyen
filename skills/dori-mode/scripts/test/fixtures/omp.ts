@@ -10,7 +10,7 @@ export function ompFixture() {
   const target: OmpTarget = { ...identity, socketPath: join(directory, "control.sock"), tokenFile: join(directory, "token") };
   writeFileSync(target.tokenFile, "fixture-bearer", { mode: 0o600 });
   const snapshot: OmpSnapshot = { identity, state: "idle", held: false, goal: null, model: "test", provider: "fixture", eventSequence: 0,
-    capabilities: { inspect: true, input: true, durableReceipts: true, hold: true, release: true, stop: true, goals: true } };
+    capabilities: { inspect: true, input: true, durableReceipts: true, durableFailures: true, hold: true, release: true, stop: true, goals: true } };
   const header = { type: "session", version: 3, id: identity.sessionId, cwd: identity.cwd, timestamp: new Date().toISOString() };
   const transcript = (entries: unknown[], suffix = "") => writeFileSync(identity.sessionFile, [header, ...entries].map(row => JSON.stringify(row) + "\n").join("") + suffix, { mode: 0o600 });
   let server: Server | undefined;
