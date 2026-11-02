@@ -134,3 +134,68 @@ test("strict wire parser and dispatch refuse changed terminal/session and extra 
     expect(() => parseRequest({ protocol: 1, id: "request", token: "fixture-bearer", target: h.identity, method: "input", params: { operationId: "op", text: "work", payloadHash: payloadHash("work"), force: true } })).toThrow("Invalid OMP parameters");
   } finally { h.cleanup(); }
 });
+test("terminal native assistant error is failed and input-fenced without invalidating its accepted receipt", async () => {
+  const h = harness(); const failure = { role: "assistant", stopReason: "error", timestamp: 20, errorMessage: "provider failed" };
+  try {
+    const accepted: any = await h.dispatch("input", { operationId: "accepted", text: "task", payloadHash: payloadHash("task") });
+    h.server.observe({ type: "turn_end", message: failure, toolResults: [] }); expect(h.server.snapshot().state).toBe("recovering");
+    // Native recovery can prune the terminal error from active messages.
+    h.server.observe({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop", timestamp: 10 }] });
+    expect(h.server.snapshot().state).toBe("failed"); expect(h.server.snapshot().capabilities.input).toBe(false);
+    expect(await h.dispatch("operation", { operationId: "accepted", payloadHash: payloadHash("task") })).toEqual({ status: "received", receipt: accepted.receipt });
+    await expect(h.dispatch("input", { operationId: "next", text: "next", payloadHash: payloadHash("next") })).rejects.toThrow("blocked before submission");
+    expect((await h.dispatch("hold", { operationId: "hold", origin: "user" }) as any).state).toBe("failed");
+    expect((await h.dispatch("release", { operationId: "release", origin: "user" }) as any).state).toBe("failed");
+    h.server.observe({ type: "agent_start" }); expect(h.server.snapshot().state).not.toBe("failed");
+  } finally { h.cleanup(); }
+});
+test("retry continuation is recovering until successful final assistant and exhausted retry is failed", () => {
+  const h = harness(); const failure = { role: "assistant", stopReason: "error", timestamp: 20 };
+  try {
+    h.server.observe({ type: "turn_end", message: failure }); h.server.observe({ type: "auto_retry_start", attempt: 1 });
+    h.server.observe({ type: "agent_end", messages: [failure], willContinue: true });
+    expect(h.server.snapshot().state).toBe("recovering"); expect(h.server.snapshot().capabilities.input).toBe(false);
+    const success = { role: "assistant", stopReason: "stop", timestamp: 30 };
+    h.server.observe({ type: "turn_end", message: success }); h.server.observe({ type: "auto_retry_end", success: true, attempt: 1 });
+    h.server.observe({ type: "agent_end", messages: [failure, success] }); expect(h.server.snapshot().state).toBe("idle");
+    h.server.observe({ type: "auto_retry_start", attempt: 2 });
+    h.server.observe({ type: "agent_end", messages: [failure], willContinue: true });
+    h.server.observe({ type: "auto_retry_end", success: false, finalError: "local continuation failed" });
+    expect(h.server.snapshot().state).toBe("failed");
+  } finally { h.cleanup(); }
+});
+test("intentional native abort and exact retry cancellation do not become provider failure", () => {
+  const h = harness();
+  try {
+    const aborted = { role: "assistant", stopReason: "aborted", errorMessage: "Request aborted" };
+    h.server.observe({ type: "turn_end", message: aborted }); h.server.observe({ type: "agent_end", messages: [aborted] }); expect(h.server.snapshot().state).toBe("idle");
+    const failure = { role: "assistant", stopReason: "error" };
+    h.server.observe({ type: "turn_end", message: failure }); h.server.observe({ type: "auto_retry_start" });
+    h.server.observe({ type: "auto_retry_end", success: false, finalError: "Retry cancelled" });
+    h.server.observe({ type: "agent_end", messages: [failure] }); expect(h.server.snapshot().state).toBe("idle");
+  } finally { h.cleanup(); }
+});
+test("public auto-compaction end clears every completion while terminal error remains visible", () => {
+  const h = harness();
+  try {
+    for (const outcome of [{ aborted: true }, { aborted: false, skipped: true, errorMessage: "nothing to compact" }, { aborted: false, result: {} }]) {
+      h.server.observe({ type: "auto_compaction_start" }); h.server.observe({ type: "session.compacting" }); expect(h.server.snapshot().state).toBe("running");
+      h.server.observe({ type: "auto_compaction_end", willRetry: false, ...outcome }); expect(h.server.snapshot().state).toBe("idle");
+    }
+    h.server.observe({ type: "session.compacting" });
+    h.server.observe({ type: "auto_compaction_end", aborted: false, willRetry: false, errorMessage: "summary provider failed" }); expect(h.server.snapshot().state).toBe("failed");
+    h.server.observe({ type: "session_compact" }); expect(h.server.snapshot().state).toBe("idle");
+  } finally { h.cleanup(); }
+});
+test("manual compaction uncertainty clears only on native run or authoritative core held, and ask name is exact", async () => {
+  const h = harness();
+  try {
+    h.server.observe({ type: "session.compacting" }); expect(h.server.snapshot().state).toBe("running"); expect(h.server.snapshot().capabilities.input).toBe(false);
+    expect((await h.dispatch("hold", { operationId: "hold", origin: "user" }) as any).state).toBe("idle");
+    await h.dispatch("release", { operationId: "release", origin: "user" });
+    h.server.observe({ type: "session.compacting" }); h.server.observe({ type: "agent_start" }); expect(h.server.snapshot().state).toBe("idle");
+    h.server.observe({ type: "tool_execution_start", toolCallId: "a", toolName: "ask" }); expect(h.server.snapshot().state).toBe("waiting_input");
+    h.server.observe({ type: "tool_execution_end", toolCallId: "a", toolName: "ask" });
+    h.server.observe({ type: "tool_execution_start", toolCallId: "b", toolName: "ask_user" }); expect(h.server.snapshot().state).toBe("running");
+  } finally { h.cleanup(); }
+});

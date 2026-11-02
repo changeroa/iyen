@@ -118,7 +118,7 @@ export async function registerOmpExtension(native: unknown, options: OmpExtensio
   api.on("session_before_switch", () => { cleanup(); });
   api.on("session_switch", (_event, ctx) => { startInBackground(ctx); });
   api.on("session_shutdown", () => { cleanup(); });
-  for (const event of ["agent_start", "agent_end", "turn_start", "turn_end", "message_end", "tool_execution_start", "tool_execution_end", "tool_approval_requested", "tool_approval_resolved", "plan_review_requested", "plan_review_resolved", "mode_changed", "session_compact", "session.compacting"]) {
+  for (const event of ["agent_start", "agent_end", "turn_start", "turn_end", "message_end", "tool_execution_start", "tool_execution_end", "tool_approval_requested", "tool_approval_resolved", "plan_review_requested", "plan_review_resolved", "mode_changed", "session_compact", "session.compacting", "auto_compaction_start", "auto_compaction_end", "auto_retry_start", "auto_retry_end"]) {
     api.on(event, (value, ctx) => { if (ctx.agent.kind === "main") { current = ctx; controller?.observe(value); } });
   }
   if (bootstrap?.role === "managed-lane") {

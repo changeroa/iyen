@@ -43,6 +43,15 @@ function hasActiveAsyncExecution(snapshot: unknown): boolean {
     typeof snapshot.delivery.delivering !== "boolean" || !Number.isSafeInteger(snapshot.delivery.queued) || !Array.isArray(snapshot.delivery.pendingJobIds)) return true;
   return snapshot.running.length > 0 || snapshot.delivery.delivering;
 }
+function assistantMessage(value: unknown): Record<string, unknown> | undefined {
+  return object(value) && value.role === "assistant" ? value : undefined;
+}
+function assistantFailed(message: Record<string, unknown> | undefined): boolean {
+  if (message?.stopReason !== "error") return false;
+  // Native retry bookkeeping can retain a superseded error in active history.
+  const recovery = message.retryRecovery;
+  return !(object(recovery) && recovery.kind === "auto-retry" && ["recovered", "superseded"].includes(recovery.status as string));
+}
 export class OmpControlServer {
   private server?: Server;
   private readonly sockets = new Set<Socket>();
@@ -56,6 +65,13 @@ export class OmpControlServer {
   private tools = new Set<string>();
   private continuing = false;
   private compacting = false;
+  private retrying = false;
+  private awaitingErrorSettle = false;
+  private retryCancelled = false;
+  private retryFailed = false;
+  private modelFailed = false;
+  private compactionFailed = false;
+  private lastAssistant?: Record<string, unknown>;
   private observedSafeSettle: boolean;
   private parkedData = false;
   private journal: OperationJournal;
@@ -107,25 +123,57 @@ export class OmpControlServer {
     const managed = this.target.role === "managed-lane", modes = ctx.sessionModes, core = this.core(ctx), barrier = !!core;
     const waiting = this.approvals.size > 0 || !!ctx.getPendingPlanReview();
     const nativeHeld = managed && core?.getState().status === "held";
-    const pending = (nativeHeld || this.parkedData ? hasActiveAsyncExecution(ctx.getAsyncJobSnapshot()) : ctx.hasPendingMessages() || hasAsyncWork(ctx.getAsyncJobSnapshot())) || this.continuing || this.compacting;
+    const pending = (nativeHeld || this.parkedData ? hasActiveAsyncExecution(ctx.getAsyncJobSnapshot()) : ctx.hasPendingMessages() || hasAsyncWork(ctx.getAsyncJobSnapshot())) || this.continuing || this.compacting || this.retrying || this.awaitingErrorSettle;
     const idle = ctx.isIdle() && this.tools.size === 0 && !pending;
-    return { identity: this.identity, state: waiting ? "waiting_approval" : this.inputTools.size ? "waiting_input" : managed && core?.getState().status === "holding" ? "pausing" : !this.observedSafeSettle ? "recovering" : idle ? "idle" : this.state.held ? "pausing" : "running",
+    const failed = this.modelFailed || this.compactionFailed;
+    return { identity: this.identity, state: waiting ? "waiting_approval" : this.inputTools.size ? "waiting_input" : managed && core?.getState().status === "holding" ? "pausing" : failed ? "failed" : !this.observedSafeSettle || this.retrying || this.awaitingErrorSettle ? "recovering" : idle ? "idle" : this.state.held ? "pausing" : "running",
       held: this.state.held || (managed && !!core && core.getState().status !== "open"), activeRunId: idle ? undefined : this.runId,
       goal: this.goal(ctx), model: ctx.model?.id ?? "", provider: ctx.model?.provider ?? "", effort: this.api.getThinkingLevel(), eventSequence: this.sequence,
-      capabilities: { inspect: true, input: durable && this.observedSafeSettle && (!managed || barrier), durableReceipts: durable, hold: managed && !!modes && barrier, release: managed && !!modes && barrier, stop: managed && !!modes && barrier, goals: !!modes } };
+      capabilities: { inspect: true, input: durable && !failed && !this.compacting && !this.retrying && !this.awaitingErrorSettle && this.observedSafeSettle && (!managed || barrier), durableReceipts: durable, hold: managed && !!modes && barrier, release: managed && !!modes && barrier, stop: managed && !!modes && barrier, goals: !!modes } };
   }
   get identity(): OmpIdentity { return identityOf(this.target); }
   observe(event: { type: string; [key: string]: unknown }): void {
     if (this.closed) return;
     this.sequence++;
     const id = String(event.toolCallId ?? "");
-    if (event.type === "agent_start") { this.runId = `${this.target.instanceId}:${this.target.generation}:${this.sequence}`; this.continuing = false; this.parkedData = false; }
+    if (event.type === "agent_start") {
+      this.runId = `${this.target.instanceId}:${this.target.generation}:${this.sequence}`; this.continuing = false; this.parkedData = false;
+      this.modelFailed = false; this.compactionFailed = false; this.compacting = false;
+      this.lastAssistant = undefined; this.awaitingErrorSettle = false; this.retryCancelled = false; this.retryFailed = false;
+    }
+    if (event.type === "turn_end" || event.type === "message_end") {
+      const message = assistantMessage(event.message);
+      if (message) { this.lastAssistant = message; this.awaitingErrorSettle = assistantFailed(message); }
+    }
     if (event.type === "agent_end") {
       this.continuing = !!event.willContinue || !!event.awaitingAsyncWork;
-      if (!this.continuing) { this.runId = undefined; this.observedSafeSettle = true; }
+      if (!this.continuing) {
+        const latest = Array.isArray(event.messages) ? event.messages.findLast(message => !!assistantMessage(message)) as Record<string, unknown> | undefined : undefined;
+        // Terminal errors may be pruned from active messages by native recovery. Keep
+        // the current turn's newer error, while allowing a later successful assistant.
+        const prior = this.lastAssistant;
+        const final = prior && (!latest || (typeof prior.timestamp === "number" && typeof latest.timestamp === "number" && prior.timestamp > latest.timestamp)) ? prior : latest ?? prior;
+        this.modelFailed = !this.retryCancelled && (assistantFailed(final) || this.retryFailed);
+        this.retrying = false; this.awaitingErrorSettle = false; this.runId = undefined; this.observedSafeSettle = true;
+      }
     }
-    if (event.type === "session.compacting") this.compacting = true;
-    if (event.type === "session_compact") this.compacting = false;
+    if (event.type === "session.compacting" || event.type === "auto_compaction_start") this.compacting = true;
+    if (event.type === "session_compact") { this.compacting = false; this.compactionFailed = false; }
+    if (event.type === "auto_compaction_end") {
+      this.compacting = false;
+      this.compactionFailed = !event.aborted && !event.skipped && !event.willRetry && typeof event.errorMessage === "string" && !!event.errorMessage;
+      if (event.willRetry) this.continuing = true;
+    }
+    if (event.type === "auto_retry_start") { this.retrying = true; this.modelFailed = false; this.retryCancelled = false; this.retryFailed = false; }
+    if (event.type === "auto_retry_end") {
+      this.retrying = false;
+      // Native turn-recovery.ts explicitly uses this exact outcome for intentional cancellation.
+      this.retryCancelled = event.success === false && event.finalError === "Retry cancelled";
+      this.retryFailed = event.success === false && !this.retryCancelled;
+      this.modelFailed = this.retryFailed;
+      if (event.success === false) this.continuing = false;
+      if (event.success === true || this.retryCancelled) this.awaitingErrorSettle = false;
+    }
     if (event.type === "tool_approval_requested") this.approvals.add(id);
     if (event.type === "tool_approval_resolved") this.approvals.delete(id);
     if (event.type === "tool_execution_start") { this.tools.add(id); if (event.toolName === "ask") this.inputTools.add(id); }
@@ -198,6 +246,8 @@ export class OmpControlServer {
     const held = await nativeHold; this.live();
     if (held.status !== "held" || held.sessionId !== this.target.sessionId || !Number.isSafeInteger(held.generation) || this.core(this.live())?.getState().generation !== held.generation) throw new OmpError("hold-unconfirmed", "Native OMP execution hold unconfirmed", true);
     this.state.coreHold = held; this.save(); this.continuing = false; this.runId = undefined;
+    // The native barrier proves compaction/retry execution has settled, unlike isIdle alone.
+    this.compacting = false; this.retrying = false; this.awaitingErrorSettle = false;
     const deadline = Date.now() + (this.options.timeoutMs ?? 15000);
     do {
       const ctx = this.live();
@@ -208,7 +258,7 @@ export class OmpControlServer {
         }
         this.observedSafeSettle = true;
         const snap = this.snapshot();
-        if (snap.state === "idle" && snap.goal?.status !== "active") return snap;
+        if (["idle", "failed"].includes(snap.state) && snap.goal?.status !== "active") return snap;
       }
       await new Promise(resolve => setTimeout(resolve, 20));
     } while (Date.now() < deadline);
@@ -221,7 +271,7 @@ export class OmpControlServer {
       if (!this.state.held) { if (before.held) throw new OmpError("unowned-hold", "Native OMP hold is not owned by this controller", false); return before; }
       if (this.state.origin === "user" && origin === "automatic") throw new OmpError("owner-held", "Automatic release cannot clear an owner hold", false);
       const core = this.core(ctx), expectedHold = this.state.coreHold;
-      if (before.state !== "idle" || hasActiveAsyncExecution(ctx.getAsyncJobSnapshot()) || !ctx.sessionModes || !core || !expectedHold || core.getState().status !== "held" || core.getState().generation !== expectedHold.generation) throw new OmpError("release-blocked", "OMP release requires confirmed idle native state and exact execution hold", false);
+      if (!["idle", "failed"].includes(before.state) || hasActiveAsyncExecution(ctx.getAsyncJobSnapshot()) || !ctx.isIdle() || this.tools.size || this.compacting || this.continuing || !ctx.sessionModes || !core || !expectedHold || core.getState().status !== "held" || core.getState().generation !== expectedHold.generation) throw new OmpError("release-blocked", "OMP release requires confirmed idle native state and exact execution hold", false);
       if (this.state.pausedGoal) {
         const expected = this.state.pausedGoal, goal = this.goal(ctx);
         if (!goal || goal.status !== "paused" || goal.objective !== expected.objective || goal.tokenBudget !== expected.tokenBudget) throw new OmpError("goal-changed", "OMP paused goal changed; explicit reconciliation required", false);
