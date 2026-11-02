@@ -144,14 +144,16 @@ export function createLeadPane({ config, configPath = process.env.IYEN_LEGACY_CO
           required(receipt(cfg, row, status), 'native receipt missing'); await probe(cfg);
           save({ state: 'received', receipt: status.receipt }); return 'delivered';
         }
-        if (status.status === 'queued') { save({ state: 'queued' }); return 'busy'; }
+        // Service admission may dispatch later. Legacy busy releases the source
+        // active-event lease, so admitted work must stay blocked for reconciliation.
+        if (status.status === 'queued') { save({ state: 'unknown' }); return 'failed'; }
         if (status.status !== 'missing' || !['prepared'].includes(row.state)) { save({ state: 'unknown' }); return 'failed'; }
         lane = await probe(cfg);
         if (!ready(lane)) return 'busy';
         // Persist the uncertainty barrier BEFORE invoking the external process.
         save({ state: 'unknown' });
         const result = await invoke(cfg, ['input', 'lead', '--text-file', textPath, '--operation-id', row.operationId]);
-        if (result?.queued === true && result.operationId === row.operationId) { save({ state: 'queued' }); return 'busy'; }
+        if (result?.queued === true && result.operationId === row.operationId) { save({ state: 'unknown' }); return 'failed'; }
         required(receipt(cfg, row, result), 'native receipt missing'); await probe(cfg);
         save({ state: 'received', receipt: result.receipt }); return 'delivered';
       });

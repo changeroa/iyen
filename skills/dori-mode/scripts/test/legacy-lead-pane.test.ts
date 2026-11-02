@@ -84,17 +84,19 @@ test('timeout after native receipt reconciles same ID while busy without another
 
 test.each(['queued', 'unknown', 'malformed'])('%s is never delivered and never reposted', async mode => {
   const f = fixture(), text = f.prompt(); f.set({ mode });
-  const result = mode === 'queued' ? 'busy' : 'failed';
-  expect(await f.lead.deliver(f.config.pane, text)).toBe(result);
+  // An admitted queue must preserve the adapter's source lease via failed/blocked.
+  expect(await f.lead.deliver(f.config.pane, text)).toBe('failed');
   expect(await f.lead.leadState(f.config.pane)).toBe('busy');
-  expect(await f.lead.deliver(f.config.pane, text)).toBe(result);
+  expect(await f.lead.deliver(f.config.pane, text)).toBe('failed');
+  const record = readdirSync(f.config.stateDir).find(name => name.endsWith('.json'))!;
+  expect(json(join(f.config.stateDir, record)).state).toBe('unknown');
   expect(f.inputCalls()).toHaveLength(1);
   expect(await f.lead.deliver(f.config.pane, f.prompt('DORI_SLACK_EVENT', 'Ev2'))).toBe('busy');
 });
 
 test('readiness reconciles a queued receipt before legacy redispatch without resubmission', async () => {
   const f = fixture(), text = f.prompt(); f.set({ mode: 'queued' });
-  expect(await f.lead.deliver(f.config.pane, text)).toBe('busy');
+  expect(await f.lead.deliver(f.config.pane, text)).toBe('failed');
   const rows = json(f.db), operationId = Object.keys(rows)[0]!, entryId = 'native-later';
   const receipt = { operationId, payloadHash: digest(text), sessionId: f.config.sessionId, sessionFile: f.config.sessionFile, entryId, receiptId: `omp-entry:${f.config.sessionId}:${entryId}` };
   rows[operationId] = { status: 'received', operationId, turnId: receipt.receiptId, receiptKind: 'omp-session-entry', receipt }; put(f.db, rows);
