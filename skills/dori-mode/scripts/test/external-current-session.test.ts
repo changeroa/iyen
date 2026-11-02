@@ -143,13 +143,16 @@ test("assistant echo is not evidence and duplicate exact receipts block dispatch
   expect(h.s.inbox.get("duplicate")?.state).toBe("unknown"); expect(queueCalls()).toHaveLength(1);
 });
 
-test("identity loss before send holds dispatch with queued mail; restored identity requires explicit reattach", async () => {
+test("identity loss before send holds dispatch with queued mail; restored exact identity automatically recovers", async () => {
   await attach(); h.agent.agent_session.value = otherId;
   await expect(input()).rejects.toThrow("identity mismatch"); expect(h.s.inbox.get("owner-input")?.state).toBe("queued");
   expect(await h.s.registry.read("lead")).toMatchObject({ dispatchBlocked: true, holdReason: "recovery" });
-  h.agent.agent_session.value = threadId; const restarted = new DoriService(h.config, h.run); await restarted.tick(); expect(queueCalls()).toHaveLength(0);
-  expect(await restarted.handle("status", { key: "lead" }, { role: "admin" })).toMatchObject({ identityVerified: true, readiness: "held" });
-  await attach(); await input(); expect(queueCalls()).toHaveLength(1);
+  const held = await h.s.registry.read("lead");
+  expect(held?.runtime?.external?.latestHoldReason?.evidence).toMatchObject({ check: "herdr-association", observed: { threadId: otherId } });
+  h.agent.agent_session.value = threadId; const restarted = new DoriService(h.config, h.run);
+  await restarted.registry.update("lead", l => ({ ...l, runtime: { ...l.runtime!, external: { ...l.runtime!.external!, reconnect: undefined, reconnectBlocked: true } } }));
+  expect(await restarted.handle("status", { key: "lead" }, { role: "admin" })).toMatchObject({ identityVerified: true, readiness: "ready", dispatchBlocked: false });
+  await restarted.tick(); expect(queueCalls()).toHaveLength(1); restarted.stop();
 });
 
 test("identity is checked again immediately before queue and after submission", async () => {

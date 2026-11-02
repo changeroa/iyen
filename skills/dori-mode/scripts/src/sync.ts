@@ -12,7 +12,7 @@ export const syncRegistry = async (deps: FlowDeps, write: boolean): Promise<Sync
     const snap = await deps.runtime.inspect(lane.key).catch(() => null);
     if (!snap) drift.push(`${lane.key}: runtime unreachable`);
     else if (snap.threadId !== lane.runtime?.threadId) drift.push(`${lane.key}: runtime identity mismatch; not replaced`);
-    else if (write) await deps.registry.update(lane.key, l => ({ ...l, runtime: l.runtime && { ...l.runtime, state: snap.state, activeTurnId: snap.activeTurnId } }));
+    else if (write && lane.runtime?.backend !== "external-current-session") await deps.registry.update(lane.key, l => ({ ...l, runtime: l.runtime && { ...l.runtime, state: snap.state, activeTurnId: snap.activeTurnId } }));
     rows.push({ key: lane.key, thread: lane.thread, pane: lane.pane ?? "-", session: lane.runtime?.threadId ?? "-", status: statusOf(lane) });
   }
   const owned = new Set(lanes.map(l => l.pane));

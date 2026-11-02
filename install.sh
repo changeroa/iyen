@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs the Iyen and dori-mode skills and the `dori` CLI.
 # Usage: curl -fsSL https://raw.githubusercontent.com/sisyphuslabs/omo-dori-mode-experimental/main/install.sh | bash
-# Needs: git, bun 1.3+, Codex CLI, herdr. Optional env: DORI_SRC (clone dir), SKILLS_DIR (skill links), IYEN_HOME or DORI_CONFIG (persistent installation).
+# Needs: git, bun 1.3+, Python 3, Codex CLI, herdr. Optional env: DORI_SRC (clone dir), SKILLS_DIR (skill links), IYEN_HOME or DORI_CONFIG (persistent installation).
 set -euo pipefail
 
 repo="https://github.com/sisyphuslabs/omo-dori-mode-experimental.git"
@@ -9,6 +9,7 @@ src="${DORI_SRC:-$HOME/.dori/src}"
 skills="${SKILLS_DIR:-$HOME/.agents/skills}"
 
 command -v bun >/dev/null || { echo "bun is required: https://bun.sh" >&2; exit 1; }
+command -v python3 >/dev/null || { echo "Python 3 is required for the process-safe attachment fence" >&2; exit 1; }
 command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
 command -v codex >/dev/null || { echo "Codex CLI is required; activation validates the shared daemon and client" >&2; exit 1; }
 command -v herdr >/dev/null || { echo "herdr is required" >&2; exit 1; }
@@ -34,3 +35,5 @@ fi
 
 echo "Installed. Skills: $skills/iyen, $skills/dori-mode  CLI: dori  Config: $config"
 echo "Next: configure or migrate $config; run dori doctor and dori serve with this installation, then ask for iyen mode in your current Codex conversation"
+
+echo "Optional independent watchdog (Python 3 required): preview dori watchdog install, then dori watchdog install --apply; load the returned LaunchAgent separately. Generic supervisors can run dori watchdog loop."

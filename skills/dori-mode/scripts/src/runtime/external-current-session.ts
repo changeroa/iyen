@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { RuntimeConfig } from "../config.ts";
@@ -15,7 +16,7 @@ export type ExternalIdentity = { threadId: string; pane: string; cwd: string; mo
 export type Attachment = ExternalIdentity & { instance: string; generation: number; token: string; socketPath: string; binary: string; binaryVersion?: string; bridge: string; excludedInboxIds: string[] };
 
 export class ExternalSessionError extends Error {
-  constructor(readonly code: ExternalHoldCode, message: string) { super(message); }
+  constructor(readonly code: ExternalHoldCode, message: string, readonly evidence?: Record<string, unknown>) { super(message); }
 }
 const safeVersion = (version: unknown): string => typeof version === "string" && /^\d{1,4}\.\d{1,4}\.\d{1,4}$/.test(version) ? version : "unrecognized";
 const knownIdentity = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
@@ -78,7 +79,7 @@ export class ExternalCurrentSession {
     const hooked = agent?.agent_session;
     if (knownIdentity(agent?.agent) && agent.agent !== "codex" || knownIdentity(agent?.pane_id) && agent.pane_id !== pane ||
       knownIdentity(hooked?.agent) && hooked.agent !== "codex" || hooked?.kind === "id" && knownIdentity(hooked.value) && hooked.value !== threadId)
-      throw new ExternalSessionError("identity-unverified", "Attached Herdr pane/thread identity mismatch; delivery is held.");
+      throw new ExternalSessionError("identity-unverified", "Attached Herdr pane/thread identity mismatch; delivery is held.", { check: "herdr-association", expected: { pane, threadId, agent: "codex" }, observed: { pane: typeof agent?.pane_id === "string" && /^[\w:.-]{1,100}$/.test(agent.pane_id) ? agent.pane_id : null, threadId: THREAD_UUID.test(hooked?.value ?? "") ? hooked?.value : null, codex: agent?.agent === "codex" && hooked?.agent === "codex" } });
     if (agent?.agent !== "codex" || agent.pane_id !== pane || hooked?.agent !== "codex" || hooked.kind !== "id" || !knownIdentity(hooked.value))
       throw new ExternalSessionError("runtime-unavailable", "Attached Herdr pane/thread association unavailable; delivery is waiting for revalidation.");
     // Herdr is the executing TUI's primary signal. Unknown hook states cannot
@@ -90,11 +91,11 @@ export class ExternalCurrentSession {
       readThread(this.observer, threadId), readLoadedThreads(this.observer), readOptionalGoal(this.observer, threadId), readTurns(this.observer, threadId),
     ]);
     if (thread.id !== threadId)
-      throw new ExternalSessionError("identity-unverified", "Attached loaded thread/cwd identity mismatch; delivery is held.");
+      throw new ExternalSessionError("identity-unverified", "Attached loaded thread/cwd identity mismatch; delivery is held.", { check: "observer-thread-cwd", expected: { threadId, cwdHash: createHash("sha256").update(cwd).digest("hex") }, observed: { threadId: THREAD_UUID.test(thread.id) ? thread.id : null, cwdHash: createHash("sha256").update(thread.cwd).digest("hex") } });
     let sameCwd: boolean;
     try { sameCwd = realpathSync(thread.cwd) === realpathSync(cwd); }
     catch { throw new ExternalSessionError("runtime-unavailable", "Attached thread/cwd observation unavailable; delivery is waiting for revalidation."); }
-    if (!sameCwd) throw new ExternalSessionError("identity-unverified", "Attached loaded thread/cwd identity mismatch; delivery is held.");
+    if (!sameCwd) throw new ExternalSessionError("identity-unverified", "Attached loaded thread/cwd identity mismatch; delivery is held.", { check: "observer-thread-cwd", expected: { threadId, cwdHash: createHash("sha256").update(cwd).digest("hex") }, observed: { threadId: THREAD_UUID.test(thread.id) ? thread.id : null, cwdHash: createHash("sha256").update(thread.cwd).digest("hex") } });
     // A shared-daemon restart can temporarily unload the exact saved thread.
     // Keep input queued and observe it again later; never resume it here.
     if (!loaded.includes(threadId) || thread.status.type === "notLoaded")

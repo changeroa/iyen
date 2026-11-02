@@ -10,10 +10,13 @@ import { mcpServer } from "./mcp.ts";
 import { utilities } from "./utilities.ts";
 import { atomicJson } from "./journal.ts";
 import { join } from "node:path";
+import { installWatchdog } from "./watchdog-install.ts";
+import { runWatchdog } from "./watchdog.ts";
 import { readStartupHealth } from "./health.ts";
 const help = `dori — Codex-only messenger lead and lanes
 
   doctor | serve | status [key] | health | paths
+  watchdog once|loop|status|install [--apply]
   lead-activate --thread-id UUID --pane ID --cwd DIR
   lead-attach --thread-id UUID --pane ID --cwd DIR
   lead-detach --thread-id UUID
@@ -88,6 +91,14 @@ try {
   }
   if (command === "session-host-start") { startSessionHost(need("state-dir"), need("key")); process.exit(0); }
   const config = await loadConfig();
+  if (command === "watchdog") {
+    if (flags.positionals[0] === "install") { output(installWatchdog(config, Boolean(values.apply))); process.exit(0); }
+    const controller = new AbortController();
+    const stop = () => controller.abort(); process.once("SIGINT", stop); process.once("SIGTERM", stop);
+    try { output(await runWatchdog(config, flags.positionals[0] ?? "once", controller.signal)); }
+    finally { process.removeListener("SIGINT", stop); process.removeListener("SIGTERM", stop); }
+    process.exit(0);
+  }
   if (command === "health") {
     try { output(await serviceClient(config)("health", {}, 2000)); }
     catch (error) {
