@@ -177,18 +177,15 @@ export class DeliveryWatchdog {
             const op = await c.operation(incident.id, incident.text);
             if (op.status === "received" && valid()) { incident.notification = "sent"; incident.turnId = op.receipt.receiptId; atomicJson(statePath(dir), state); return state; }
             if (incident.notification === "unknown" || op.status !== "absent" || controller.signal.aborted) return state;
-            let delivery: Promise<Awaited<ReturnType<typeof c.input>>> | undefined;
             await withBindingFence(dir, async () => {
               if (!valid() || controller.signal.aborted) return;
               incident.notification = "unknown"; atomicJson(statePath(dir), state);
-              delivery = c.input(incident.text, incident.id);
-              // Receipt waiting cannot hold the shared Iyen mutation fence.
-              void delivery.catch(() => {});
-            }, controller.signal);
-            if (delivery) {
-              const result = await delivery;
+              // This borrowed-lead notification holds routing authority until the
+              // bounded native input finishes, including its asynchronous socket
+              // connect/write. No managed hold shares this receipt-wait lock.
+              const result = await c.input(incident.text, incident.id);
               if (valid()) { incident.notification = "sent"; incident.turnId = result.receipt.receiptId; atomicJson(statePath(dir), state); }
-            }
+            }, controller.signal);
           } finally { c.close(); }
         } catch { /* OMP uncertainties stay unknown, never enter Codex observation or fallback transport. */ }
         finally { clearTimeout(deadline); this.opts.signal?.removeEventListener("abort", stopped); }

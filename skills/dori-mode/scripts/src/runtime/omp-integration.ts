@@ -1,4 +1,6 @@
-import { chmodSync, existsSync, readdirSync, realpathSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, readdirSync, realpathSync, unlinkSync } from "node:fs";
+import { createConnection } from "node:net";
+import { acquireFileFence } from "../binding-fence.ts";
 import { dirname, join, resolve } from "node:path";
 import type { DoriConfig } from "../config.ts";
 import { atomicJson } from "../journal.ts";
@@ -23,6 +25,35 @@ export const ompManagedEnvironment = (settingsHome: string, pane: { pane_id: str
 export const ompPaneCommand = (spec: { cwd: string; argv: string[]; env: Record<string, string> }): string => {
   if (Object.keys(spec.env).some(key => !/^[A-Z_][A-Z0-9_]*$/.test(key))) throw new Error("Invalid managed environment variable");
   return `cd ${quoteForPane(spec.cwd)} && env -i ${Object.entries(spec.env).map(([k,v]) => `${k}=${quoteForPane(v)}`).join(" ")} ${spec.argv.map(quoteForPane).join(" ")}`;
+};
+export const sameOmpTarget = (a: OmpTarget, b: OmpTarget): boolean => sameIdentity(a, b) && a.socketPath === b.socketPath && a.tokenFile === b.tokenFile;
+export const ompHostOwnerPath = (stateDir: string, key: string) => join(stateDir, "hosts", `${key}.socket-owner.json`);
+/** Capture the legacy host's ownership before the launcher rotates its PID file. */
+export const preserveOmpSocketOwner = (stateDir: string, key: string): void => {
+  if (!existsSync(hostSocket(stateDir, key)) || existsSync(ompHostOwnerPath(stateDir, key))) return;
+  const prior = readJson<{ pid: number; instance: string }>(join(stateDir, "hosts", `${key}.pid.json`));
+  if (!Number.isSafeInteger(prior.pid) || prior.pid <= 0 || !prior.instance || processAlive(prior.pid)) throw new Error("Prior OMP host death unverified; socket retained");
+  atomicJson(ompHostOwnerPath(stateDir, key), prior);
+};
+/** Called only while owning the per-lane host lifetime fence. */
+export const prepareOmpHostSocket = async (stateDir: string, boot: Pick<Bootstrap, "key" | "instance" | "generation">): Promise<void> => {
+  const socket = hostSocket(stateDir, boot.key), ownerPath = ompHostOwnerPath(stateDir, boot.key);
+  if (existsSync(socket)) {
+    preserveOmpSocketOwner(stateDir, boot.key);
+    const owner = readJson<{ pid: number; instance: string }>(ownerPath);
+    const before = lstatSync(socket);
+    if (!before.isSocket() || before.isSymbolicLink() || before.uid !== process.getuid?.() || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 || !owner.instance || processAlive(owner.pid)) throw new Error("OMP host endpoint ownership or prior death unverified");
+    await new Promise<void>((resolve, reject) => {
+      const probe = createConnection({ path: socket });
+      const timer = setTimeout(() => { probe.destroy(); reject(new Error("OMP host socket liveness unknown; retained")); }, 1000);
+      probe.once("connect", () => { clearTimeout(timer); probe.destroy(); reject(new Error("An existing OMP host still owns this socket")); });
+      probe.once("error", error => { clearTimeout(timer); probe.destroy(); if ((error as NodeJS.ErrnoException).code === "ECONNREFUSED") resolve(); else reject(new Error("OMP host socket liveness unknown; retained")); });
+    });
+    const after = lstatSync(socket), latestOwner = readJson<{ pid: number; instance: string }>(ownerPath);
+    if (after.dev !== before.dev || after.ino !== before.ino || latestOwner.pid !== owner.pid || latestOwner.instance !== owner.instance || processAlive(owner.pid)) throw new Error("OMP host endpoint changed during stale-socket probe");
+    unlinkSync(socket);
+  }
+  atomicJson(ownerPath, { pid: process.pid, instance: boot.instance, generation: boot.generation });
 };
 export const ompSnapshot = (snap: OmpSnapshot): RuntimeSnapshot => ({ threadId: snap.identity.sessionId, state: snap.state, activeTurnId: snap.activeRunId, goal: snap.goal });
 export const ompVersionMatches = (output: string, version: string): boolean => output.trim() === version || output.trim() === `omp ${version}`;
@@ -79,6 +110,11 @@ export const callOmp = async (target: OmpTarget, action: string, args: any, conf
 
 /** OMP host owns the service bridge; the native TUI owns the control extension. */
 export const runOmpSessionHost = async (stateDir: string, boot: Bootstrap): Promise<void> => {
+  const release = await acquireFileFence(join(stateDir, "hosts", `${boot.key}.host.lock`), Math.min(5000, boot.config.runtime.rpcTimeoutMs));
+  try { await prepareOmpHostSocket(stateDir, boot); await runOmpOwnedSessionHost(stateDir, boot); }
+  finally { await release(); }
+};
+const runOmpOwnedSessionHost = async (stateDir: string, boot: Bootstrap): Promise<void> => {
   const config = boot.config, omp = config.runtime.omp;
   if (!omp || boot.role !== "lane" || boot.key === "lead") throw new Error("Invalid managed OMP host");
   const role = { ...config.runtime.roles.lane, ...(boot.model ? { model: boot.model } : {}) };
@@ -182,7 +218,8 @@ export const runOmpSessionHost = async (stateDir: string, boot: Bootstrap): Prom
       return Response.json({ result });
     } catch (error) { return Response.json({ error: error instanceof Error ? error.message : "OMP host failed" }, { status: 409 }); }
   } });
-  chmodSync(hostSocket(stateDir, boot.key), 0o600); persist();
+  chmodSync(hostSocket(stateDir, boot.key), 0o600);
+  const boundSocket = lstatSync(hostSocket(stateDir, boot.key)); persist();
   await service("host-register", { runtime: runtime(), pid: process.pid });
   const shutdown = () => { held = true; closing = true; persist(); };
   process.once("SIGTERM", shutdown); process.once("SIGINT", shutdown);
@@ -201,7 +238,10 @@ export const runOmpSessionHost = async (stateDir: string, boot: Bootstrap): Prom
       catch { if (Date.now() - lastAck >= config.runtime.heartbeatTimeoutMs) { held = true; persist(); await callOmp(pinned, "hold", { origin: "automatic" }, config).catch(() => {}); } }
       await Bun.sleep(config.runtime.heartbeatIntervalMs);
     }
-  } finally { if (!nativeStopped) { held = true; persist(); await callOmp(pinned, "hold", { origin: "automatic" }, config).catch(() => {}); } await Bun.sleep(100); server.stop(true); process.off("SIGTERM", shutdown); process.off("SIGINT", shutdown); if (existsSync(hostSocket(stateDir, boot.key))) unlinkSync(hostSocket(stateDir, boot.key)); }
+  } finally { if (!nativeStopped) { held = true; persist(); await callOmp(pinned, "hold", { origin: "automatic" }, config).catch(() => {}); } await Bun.sleep(100); server.stop(true); process.off("SIGTERM", shutdown); process.off("SIGINT", shutdown); if (existsSync(hostSocket(stateDir, boot.key))) {
+      const current = lstatSync(hostSocket(stateDir, boot.key)), owner = readJson<{ pid: number; instance: string }>(ompHostOwnerPath(stateDir, boot.key));
+      if (current.dev === boundSocket.dev && current.ino === boundSocket.ino && owner.pid === process.pid && owner.instance === boot.instance) unlinkSync(hostSocket(stateDir, boot.key));
+    } }
 };
 const processAlive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code !== "ESRCH"; } };
 const controllerPid = (dir: string, target: OmpTarget): number | undefined => {

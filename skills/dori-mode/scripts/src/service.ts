@@ -27,7 +27,7 @@ import { readWatchTarget } from "./watchdog.ts";
 import { operationText } from "./runtime/herdr.ts";
 import type { Turn } from "./runtime/generated/v2/Turn.ts";
 
-import { callOmp, findOmpTarget, verifyOmpHerdr } from "./runtime/omp-integration.ts";
+import { callOmp, findOmpTarget, verifyOmpHerdr, sameOmpTarget } from "./runtime/omp-integration.ts";
 import { connectOmp } from "./runtime/omp/client.ts";
 import { sameIdentity, validReceipt, payloadHash, type OmpTarget } from "./runtime/omp/contract.ts";
 type Attachment = CodexAttachment & { omp?: OmpTarget };
@@ -83,7 +83,7 @@ export class DoriService {
       const lane = await this.registry.read(key);
       if (!lane?.runtime?.threadId) throw new Error("Runtime is not registered");
       if (lane.runtime.backend === "external-current-session") return this.externalCall(lane, action, args) as Promise<T>;
-      if (lane.runtime.kind === "omp" && action === "release" && this.inbox.list().some(row => row.target === key && row.attachmentInstance === lane.runtime!.hostInstanceId && ["unknown", "sending"].includes(row.state))) throw new Error("OMP unresolved operation fence; reconcile exact receipts before release");
+      if (lane.runtime.kind === "omp" && action === "release" && this.inbox.list().some(row => row.target === key && ["unknown", "sending"].includes(row.state))) throw new Error("OMP unresolved operation fence; reconcile exact receipts before release");
       if (action === "stop" && lane.runtime.state === "stopped") return undefined as T;
       const boot = readJson<Bootstrap>(bootstrapPath(config.stateDir, key));
       const result = await ipc<T>(hostSocket(config.stateDir, key), boot.hostToken, action, args, config.runtime.rpcTimeoutMs * 3);
@@ -109,7 +109,14 @@ export class DoriService {
         }
         if (lane.runtime?.kind === "omp") {
           if (mail.attachmentInstance && mail.attachmentInstance !== lane.runtime.hostInstanceId) throw new DeliveryDeferred("OMP mail belongs to a previous attachment");
-          if (mail.state === "queued") this.inbox.mark(mail.id, { attachmentInstance: lane.runtime.hostInstanceId });
+          if (mail.state === "queued") {
+            const target = lane.runtime.omp?.target;
+            if (!target) throw new DeliveryDeferred("OMP native target missing before submission");
+            if (mail.ompProvenance && (!sameOmpTarget(mail.ompProvenance.target, target) || mail.ompProvenance.attachmentInstanceId !== lane.runtime.hostInstanceId || mail.ompProvenance.attachmentGeneration !== lane.runtime.generation)) throw new DeliveryDeferred("OMP operation provenance changed; no replay");
+            // Persist exact native provenance before the durable sending state and
+            // external attempt. Host recovery never relabels this original epoch.
+            this.inbox.mark(mail.id, { attachmentInstance: lane.runtime.hostInstanceId, ompProvenance: { target, attachmentInstanceId: lane.runtime.hostInstanceId, attachmentGeneration: lane.runtime.generation } });
+          }
         }
         const delivered = await this.inbox.deliver(mail.id, async row => {
           let result: RuntimeInputReceipt;
@@ -1005,16 +1012,32 @@ export class DoriService {
       if (!box || box.get(args.id)?.state !== "unknown") throw new Error("Only unknown mail can be reconciled");
       const row = box.get(args.id)!;
       const lane = await this.registry.read(row.target);
-      if (box === this.inbox && lane?.runtime?.kind === "omp") {
+      if (box === this.inbox && (row.ompProvenance || lane?.runtime?.kind === "omp" || this.config.runtime.kind === "omp")) {
+        if (lane?.runtime?.kind !== "omp") throw new Error("OMP current native attachment missing; delivery remains unknown");
         const epoch = lane.runtime.hostInstanceId, generation = lane.runtime.generation;
-        if (args.state !== "sent" || row.attachmentInstance !== lane.runtime.hostInstanceId) throw new Error("OMP uncertain delivery cannot be replayed or moved to another attachment");
-        const target = lane.runtime.omp?.target;
-        if (!target) throw new Error("Missing OMP target");
-        const op = lane.runtime.backend === "external-current-session" ? await callOmp(target, "operation", { operationId: row.id, text: row.text }, this.config, this.runner) : await ipc<any>(hostSocket(this.config.stateDir, lane.key), readJson<Bootstrap>(bootstrapPath(this.config.stateDir, lane.key)).hostToken, "operation", { operationId: row.id, text: row.text });
+        if (args.state !== "sent") throw new Error("OMP uncertain delivery cannot be replayed");
+        const provenance = row.ompProvenance;
+        if (!provenance || !provenance.target || row.attachmentInstance !== provenance.attachmentInstanceId || !Number.isSafeInteger(provenance.attachmentGeneration) || provenance.attachmentGeneration < 1) throw new Error("OMP native operation provenance missing; delivery remains unknown");
+        const target = provenance.target;
+        const assertCurrent = (current: Lane): void => {
+          const runtime = current.runtime;
+          if (runtime?.kind !== "omp" || runtime.hostInstanceId !== epoch || runtime.generation !== generation || runtime.state === "stopped" || runtime.external?.detachedAt || runtime.omp?.detachedAt || statusOf(current) === "closed" || !runtime.omp || !sameOmpTarget(runtime.omp.target, target) || current.cleanupFence || current.key === "lead" && this.pendingHandoff()) throw new Error("OMP attachment detached, pending or changed during reconciliation");
+          if (runtime.backend === "external-current-session" && (provenance.attachmentInstanceId !== epoch || provenance.attachmentGeneration !== generation)) throw new Error("OMP borrowed receipt belongs to a previous attachment");
+          if (target.laneKey !== current.key || target.role !== (runtime.backend === "external-current-session" ? "attached-lead" : "managed-lane")) throw new Error("OMP provenance lane mismatch");
+        };
+        assertCurrent(lane);
+        const capturedRow = JSON.stringify(row);
+        // Query the originally recorded native controller, even after a host-only
+        // epoch rotation. No submission or alternate target is permitted here.
+        const op = await callOmp(target, "operation", { operationId: row.id, text: row.text }, this.config, this.runner);
         if (op.status !== "received" || !validReceipt(op.receipt, target, row.id, payloadHash(row.text))) throw new Error("OMP exact durable receipt unavailable; delivery remains unknown");
-        const current = await this.lane(row.target);
-        if (current.runtime?.hostInstanceId !== epoch || current.runtime.generation !== generation) throw new Error("OMP attachment changed during reconciliation");
-        return box.mark(args.id, { state: "sent", turnId: op.receipt.receiptId, receiptKind: "omp-session-entry", receipt: op.receipt });
+        return withBindingFence(this.config.stateDir, async () => {
+          const current = await this.lane(row.target);
+          assertCurrent(current);
+          const latest = box.get(row.id);
+          if (!latest || latest.state !== "unknown" || JSON.stringify(latest) !== capturedRow) throw new Error("OMP mail changed during reconciliation");
+          return box.mark(row.id, { state: "sent", turnId: op.receipt.receiptId, receiptKind: "omp-session-entry", receipt: op.receipt });
+        });
       }
       return box.mark(args.id, { state: args.state, source: `reconciled: ${args.evidence}` });
     }
@@ -1050,11 +1073,23 @@ export class DoriService {
           if ((await this.runner(argv)).code !== 0) throw new Error("Cannot restore owned worktree; inspect repository");
         }
         if (action === "reopen") lane = await this.registry.update(key, l => withStatus(l, "working", "Reopened", new Date().toISOString(), { cycle: (l.cycle ?? 1) + 1, closedAt: undefined, claim: undefined, objection: undefined, cleanupFence: undefined, dispatchBlocked: false, holdReason: undefined }));
-        const workspace = workspaceForRole(this.config, lane.role);
-        const created = await this.runner(["herdr", "tab", "create", ...(workspace ? ["--workspace", workspace] : []), "--cwd", lane.cwd ?? this.config.defaultCwd, "--label", key, "--no-focus"]);
-        if (created.code !== 0) throw new Error("Cannot create recovery tab");
-        const made = JSON.parse(created.out).result;
-        lane = await this.registry.update(key, l => ({ ...l, pane: made.root_pane.pane_id, tab: made.tab_id ?? made.root_pane.tab_id }));
+        let reconnectOmp = false;
+        if (!args.newSession && lane.runtime?.kind === "omp" && lane.runtime.omp) {
+          const native = lane.runtime.omp.target;
+          if (native.paneId !== lane.pane || native.cwd !== realpathSync(lane.cwd!)) throw new Error("OMP recovery native pane/cwd mismatch");
+          try {
+            await verifyOmpHerdr(native, this.runner);
+            const controller = await connectOmp(native, { timeoutMs: this.config.runtime.rpcTimeoutMs });
+            try { await controller.inspect(); reconnectOmp = true; } finally { controller.close(); }
+          } catch { /* boot must prove prior process exit before any session resume */ }
+        }
+        if (!reconnectOmp) {
+          const workspace = workspaceForRole(this.config, lane.role);
+          const created = await this.runner(["herdr", "tab", "create", ...(workspace ? ["--workspace", workspace] : []), "--cwd", lane.cwd ?? this.config.defaultCwd, "--label", key, "--no-focus"]);
+          if (created.code !== 0) throw new Error("Cannot create recovery tab");
+          const made = JSON.parse(created.out).result;
+          lane = await this.registry.update(key, l => ({ ...l, pane: made.root_pane.pane_id, tab: made.tab_id ?? made.root_pane.tab_id }));
+        }
         await this.boot(lane);
         const text = args.text ?? (!lane.runtime?.threadId ? await Bun.file(lane.brief).text() : undefined);
         if (text) this.putInbox({ id: args.operationId ?? `handoff:${key}:${lane.cycle ?? 1}`, target: key, text, state: "queued", at: new Date().toISOString() });
