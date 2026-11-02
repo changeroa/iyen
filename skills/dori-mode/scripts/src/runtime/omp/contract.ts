@@ -4,11 +4,17 @@ import { isAbsolute } from "node:path";
 export const OMP_PROTOCOL = 1 as const;
 export const OMP_MAX_FRAME_BYTES = 1024 * 1024;
 export type OmpIdentity = {
-  kind: "omp"; sessionId: string; sessionFile: string; cwd: string; paneId: string;
+  kind: "omp"; sessionId: string; sessionFile: string; cwd: string; paneId: string; terminalId: string;
   instanceId: string; generation: number; role: "attached-lead" | "managed-lane";
   laneKey: string; protocol: 1; runtimeVersion: string;
 };
 export type OmpTarget = OmpIdentity & { socketPath: string; tokenFile: string };
+export type OmpExtensionBootstrap = {
+  protocol: 1; registryDir: string; role: "attached-lead" | "managed-lane"; laneKey: string;
+  expectedCwd: string; expectedPaneId: string; expectedTerminalId: string;
+  expectedSessionId?: string; expectedSessionFile?: string;
+  service?: { contextFile: string; configFile: string; stateDir: string; cliPath: string; bunBinary: string };
+};
 export type OmpGoal = { status: "active" | "paused"; objective: string; tokenBudget: number | null } | null;
 export type OmpReceipt = { operationId: string; payloadHash: string; sessionId: string; sessionFile: string; entryId: string; receiptId: string };
 export type OmpSnapshot = {
@@ -47,14 +53,14 @@ export const hash = (value: unknown): value is string => typeof value === "strin
 export function exactKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
   return required.every(key => Object.hasOwn(value, key)) && Object.keys(value).every(key => required.includes(key) || optional.includes(key));
 }
-const identityKeys = ["kind", "sessionId", "sessionFile", "cwd", "paneId", "instanceId", "generation", "role", "laneKey", "protocol", "runtimeVersion"] as const;
+const identityKeys = ["kind", "sessionId", "sessionFile", "cwd", "paneId", "terminalId", "instanceId", "generation", "role", "laneKey", "protocol", "runtimeVersion"] as const;
 export function identityOf(target: OmpIdentity): OmpIdentity {
   return Object.fromEntries(identityKeys.map(key => [key, target[key]])) as OmpIdentity;
 }
 export function validIdentity(value: unknown): value is OmpIdentity {
   return object(value) && exactKeys(value, identityKeys) && value.kind === "omp" && value.protocol === 1 &&
     typeof value.sessionId === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value.sessionId) &&
-    ["sessionFile", "cwd", "paneId", "instanceId", "laneKey", "runtimeVersion"].every(key => nonempty(value[key])) &&
+    ["sessionFile", "cwd", "paneId", "terminalId", "instanceId", "laneKey", "runtimeVersion"].every(key => nonempty(value[key])) &&
     isAbsolute(value.sessionFile as string) && isAbsolute(value.cwd as string) &&
     Number.isSafeInteger(value.generation) && (value.generation as number) >= 0 &&
     (value.role === "attached-lead" || value.role === "managed-lane");

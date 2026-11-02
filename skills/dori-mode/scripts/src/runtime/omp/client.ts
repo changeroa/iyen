@@ -8,7 +8,7 @@ import { OMP_MAX_FRAME_BYTES, OmpError, assertIdentity, exactKeys, identityOf, n
 export async function connectOmp(target: OmpTarget, options: { timeoutMs?: number } = {}): Promise<OmpController> {
   const identity = identityOf(target); assertIdentity(identity);
   if (!isAbsolute(target.socketPath) || !isAbsolute(target.tokenFile)) throw new OmpError("invalid-target", "OMP endpoints require absolute paths", false);
-  const timeoutMs = options.timeoutMs ?? 30000;
+  const timeoutMs = options.timeoutMs ?? 15000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new OmpError("invalid-timeout", "Invalid OMP timeout", false);
   const fd = openSync(target.tokenFile, constants.O_RDONLY | constants.O_NOFOLLOW);
   let token: string;
