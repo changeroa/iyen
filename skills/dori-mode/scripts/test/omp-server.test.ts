@@ -233,7 +233,8 @@ test("transient retry success, recovered errors, cancellation, assistant abort a
     h.server.observe({ type: "agent_end", messages: [{ ...error, retryRecovery: { kind: "auto-retry", status: "recovered" } }] });
     h.server.observe({ type: "agent_start" }); h.server.observe({ type: "auto_retry_end", success: false, finalError: "Retry cancelled" }); h.server.observe({ type: "agent_end", messages: [error] });
     h.server.observe({ type: "agent_start" }); h.server.observe({ type: "agent_end", messages: [{ ...error, stopReason: "aborted" }] });
-    h.server.observe({ type: "agent_start" }); await h.dispatch("hold", { operationId: "hold", origin: "user" }); h.server.observe({ type: "agent_end", messages: [error] });
+    h.server.observe({ type: "agent_start" }); await h.dispatch("hold", { operationId: "hold", origin: "user" }); h.server.observe({ type: "agent_end", messages: [{ ...error, stopReason: "aborted" }] });
+    h.server.observe({ type: "auto_retry_end", success: false, finalError: "Retry cancelled" });
     expect((await h.dispatch("failures", { after: 0, limit: 100 }) as any).records).toHaveLength(0);
   } finally { h.cleanup(); }
 });
@@ -288,5 +289,34 @@ test("failure journal write failure disables managed input and durable failure r
     await expect(h.dispatch("failures", { after: 0, limit: 100 })).rejects.toThrow("failure channel unavailable");
     await expect(h.dispatch("input", { operationId: "next", text: "task", payloadHash: payloadHash("task") })).rejects.toThrow("blocked before submission");
     expect(h.sends()).toBe(0);
+  } finally { h.cleanup(); }
+});
+
+
+test("automatic hold racing genuine terminal authentication failure persists one record", async () => {
+  const h = harness();
+  try {
+    h.server.observe({ type: "agent_start" });
+    await h.dispatch("hold", { operationId: "automatic-disconnect-hold", origin: "automatic" });
+    h.server.observe({ type: "auto_retry_end", success: false, finalError: "provider authentication failed sk-secret-example" });
+    const page: any = await h.dispatch("failures", { after: 0, limit: 100 });
+    expect(h.server.snapshot()).toMatchObject({ state: "failed", held: true, capabilities: { durableFailures: true } });
+    expect(page.records).toHaveLength(1);
+    expect(page.records[0]).toMatchObject({ phase: "model", category: "authentication", executionId: "instance:1:1" });
+    expect(JSON.stringify(page)).not.toContain("sk-secret-example");
+    h.server.observe({ type: "agent_end", messages: [{ role: "assistant", stopReason: "error" }] });
+    expect((await h.dispatch("failures", { after: 0, limit: 100 }) as any).records).toHaveLength(1);
+  } finally { h.cleanup(); }
+});
+
+test("stop intent does not suppress genuine model or compaction failures", async () => {
+  const h = harness();
+  try {
+    h.server.observe({ type: "agent_start" });
+    await h.dispatch("stop", { operationId: "stop" });
+    h.server.observe({ type: "agent_end", messages: [{ role: "assistant", stopReason: "error", errorMessage: "provider authentication failed" }] });
+    h.server.observe({ type: "auto_compaction_end", errorMessage: "provider authentication failed" });
+    const page: any = await h.dispatch("failures", { after: 0, limit: 100 });
+    expect(page.records.map((record: any) => [record.phase, record.category])).toEqual([["model", "authentication"], ["compaction", "authentication"]]);
   } finally { h.cleanup(); }
 });

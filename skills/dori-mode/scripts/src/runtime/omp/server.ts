@@ -140,7 +140,9 @@ export class OmpControlServer {
   }
   get identity(): OmpIdentity { return identityOf(this.target); }
   private recordFailure(executionId: string | undefined, phase: "model" | "compaction", error: unknown): void {
-    if (!this.failures || this.state.held || this.state.stopping) return;
+    // A hold/stop can race a genuine terminal provider failure. Cancellation is
+    // classified at the native event boundary, never inferred from control state.
+    if (!this.failures) return;
     if (!executionId) { this.failureGap = true; this.failures.invalidate(); return; }
     try { this.failures.append(executionId, phase, failureCategory(error)); }
     catch { this.failureGap = true; }
