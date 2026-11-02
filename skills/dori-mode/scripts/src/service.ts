@@ -16,22 +16,27 @@ import { sampleHost, guardTick } from "./host-guard.ts";
 import { canLaunch } from "./routing.ts";
 import { run, realClock, type Runner } from "./run.ts";
 import { backendSocket, bootstrapPath, type Bootstrap } from "./runtime/session-host.ts";
-import type { ExternalHoldCode, RuntimeControl, RuntimeRef, RuntimeSnapshot } from "./runtime/types.ts";
+import type { RuntimeInputReceipt, ExternalHoldCode, RuntimeControl, RuntimeRef, RuntimeSnapshot } from "./runtime/types.ts";
 import { WorkTimers } from "./work.ts";
-import { turnFailure } from "./turn-failure.ts";
+import { turnFailure, ompFailureGuidance } from "./turn-failure.ts";
 import { DeliveryDeferred, Mailbox, postHook, type Mail } from "./mailbox.ts";
-import { ExternalCurrentSession, ExternalSessionError, discoverExternal, observeExternal, sharedDaemon, THREAD_UUID, type Attachment } from "./runtime/external-current-session.ts";
+import { ExternalCurrentSession, ExternalSessionError, discoverExternal, observeExternal, sharedDaemon, THREAD_UUID, type Attachment as CodexAttachment } from "./runtime/external-current-session.ts";
 import { connectObserver, receiptInTurns } from "./runtime/observer.ts";
 import { withBindingFence } from "./binding-fence.ts";
 import { readWatchTarget } from "./watchdog.ts";
 import { operationText } from "./runtime/herdr.ts";
 import type { Turn } from "./runtime/generated/v2/Turn.ts";
 
+import { callOmp, findOmpTarget, verifyOmpHerdr, sameOmpTarget } from "./runtime/omp-integration.ts";
+import { connectOmp } from "./runtime/omp/client.ts";
+import { sameIdentity, validReceipt, payloadHash, object, exactKeys, validateFailureRecord, type OmpTarget } from "./runtime/omp/contract.ts";
+type Attachment = CodexAttachment & { omp?: OmpTarget };
+
 export type Caller = { role: "admin" | "lead" | "lane" | "host"; key?: string; instance?: string };
 export type ExternalTransport = { connect: typeof connectObserver; observe: typeof observeExternal };
 type OwnedFailure = Mail & { leadIntakeInstance?: string };
 const UNOWNED_LEAD = "unattached-lead";
-type HandoffArgs = { fromThreadId: string; threadId: string; pane: string; cwd: string; mailIds: string[]; operationId: string };
+type HandoffArgs = { sessionFile?: string; terminalId?: string; fromThreadId: string; threadId: string; pane: string; cwd: string; mailIds: string[]; operationId: string };
 type HandoffIntent = { version: 1; status: "prepared" | "committed"; args: HandoffArgs; before: Lane; beforeAttachment: Attachment; after: Lane; afterAttachment: Attachment; result: any; createdAt: string; identityHeld?: boolean; cleanupPending?: boolean; activation?: boolean };
 export type HandoffIO = { removeMarker(path: string): void };
 const durableMarkerRemoval = (path: string): void => {
@@ -78,14 +83,20 @@ export class DoriService {
       const lane = await this.registry.read(key);
       if (!lane?.runtime?.threadId) throw new Error("Runtime is not registered");
       if (lane.runtime.backend === "external-current-session") return this.externalCall(lane, action, args) as Promise<T>;
+      if (lane.runtime.kind === "omp" && action === "release" && this.inbox.list().some(row => row.target === key && ["unknown", "sending"].includes(row.state))) throw new Error("OMP unresolved operation fence; reconcile exact receipts before release");
       if (action === "stop" && lane.runtime.state === "stopped") return undefined as T;
       const boot = readJson<Bootstrap>(bootstrapPath(config.stateDir, key));
       const result = await ipc<T>(hostSocket(config.stateDir, key), boot.hostToken, action, args, config.runtime.rpcTimeoutMs * 3);
+      if (lane.runtime.kind === "omp") {
+        const current = await this.lane(key);
+        if (current.runtime?.hostInstanceId !== lane.runtime.hostInstanceId || current.runtime.generation !== lane.runtime.generation) throw new Error("OMP host generation changed during control; outcome unknown");
+        if (action === "input" && (!lane.runtime.omp || !validReceipt((result as any)?.receipt, lane.runtime.omp.target, args.operationId, payloadHash(args.text)))) throw new Error("OMP exact receipt missing");
+      }
       if (action === "stop") await this.registry.update(key, l => ({ ...l, runtime: l.runtime && { ...l.runtime, state: "stopped", activeTurnId: undefined } }));
       return result;
     };
     const runtime: RuntimeControl = {
-      inspect: key => this.dispatchQueue.run(key, () => call(key, "inspect")),
+      inspect: async key => (await this.registry.read(key))?.runtime?.kind === "omp" ? call(key, "inspect") : this.dispatchQueue.run(key, () => call(key, "inspect")),
       input: (key, text, operationId) => this.withIntake(() => this.dispatchQueue.run(key, async () => {
         const lane = await this.registry.read(key);
         if (!lane || lane.dispatchBlocked || statusOf(lane) === "closed") throw new Error("Lane dispatch is blocked");
@@ -96,13 +107,32 @@ export class DoriService {
           if (mail.state === "queued" && !["idle", "running"].includes((await call<RuntimeSnapshot>(key, "inspect")).state)) throw new DeliveryDeferred("Attached session requires approval or input; dispatch held");
           if (mail.state === "queued") this.inbox.mark(mail.id, { attachmentInstance: lane.runtime.hostInstanceId });
         }
+        if (lane.runtime?.kind === "omp") {
+          if (mail.attachmentInstance && mail.attachmentInstance !== lane.runtime.hostInstanceId) throw new DeliveryDeferred("OMP mail belongs to a previous attachment");
+          if (mail.state === "queued") {
+            const target = lane.runtime.omp?.target;
+            if (!target) throw new DeliveryDeferred("OMP native target missing before submission");
+            if (mail.ompProvenance && (!sameOmpTarget(mail.ompProvenance.target, target) || mail.ompProvenance.attachmentInstanceId !== lane.runtime.hostInstanceId || mail.ompProvenance.attachmentGeneration !== lane.runtime.generation)) throw new DeliveryDeferred("OMP operation provenance changed; no replay");
+            // Persist exact native provenance before the durable sending state and
+            // external attempt. Host recovery never relabels this original epoch.
+            this.inbox.mark(mail.id, { attachmentInstance: lane.runtime.hostInstanceId, ompProvenance: { target, attachmentInstanceId: lane.runtime.hostInstanceId, attachmentGeneration: lane.runtime.generation } });
+          }
+        }
         const delivered = await this.inbox.deliver(mail.id, async row => {
-          const result = await call<{ turnId: string }>(key, "input", { text: row.text, operationId: row.id });
+          let result: RuntimeInputReceipt;
+          try { result = await call<RuntimeInputReceipt>(key, "input", { text: row.text, operationId: row.id }); }
+          catch (error) {
+            if (lane.runtime?.kind === "omp" && !(error instanceof DeliveryDeferred)) {
+              await this.registry.update(key, current => current.runtime?.hostInstanceId !== lane.runtime!.hostInstanceId ? current : { ...current, dispatchBlocked: true, holdReason: current.holdReason ?? "recovery", runtime: { ...current.runtime, held: true, state: "recovering" } });
+              if (lane.runtime.backend !== "external-current-session") void call(key, "hold", { origin: "automatic" }).catch(() => {});
+            }
+            throw error;
+          }
           if (typeof result?.turnId !== "string" || !result.turnId.trim()) throw new Error("Missing turn receipt");
           return result;
         });
         if (!delivered.turnId) throw new Error("Missing turn receipt");
-        return { turnId: delivered.turnId };
+        return { turnId: delivered.turnId, receiptKind: delivered.receiptKind, receipt: delivered.receipt };
       })),
       hold: (key, origin) => call(key, "hold", { origin }), release: (key, origin) => call(key, "release", { origin }), stop: key => call(key, "stop"),
     };
@@ -189,7 +219,7 @@ export class DoriService {
       typeof args.pane !== "string" || !args.pane.trim() || typeof args.cwd !== "string" || !isAbsolute(args.cwd)) throw new Error("Handoff requires exact fromThreadId, different UUID threadId, pane and absolute cwd");
     if (apply && (!Array.isArray(args.mailIds) || typeof args.operationId !== "string" || !args.operationId.trim() || args.operationId.length > 200)) throw new Error("Handoff requires explicit mailIds array and stable operationId");
     if (args.mailIds !== undefined && (!Array.isArray(args.mailIds) || args.mailIds.some((id: unknown) => typeof id !== "string" || !id) || new Set(args.mailIds).size !== args.mailIds.length)) throw new Error("mailIds must contain unique nonempty strings");
-    return { fromThreadId: args.fromThreadId, threadId: args.threadId, pane: args.pane, cwd: realpathSync(args.cwd), mailIds: [...(args.mailIds ?? [])].sort(), operationId: args.operationId ?? "" };
+    return { ...(this.config.runtime.kind === "omp" ? { sessionFile: realpathSync(args.sessionFile), terminalId: args.terminalId } : {}), fromThreadId: args.fromThreadId, threadId: args.threadId, pane: args.pane, cwd: realpathSync(args.cwd), mailIds: [...(args.mailIds ?? [])].sort(), operationId: args.operationId ?? "" };
   }
   private handoffMail(saved: Attachment): { eligibleMailIds: string[]; blocked: { id: string; reason: string }[]; historicalMailIds: string[] } {
     const eligibleMailIds: string[] = [], blocked: { id: string; reason: string }[] = [], historicalMailIds: string[] = [];
@@ -202,6 +232,16 @@ export class DoriService {
     return { eligibleMailIds: eligibleMailIds.sort(), blocked, historicalMailIds: historicalMailIds.sort() };
   }
   private async validateHandoffTarget(args: HandoffArgs, socketPath: string): Promise<{ daemon: Awaited<ReturnType<typeof discoverExternal>>; snap: Awaited<ReturnType<ExternalCurrentSession["inspect"]>> }> {
+    if (this.config.runtime.kind === "omp") {
+      const target = await findOmpTarget(this.config, { sessionId: args.threadId, sessionFile: args.sessionFile!, terminalId: args.terminalId!, pane: args.pane, cwd: args.cwd }, this.runner);
+      const controller = await connectOmp(target, { timeoutMs: this.config.runtime.rpcTimeoutMs });
+      try {
+        const observed = await controller.inspect();
+        if (!["idle", "running"].includes(observed.state) || observed.goal?.status === "paused") throw new Error("OMP target is not ready");
+        return { daemon: { socketPath: target.socketPath, binaryVersion: target.runtimeVersion, binary: this.config.runtime.binary, omp: target } as any,
+          snap: { threadId: target.sessionId, state: observed.state, activeTurnId: observed.activeRunId, goal: observed.goal, model: observed.model, effort: observed.effort } as any };
+      } finally { controller.close(); }
+    }
     const daemon = await discoverExternal(this.runner, this.config.runtime);
     if (daemon.socketPath !== socketPath) throw new ExternalSessionError("identity-unverified", "Handoff daemon affinity changed; explicit detach and attach required.");
     const observer = await this.externalTransport.connect(daemon.socketPath, this.config.runtime.rpcTimeoutMs).catch(() => { throw new ExternalSessionError("runtime-unavailable", "Handoff target observer unavailable; replacement remains held."); });
@@ -234,6 +274,7 @@ export class DoriService {
     } else {
       if (this.pendingHandoff()) throw new Error("Another handoff is pending; finish its recorded operation first");
       const before = await this.lane("lead");
+      if (before.runtime && before.runtime.kind !== this.config.runtime.kind) throw new Error("Cross-runtime handoff prohibited; use isolated profiles");
       if (before.runtime?.threadId !== args.fromThreadId || before.runtime.backend !== "external-current-session") throw new Error("Handoff expected source session mismatch");
       const beforeAttachment = this.attachment(before), summary = this.handoffMail(beforeAttachment);
       if (args.mailIds.some(id => !summary.eligibleMailIds.includes(id))) throw new Error("Handoff selection includes attempted, reconciled, unknown or other-attachment mail");
@@ -345,6 +386,7 @@ export class DoriService {
         saved.socketPath !== lane.runtime.external?.socketPath || saved.bridge !== lane.runtime.external.bridge ||
         (saved.binary !== lane.runtime.external.binary || (saved.binaryVersion && saved.binaryVersion !== lane.runtime.binaryVersion)) &&
           !(lane.runtime.external.rebind?.binary === saved.binary && lane.runtime.external.rebind.binaryVersion === saved.binaryVersion)) throw new Error("Stale or detached lead attachment");
+    if (lane.runtime.kind === "omp" && (!saved.omp || !lane.runtime.omp || !sameIdentity(saved.omp, lane.runtime.omp.target) || lane.runtime.omp.attachmentInstanceId !== saved.instance || lane.runtime.omp.attachmentGeneration !== saved.generation)) throw new Error("OMP saved attachment mismatch");
     return saved;
   }
   private async holdExternal(instance: string, error: unknown = new ExternalSessionError("identity-unverified", "Attached session identity unavailable; explicit attachment required.")): Promise<void> {
@@ -443,6 +485,7 @@ export class DoriService {
     let saved: Attachment;
     try { saved = this.attachment(lane); }
     catch (error) { await this.holdExternal(lane.runtime!.hostInstanceId, new ExternalSessionError("attachment-inconsistent", "Attached session records are inconsistent; explicit attachment required.")); throw error; }
+    if (lane.runtime?.kind === "omp") return this.ompExternalCall(lane, saved, action, args);
     if (action === "inspect" && (lane.runtime?.external?.rebind || lane.runtime?.external?.holdReason)) {
       const recovered = await this.reconnectExternal(lane, saved);
       if (recovered) return recovered;
@@ -476,6 +519,36 @@ export class DoriService {
       throw error;
     }
   }
+  private async ompExternalCall(lane: Lane, saved: Attachment, action: string, args: any): Promise<unknown> {
+    const target = saved.omp, epoch = lane.runtime!.omp;
+    if (!target || !epoch || !sameIdentity(target, epoch.target) || epoch.attachmentInstanceId !== saved.instance || epoch.attachmentGeneration !== saved.generation) throw new Error("OMP attachment epoch inconsistent");
+    const assertCurrent = async () => {
+      const current = await this.lane("lead");
+      if (this.pendingHandoff() || current.runtime?.hostInstanceId !== saved.instance || current.runtime.generation !== saved.generation || current.runtime.external?.detachedAt || !current.runtime.omp || !sameIdentity(current.runtime.omp.target, target)) throw new Error("OMP attachment changed during dispatch; outcome unknown");
+      return current;
+    };
+    try {
+      const current = await assertCurrent();
+      if (action === "input" && (current.dispatchBlocked || epoch.excludedInboxIds.includes(args.operationId))) throw new DeliveryDeferred("OMP lead held for reconciliation");
+      // Do not hold the cross-process binding fence while the native receipt waits.
+      // The dispatch queue fences attachment/handoff; hold uses independent service gates.
+      const result = await callOmp(target, action, args, this.config, this.runner);
+      await assertCurrent();
+      if (action === "inspect") {
+        const snap = result as RuntimeSnapshot;
+        await this.registry.update("lead", l => {
+          if (l.runtime?.hostInstanceId !== saved.instance || l.runtime.generation !== saved.generation) return l;
+          const recover = l.holdReason === "recovery" && !["paused", "done-claimed", "verified-done", "closed"].includes(statusOf(l)) && ["idle", "running"].includes(snap.state) && !this.inbox.list().some(row => row.target === "lead" && row.attachmentInstance === saved.instance && ["sending", "unknown"].includes(row.state));
+          return { ...l, ...(recover ? { dispatchBlocked: false, holdReason: undefined } : {}), runtime: { ...l.runtime!, held: recover ? false : l.runtime!.held, state: l.dispatchBlocked && !recover ? "recovering" : snap.state, activeTurnId: snap.activeTurnId,
+            external: { ...l.runtime!.external!, ...(recover ? { holdReason: undefined, reconnectBlocked: undefined } : {}) } } };
+        });
+      }
+      return result;
+    } catch (error) {
+      if (!(error instanceof DeliveryDeferred)) await this.holdExternal(saved.instance, new ExternalSessionError("identity-unverified", "OMP exact target unavailable or changed; explicit revalidation required"));
+      throw error;
+    }
+  }
   private async publicLane(lane: Lane, dispatchLocked = false): Promise<any> {
     if (lane.runtime?.backend === "external-current-session" && !dispatchLocked) return this.dispatchQueue.run(lane.key, async () => this.publicLane(await this.lane(lane.key), true));
     if (lane.runtime?.backend !== "external-current-session") return lane;
@@ -484,11 +557,14 @@ export class DoriService {
     const current = await this.lane(lane.key);
     const stillAttached = !current.runtime?.external?.detachedAt && current.runtime?.state !== "stopped";
     const identityVerified = Boolean(snap) && stillAttached && current.runtime?.hostInstanceId === lane.runtime.hostInstanceId;
+    const inputReady = identityVerified && !current.dispatchBlocked &&
+      (current.runtime?.kind === "omp" ? snap?.inputReady === true && !this.pendingHandoff() &&
+        !this.inbox.list().some(row => row.target === lane.key && row.attachmentInstance === current.runtime?.hostInstanceId && ["sending", "unknown"].includes(row.state)) : snap?.state === "idle");
     return { ...current, mode: "external-current-session", bridge: current.runtime?.external?.bridge, identityVerified,
       verifiedIdentity: identityVerified ? { threadId: current.runtime?.threadId, pane: current.pane, cwd: current.cwd, model: current.runtime?.model, effort: current.runtime?.effort } : null,
-      readiness: !stillAttached ? "detached" : !identityVerified || current.dispatchBlocked ? "held" : snap?.state === "idle" ? "ready" : "busy" };
+      inputReady, readiness: !stillAttached ? "detached" : !identityVerified || current.dispatchBlocked ? "held" : inputReady ? "ready" : "busy" };
   }
-  private async assertPriorTuiGone(source: Attachment, target: Pick<HandoffArgs, "threadId" | "pane">): Promise<void> {
+  private async assertPriorTuiGone(source: Attachment, target: Pick<HandoffArgs, "threadId" | "pane" | "sessionFile">): Promise<void> {
     const unknown = () => new Error("Prior lead TUI ownership is unverified; inspect Herdr and retry activation, or use explicit lead-handoff");
     const live = () => new Error("Prior lead session still has a live Herdr TUI; use explicit lead-handoff to replace it");
     const read = async (argv: string[]) => {
@@ -498,7 +574,9 @@ export class DoriService {
         return JSON.parse(result.out).result;
       } catch { throw unknown(); }
     };
-    const session = (row: any): string | undefined => row?.agent === "codex" && row.agent_session?.agent === "codex" &&
+    const session = (row: any): string | undefined => source.omp
+      ? row?.agent === "omp" && row.agent_session?.agent === "omp" && row.agent_session.kind === "path" && row.agent_session.source === "herdr:omp" && typeof row.agent_session.value === "string" ? row.agent_session.value : undefined
+      : row?.agent === "codex" && row.agent_session?.agent === "codex" &&
       row.agent_session.kind === "id" && typeof row.agent_session.value === "string" && THREAD_UUID.test(row.agent_session.value) ? row.agent_session.value : undefined;
     const emptyShell = async (): Promise<void> => {
       const inspect = async () => {
@@ -530,9 +608,9 @@ export class DoriService {
       if (snapshot.agents.some((row: any) => !snapshot.panes.some((pane: any) => pane.pane_id === row.pane_id))) throw unknown();
       const rows = [...snapshot.panes, ...snapshot.agents];
       // Status (including idle/done) is never evidence that a TUI has exited.
-      if (rows.some(row => row.agent_session?.value === source.threadId)) throw live();
+      if (rows.some(row => row.agent_session?.value === (source.omp?.sessionFile ?? source.threadId))) throw live();
       const targetRows = rows.filter(row => row.pane_id === target.pane);
-      if (targetRows.length !== 2 || targetRows.some(row => session(row) !== target.threadId) || rows.some(row => session(row) === target.threadId && row.pane_id !== target.pane)) throw unknown();
+      if (targetRows.length !== 2 || targetRows.some(row => session(row) !== (target.sessionFile ?? target.threadId)) || rows.some(row => session(row) === (target.sessionFile ?? target.threadId) && row.pane_id !== target.pane)) throw unknown();
       const priorRows = rows.filter(row => row.pane_id === source.pane);
       if (priorRows.length === 1 && !priorRows[0].agent && !priorRows[0].agent_session) return [session(targetRows[0])!, "shell"];
       if (priorRows.length && (priorRows.length !== 2 || priorRows.some(row => !session(row)) || session(priorRows[0]) !== session(priorRows[1]))) throw unknown();
@@ -544,19 +622,20 @@ export class DoriService {
     for (const pane of new Set([target.pane, ...(before.length > 1 ? [source.pane] : [])])) {
       if (pane === source.pane && before[1] === "shell") { await emptyShell(); continue; }
       const agent = (await read(["agent", "get", pane]))?.agent;
-      if (agent?.agent_session?.value === source.threadId) throw live();
+      if (agent?.agent_session?.value === (source.omp?.sessionFile ?? source.threadId)) throw live();
       if (agent?.pane_id !== pane || !session(agent) || session(agent) !== before[pane === target.pane ? 0 : 1]) throw unknown();
     }
     if (!sameJson(before, await observe())) throw unknown();
   }
   private async activateLead(raw: any): Promise<any> {
     if (typeof raw.threadId !== "string" || !THREAD_UUID.test(raw.threadId) || typeof raw.pane !== "string" || !raw.pane.trim() || typeof raw.cwd !== "string" || !isAbsolute(raw.cwd)) throw new Error("lead-activate requires UUID thread-id, pane and absolute cwd");
-    const args = { threadId: raw.threadId, pane: raw.pane, cwd: realpathSync(raw.cwd) }, pending = this.pendingHandoff();
+    const args = { threadId: raw.threadId, pane: raw.pane, cwd: realpathSync(raw.cwd), ...(this.config.runtime.kind === "omp" ? { sessionFile: raw.sessionFile, terminalId: raw.terminalId } : {}) }, pending = this.pendingHandoff();
     if (pending) {
-      if (!pending.activation || pending.args.threadId !== args.threadId || pending.args.pane !== args.pane || pending.args.cwd !== args.cwd) throw new Error("Another handoff is pending; retry its recorded target and operationId first");
+      if (!pending.activation || pending.args.threadId !== args.threadId || pending.args.pane !== args.pane || pending.args.cwd !== args.cwd || this.config.runtime.kind === "omp" && (pending.args.sessionFile !== args.sessionFile || pending.args.terminalId !== args.terminalId)) throw new Error("Another handoff is pending; retry its recorded target and operationId first");
       return this.applyHandoff(pending.args, true);
     }
     const previous = await this.registry.read("lead");
+    if (previous?.runtime && previous.runtime.kind !== this.config.runtime.kind) throw new Error("Cross-runtime activation prohibited; use isolated profiles");
     if (previous?.runtime?.backend !== "external-current-session" || previous.runtime.external?.detachedAt || previous.runtime.state === "stopped" ||
       previous.runtime.threadId === args.threadId && previous.pane === args.pane && previous.cwd === args.cwd) return this.attachLead(args);
     const source = this.attachment(previous);
@@ -571,12 +650,26 @@ export class DoriService {
   private async attachLead(args: any): Promise<any> {
     if (typeof args.threadId !== "string" || !THREAD_UUID.test(args.threadId) || typeof args.pane !== "string" || !args.pane.trim() || typeof args.cwd !== "string" || !isAbsolute(args.cwd)) throw new Error("lead-attach requires UUID thread-id, pane and absolute cwd");
     const cwd = realpathSync(args.cwd), previous = await this.registry.read("lead");
+    if (previous?.runtime && previous.runtime.kind !== this.config.runtime.kind) throw new Error("Cross-runtime attachment conversion prohibited; use an isolated profile");
     const same = previous?.runtime?.backend === "external-current-session" && !previous.runtime.external?.detachedAt && previous.runtime.state !== "stopped" && previous.runtime.threadId === args.threadId && previous.pane === args.pane && previous.cwd === cwd;
     if (previous?.runtime?.backend === "external-current-session" && !previous.runtime.external?.detachedAt && previous.runtime.state !== "stopped" && !same) throw new Error("A different lead is attached; explicitly detach it first");
     // Matching identity may keep its existing capability across a binary upgrade.
     // This also accepts either side of a previously interrupted, recorded rebind.
     const saved = same ? this.attachment(previous) : undefined;
     try {
+      if (this.config.runtime.kind === "omp") {
+        const { daemon, snap } = await this.validateHandoffTarget({ ...args, cwd } as HandoffArgs, "");
+        const target = (daemon as any).omp as OmpTarget;
+        if (saved) {
+          if (!saved.omp || !sameIdentity(saved.omp, target)) throw new Error("OMP native controller changed; detach then explicitly reattach");
+          await this.registry.update("lead", current => {
+            const protectedHold = ["owner-pause", "done-review"].includes(current.holdReason ?? "") || ["paused", "done-claimed", "verified-done", "closed"].includes(statusOf(current)) || this.inbox.list().some(row => row.target === "lead" && row.attachmentInstance === current.runtime?.hostInstanceId && ["sending", "unknown"].includes(row.state));
+            return { ...current, dispatchBlocked: protectedHold, holdReason: protectedHold ? current.holdReason : undefined, runtime: { ...current.runtime!, held: protectedHold, state: snap.state, external: { ...current.runtime!.external!, holdReason: undefined, firstHoldReason: undefined, latestHoldReason: undefined, reconnectBlocked: undefined } } };
+          });
+          return { attached: true, bridge: saved.bridge, lead: await this.publicLane(await this.lane("lead"), true), reused: true };
+        }
+        return this.createAttachment(args, cwd, previous, this.config.runtime.binary, daemon, snap);
+      }
       if (saved) {
         await this.rebindExternal(previous!, saved, false);
         return { attached: true, bridge: saved.bridge, lead: await this.publicLane(await this.lane("lead"), true), reused: true };
@@ -633,14 +726,14 @@ export class DoriService {
     const clientDir = resolve(this.config.stateDir, "clients", "attached-lead", instance), bridge = join(clientDir, "iyen");
     mkdirSync(clientDir, { recursive: true, mode: 0o700 });
     const saved: Attachment = { threadId: args.threadId, pane: args.pane, cwd, model: snap.model, effort: snap.effort, instance, generation, token: crypto.randomUUID(), ...daemon, binary, bridge,
-      excludedInboxIds: excludedInboxIds };
+      excludedInboxIds: excludedInboxIds, ...((daemon as any).omp ? { omp: (daemon as any).omp } : {}) };
     atomicJson(join(clientDir, "context.json"), { token: saved.token, key: "lead", stateDir: this.config.stateDir });
     atomicJson(join(clientDir, "config.json"), this.config);
     writeFileSync(bridge, `#!/bin/sh\nDORI_CONTEXT=${quoteForPane(join(clientDir, "context.json"))} DORI_STATE_DIR=${quoteForPane(this.config.stateDir)} DORI_CONFIG=${quoteForPane(join(clientDir, "config.json"))} DORI_LANE_KEY=lead exec ${quoteForPane(process.execPath)} ${quoteForPane(resolve(import.meta.dir, "cli.ts"))} "$@"\n`, { mode: 0o700 });
     const lead: Lane = { key: "lead", title: "Iyen current-session lead", role: "lead", thread: "none", brief: "", done: "", pane: args.pane, cwd, model: snap.model,
       openedAt: new Date().toISOString(), status: "working", dispatchBlocked: false, revision: previous?.revision,
       runtimeHistory: [...(previous?.runtimeHistory ?? []), ...(previous?.runtime ? [previous.runtime] : [])],
-      runtime: { kind: "codex", backend: "external-current-session", threadId: args.threadId, state: snap.state, activeTurnId: snap.activeTurnId,
+      runtime: { kind: this.config.runtime.kind, ...(saved.omp ? { omp: { kind: "omp" as const, target: saved.omp, attachmentInstanceId: instance, attachmentGeneration: generation, attachedAt: new Date().toISOString(), excludedInboxIds } } : {}), backend: "external-current-session", threadId: args.threadId, state: snap.state, activeTurnId: snap.activeTurnId,
         hostInstanceId: instance, generation, binaryVersion: daemon.binaryVersion, model: snap.model, effort: snap.effort, external: { socketPath: daemon.socketPath, binary, bridge } } };
     return { saved, lead };
   }
@@ -660,6 +753,11 @@ export class DoriService {
       try { process.kill(pid, 0); throw new Error("Prior backend process still exists; refuse second writer"); }
       catch (e) { if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e; }
     }
+    if (lane.runtime?.kind === "omp" && lane.runtime.omp) {
+      const target = lane.runtime.omp.target;
+      try { await verifyOmpHerdr(target, this.runner); const c = await connectOmp(target); try { await c.inspect(); } finally { c.close(); } return; }
+      catch { /* existing controller unavailable; require absence checks below */ }
+    }
     const live = await this.runner(["herdr", "agent", "list"]);
     if (live.code !== 0) throw new Error("Cannot prove exclusive TUI ownership");
     const agents = JSON.parse(live.out).result.agents as { pane_id: string; agent_session?: { value: string } }[];
@@ -668,6 +766,7 @@ export class DoriService {
   async boot(lane: Lane): Promise<void> {
     if (lane.key === "lead" || lane.role === "lead") throw new Error("Iyen lead must attach to the current session; use lead-attach");
     if (lane.runtime?.backend === "external-current-session") throw new Error("External current-session boot is unsupported; use lead-attach");
+    if (lane.runtime?.threadId && lane.runtime.kind !== this.config.runtime.kind) throw new Error("Runtime kind conversion is prohibited; use an isolated OMP profile");
     if (!lane.pane) throw new Error("A Herdr pane is required");
     const pane = lane.pane;
     await this.assertHostStopped(lane);
@@ -682,6 +781,12 @@ export class DoriService {
     }
     const instance = crypto.randomUUID();
     const boot: Bootstrap = { key: lane.key, role: lane.role ?? "lane", pane, instance, generation: (lane.runtime?.generation ?? 0) + 1, hostToken: crypto.randomUUID(), laneToken: crypto.randomUUID(), cwd: lane.cwd ?? this.config.defaultCwd, threadId: lane.runtime?.threadId, model: lane.model, blocked: Boolean(lane.dispatchBlocked), config: this.config };
+    if (this.config.runtime.kind === "omp" && lane.runtime?.omp && existsSync(path)) {
+      const old = readJson<Bootstrap>(path);
+      // The existing native extension's MCP helper already loaded this scoped
+      // lane token. Keep it only when reconnecting the exact same controller.
+      try { await verifyOmpHerdr(lane.runtime.omp.target, this.runner); if (old.threadId === boot.threadId || lane.runtime.threadId === boot.threadId) boot.laneToken = old.laneToken; } catch { /* stopped controller: fresh lane credential */ }
+    }
     atomicJson(path, boot);
     const clientDir = join(this.config.stateDir, "clients", lane.key);
     mkdirSync(clientDir, { recursive: true, mode: 0o700 });
@@ -689,7 +794,7 @@ export class DoriService {
     atomicJson(join(clientDir, "config.json"), this.config);
     const wrapper = `#!/bin/sh\nDORI_CONTEXT=${quoteForPane(join(clientDir, "context.json"))} DORI_STATE_DIR=${quoteForPane(this.config.stateDir)} DORI_CONFIG=${quoteForPane(join(clientDir, "config.json"))} DORI_LANE_KEY=${quoteForPane(lane.key)} exec ${quoteForPane(process.execPath)} ${quoteForPane(resolve(import.meta.dir, "cli.ts"))} "$@"\n`;
     writeFileSync(join(clientDir, "dori"), wrapper, { mode: 0o700 });
-    await this.registry.update(lane.key, current => ({ ...current, runtime: { kind: "codex", backend: "herdr-tui", threadId: boot.threadId, state: "starting", hostInstanceId: instance, generation: boot.generation, binaryVersion: this.config.runtime.requiredVersion, lastHeartbeatAt: new Date().toISOString() } }));
+    await this.registry.update(lane.key, current => ({ ...current, runtime: { kind: this.config.runtime.kind, backend: "herdr-tui", threadId: boot.threadId, state: "starting", hostInstanceId: instance, generation: boot.generation, binaryVersion: this.config.runtime.requiredVersion, lastHeartbeatAt: new Date().toISOString() } }));
     const cli = resolve(import.meta.dir, "cli.ts");
     const launched = await this.runner([process.execPath, cli, "session-host-start", "--state-dir", this.config.stateDir, "--key", lane.key]);
     if (launched.code !== 0) throw new Error("Failed to start private backend host; intent retained");
@@ -768,8 +873,30 @@ export class DoriService {
       if (lane.runtime?.backend === "external-current-session") throw new Error("External current-session cannot register a managed host");
       if (!lane.runtime || lane.runtime.hostInstanceId !== args.instance || args.runtime?.hostInstanceId !== args.instance || args.runtime?.generation !== lane.runtime.generation) throw new Error("Stale host generation");
       if (lane.runtime.threadId && lane.runtime.threadId !== args.runtime.threadId) throw new Error("Thread identity mismatch");
-      if (!args.runtime.threadId || args.runtime.kind !== "codex") throw new Error("Invalid runtime identity");
+      if (!args.runtime.threadId || args.runtime.kind !== lane.runtime.kind || args.runtime.kind !== this.config.runtime.kind) throw new Error("Invalid runtime identity");
+      if (args.runtime.kind === "omp") {
+        const native = args.runtime.omp?.target as OmpTarget | undefined;
+        if (!native || native.sessionId !== args.runtime.threadId || native.paneId !== lane.pane || native.cwd !== realpathSync(lane.cwd!) || native.role !== "managed-lane" || native.laneKey !== lane.key || native.runtimeVersion !== this.config.runtime.requiredVersion || args.runtime.omp.attachmentInstanceId !== args.instance || args.runtime.omp.attachmentGeneration !== lane.runtime.generation) throw new Error("Invalid OMP host/native attachment identity");
+        if (lane.runtime.omp && !sameIdentity(lane.runtime.omp.target, native)) throw new Error("OMP native controller changed within host generation");
+        await verifyOmpHerdr(native, this.runner);
+      }
       if (action === "host-register") atomicJson(join(this.config.stateDir, "hosts", `${lane.key}.pid.json`), { pid: args.pid, instance: args.instance });
+      if (action === "host-event" && args.event?.method === "runtime/failure") {
+        const params = args.event.params, native = args.runtime.omp?.target as OmpTarget | undefined;
+        if (args.runtime.kind !== "omp" || !native || lane.role === "lead" || !object(args.event) || !exactKeys(args.event, ["method", "params"]) ||
+          !object(params) || !exactKeys(params, ["runtime", "streamId", "sessionId", "sessionFile", "laneKey", "failure"]) || params.runtime !== "omp" ||
+          params.sessionId !== native.sessionId || params.sessionFile !== native.sessionFile || params.laneKey !== lane.key || typeof params.streamId !== "string" ||
+          !validateFailureRecord(params.failure, params.streamId)) throw new Error("Invalid OMP terminal failure identity");
+        const failure = params.failure;
+        // Keep raw native errors out of every service store. A digest detects a
+        // changed duplicate without retaining arbitrary upstream metadata.
+        const eventDigest = payloadHash(JSON.stringify([params.sessionId, params.sessionFile, params.laneKey, params.streamId,
+          failure.sequence, failure.failureId, failure.sourceInstanceId, failure.sourceGeneration, failure.executionId, failure.phase, failure.category, failure.observedAt]));
+        this.putFailure({ id: `omp-failure:${lane.key}:${params.streamId}:${failure.sequence}`, target: lane.key,
+          turnId: failure.failureId, source: params.streamId, state: "queued", at: failure.observedAt,
+          text: JSON.stringify({ runtime: "omp", phase: failure.phase, category: failure.category, guidance: ompFailureGuidance(failure.category), eventDigest }) });
+        return { accepted: true };
+      }
       await this.registry.update(lane.key, l => ({ ...l,
         ...(args.runtime.held && !l.dispatchBlocked ? { dispatchBlocked: true, holdReason: "recovery" as const } : {}),
         runtime: { ...args.runtime as RuntimeRef, lastHeartbeatAt: new Date().toISOString() } }));
@@ -781,7 +908,7 @@ export class DoriService {
       if (action === "host-event" && args.event?.method === "runtime/disconnected" && lane.role !== "lead") {
         this.putInbox({ id: `runtime-failed:${lane.key}:${args.instance}`, target: "lead", text: `Runtime failed for ${lane.key}. Inspect status and reconcile unknown operations before recover.`, state: "queued", at: new Date().toISOString() });
       }
-      if (action === "host-event" && args.event?.method === "turn/completed" && args.event.params?.turn?.status === "failed") {
+      if (lane.runtime.kind === "codex" && action === "host-event" && args.event?.method === "turn/completed" && args.event.params?.turn?.status === "failed") {
         const turnId = args.event.params.turn.id;
         if (typeof turnId !== "string" || !turnId || (args.event.params.threadId && args.event.params.threadId !== lane.runtime.threadId)) throw new Error("Invalid failed turn identity");
         this.putFailure({ id: `failed-turn:${lane.key}:${args.instance}:${turnId}`, target: lane.key, turnId, source: args.instance,
@@ -818,6 +945,37 @@ export class DoriService {
       return this.workQueue.run(args.id, async () => ({ workThresholdSec, work: await timers.stop(args.id) }));
     }
     if (action === "status") return key ? this.publicLane(await this.lane(key)) : Promise.all((await this.registry.list()).map(lane => this.publicLane(lane)));
+    if (action === "input-status") {
+      if (caller.role !== "lead" || caller.key !== "lead" || !caller.instance || key !== "lead") throw new Error("Input receipt lookup requires the current scoped lead capability");
+      if (typeof args.text !== "string" || !args.text || typeof args.operationId !== "string" || !args.operationId) throw new Error("text and operationId required");
+      return this.dispatchQueue.run(key, async () => {
+        const lane = await this.lane(key), runtime = lane.runtime;
+        const assertCurrent = (current: Lane) => {
+          if (!runtime?.omp || current.runtime?.kind !== "omp" || current.runtime.backend !== "external-current-session" ||
+            current.runtime.hostInstanceId !== caller.instance || current.runtime.hostInstanceId !== runtime.hostInstanceId || current.runtime.generation !== runtime.generation ||
+            current.runtime.state === "stopped" || current.runtime.external?.detachedAt || current.runtime.omp?.detachedAt || !current.runtime.omp ||
+            !sameOmpTarget(current.runtime.omp.target, runtime.omp.target) || current.cleanupFence || this.pendingHandoff()) throw new Error("OMP receipt attachment changed or unavailable");
+        };
+        assertCurrent(lane);
+        const row = this.inbox.get(args.operationId);
+        if (!row) return { status: "missing", operationId: args.operationId };
+        if (row.target !== key || row.text !== args.text || row.attachmentInstance !== caller.instance || this.attachment(lane).excludedInboxIds.includes(row.id)) throw new Error("Input receipt payload or attachment mismatch");
+        const provenance = row.ompProvenance;
+        if (provenance && (provenance.attachmentInstanceId !== caller.instance || provenance.attachmentGeneration !== runtime!.generation || !sameOmpTarget(provenance.target, runtime!.omp!.target))) throw new Error("Input receipt provenance mismatch");
+        if (row.state === "queued") return { status: "queued", operationId: row.id };
+        if (!provenance) throw new Error("Input receipt native provenance missing");
+        const captured = JSON.stringify(row);
+        const result = await callOmp(provenance.target, "operation", { operationId: row.id, text: row.text }, this.config, this.runner);
+        return withBindingFence(this.config.stateDir, async () => {
+          assertCurrent(await this.lane(key));
+          if (JSON.stringify(this.inbox.get(row.id)) !== captured) throw new Error("Input receipt changed during reconciliation");
+          if (result.status !== "received" || !validReceipt(result.receipt, provenance.target, row.id, payloadHash(row.text))) return { status: "unknown", operationId: row.id };
+          const receipt = { turnId: result.receipt.receiptId, receiptKind: "omp-session-entry" as const, receipt: result.receipt };
+          this.inbox.mark(row.id, { state: "sent", ...receipt });
+          return { status: "received", operationId: row.id, ...receipt };
+        });
+      });
+    }
     if (action === "can-launch") return canLaunch(await sampleHost(this.runner), this.config.guard);
     if (action === "launch") {
       if (key === "lead" || args.role === "lead") throw new Error("Iyen lead must attach to the current session; use lead-attach");
@@ -863,7 +1021,7 @@ export class DoriService {
       if (mail.state === "unknown" || mail.state === "sending") throw new Error("Delivery unknown; reconcile before retry");
       if (mail.state === "sent") {
         if (!mail.turnId) throw new Error("Missing turn receipt");
-        return { turnId: mail.turnId };
+        return { turnId: mail.turnId, ...(mail.receiptKind ? { receiptKind: mail.receiptKind, receipt: mail.receipt } : {}) };
       }
       if (lane.dispatchBlocked) return { queued: true, operationId: mail.id };
       if (lane.runtime?.backend === "external-current-session") {
@@ -902,6 +1060,35 @@ export class DoriService {
       if (caller.role !== "admin" || !["sent", "queued"].includes(args.state) || !args.evidence) throw new Error("Explicit reconciliation evidence required");
       const box = args.box === "inbox" ? this.inbox : args.box === "outbox" ? this.outbox : undefined;
       if (!box || box.get(args.id)?.state !== "unknown") throw new Error("Only unknown mail can be reconciled");
+      const row = box.get(args.id)!;
+      const lane = await this.registry.read(row.target);
+      if (box === this.inbox && (row.ompProvenance || lane?.runtime?.kind === "omp" || this.config.runtime.kind === "omp")) {
+        if (lane?.runtime?.kind !== "omp") throw new Error("OMP current native attachment missing; delivery remains unknown");
+        const epoch = lane.runtime.hostInstanceId, generation = lane.runtime.generation;
+        if (args.state !== "sent") throw new Error("OMP uncertain delivery cannot be replayed");
+        const provenance = row.ompProvenance;
+        if (!provenance || !provenance.target || row.attachmentInstance !== provenance.attachmentInstanceId || !Number.isSafeInteger(provenance.attachmentGeneration) || provenance.attachmentGeneration < 1) throw new Error("OMP native operation provenance missing; delivery remains unknown");
+        const target = provenance.target;
+        const assertCurrent = (current: Lane): void => {
+          const runtime = current.runtime;
+          if (runtime?.kind !== "omp" || runtime.hostInstanceId !== epoch || runtime.generation !== generation || runtime.state === "stopped" || runtime.external?.detachedAt || runtime.omp?.detachedAt || statusOf(current) === "closed" || !runtime.omp || !sameOmpTarget(runtime.omp.target, target) || current.cleanupFence || current.key === "lead" && this.pendingHandoff()) throw new Error("OMP attachment detached, pending or changed during reconciliation");
+          if (runtime.backend === "external-current-session" && (provenance.attachmentInstanceId !== epoch || provenance.attachmentGeneration !== generation)) throw new Error("OMP borrowed receipt belongs to a previous attachment");
+          if (target.laneKey !== current.key || target.role !== (runtime.backend === "external-current-session" ? "attached-lead" : "managed-lane")) throw new Error("OMP provenance lane mismatch");
+        };
+        assertCurrent(lane);
+        const capturedRow = JSON.stringify(row);
+        // Query the originally recorded native controller, even after a host-only
+        // epoch rotation. No submission or alternate target is permitted here.
+        const op = await callOmp(target, "operation", { operationId: row.id, text: row.text }, this.config, this.runner);
+        if (op.status !== "received" || !validReceipt(op.receipt, target, row.id, payloadHash(row.text))) throw new Error("OMP exact durable receipt unavailable; delivery remains unknown");
+        return withBindingFence(this.config.stateDir, async () => {
+          const current = await this.lane(row.target);
+          assertCurrent(current);
+          const latest = box.get(row.id);
+          if (!latest || latest.state !== "unknown" || JSON.stringify(latest) !== capturedRow) throw new Error("OMP mail changed during reconciliation");
+          return box.mark(row.id, { state: "sent", turnId: op.receipt.receiptId, receiptKind: "omp-session-entry", receipt: op.receipt });
+        });
+      }
       return box.mark(args.id, { state: args.state, source: `reconciled: ${args.evidence}` });
     }
     if (action === "reopen" || action === "recover") {
@@ -936,11 +1123,23 @@ export class DoriService {
           if ((await this.runner(argv)).code !== 0) throw new Error("Cannot restore owned worktree; inspect repository");
         }
         if (action === "reopen") lane = await this.registry.update(key, l => withStatus(l, "working", "Reopened", new Date().toISOString(), { cycle: (l.cycle ?? 1) + 1, closedAt: undefined, claim: undefined, objection: undefined, cleanupFence: undefined, dispatchBlocked: false, holdReason: undefined }));
-        const workspace = workspaceForRole(this.config, lane.role);
-        const created = await this.runner(["herdr", "tab", "create", ...(workspace ? ["--workspace", workspace] : []), "--cwd", lane.cwd ?? this.config.defaultCwd, "--label", key, "--no-focus"]);
-        if (created.code !== 0) throw new Error("Cannot create recovery tab");
-        const made = JSON.parse(created.out).result;
-        lane = await this.registry.update(key, l => ({ ...l, pane: made.root_pane.pane_id, tab: made.tab_id ?? made.root_pane.tab_id }));
+        let reconnectOmp = false;
+        if (!args.newSession && lane.runtime?.kind === "omp" && lane.runtime.omp) {
+          const native = lane.runtime.omp.target;
+          if (native.paneId !== lane.pane || native.cwd !== realpathSync(lane.cwd!)) throw new Error("OMP recovery native pane/cwd mismatch");
+          try {
+            await verifyOmpHerdr(native, this.runner);
+            const controller = await connectOmp(native, { timeoutMs: this.config.runtime.rpcTimeoutMs });
+            try { await controller.inspect(); reconnectOmp = true; } finally { controller.close(); }
+          } catch { /* boot must prove prior process exit before any session resume */ }
+        }
+        if (!reconnectOmp) {
+          const workspace = workspaceForRole(this.config, lane.role);
+          const created = await this.runner(["herdr", "tab", "create", ...(workspace ? ["--workspace", workspace] : []), "--cwd", lane.cwd ?? this.config.defaultCwd, "--label", key, "--no-focus"]);
+          if (created.code !== 0) throw new Error("Cannot create recovery tab");
+          const made = JSON.parse(created.out).result;
+          lane = await this.registry.update(key, l => ({ ...l, pane: made.root_pane.pane_id, tab: made.tab_id ?? made.root_pane.tab_id }));
+        }
         await this.boot(lane);
         const text = args.text ?? (!lane.runtime?.threadId ? await Bun.file(lane.brief).text() : undefined);
         if (text) this.putInbox({ id: args.operationId ?? `handoff:${key}:${lane.cycle ?? 1}`, target: key, text, state: "queued", at: new Date().toISOString() });
@@ -969,8 +1168,9 @@ export class DoriService {
         if (this.failures.get(failure.id)?.state !== "queued") return;
         const lane = await this.lane(failure.target);
         if (failure.attachmentInstance && (lane.runtime?.backend !== "external-current-session" || lane.runtime.hostInstanceId !== failure.attachmentInstance)) return;
-        const metadata = JSON.parse(failure.text) as ReturnType<typeof turnFailure>;
-        const text = `Codex task failed (${metadata.category}). ${metadata.guidance} The task was not automatically retried.`;
+        const metadata = JSON.parse(failure.text) as ReturnType<typeof turnFailure> & { runtime?: string; phase?: string };
+        const label = metadata.runtime === "omp" ? `OMP ${metadata.phase === "compaction" ? "compaction" : "model"}` : "Codex task";
+        const text = `${label} failed (${metadata.category}). ${metadata.guidance} The task was not automatically retried.`;
         if (lane.role !== "lead") {
           this.putInbox({ id: `notice:${failure.id}`, target: "lead", attachmentInstance: (failure as OwnedFailure).leadIntakeInstance ?? UNOWNED_LEAD, thread: lane.thread, text: `Lane ${lane.key}: ${text}`, state: "queued", at: failure.at });
         } else {

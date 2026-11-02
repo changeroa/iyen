@@ -7,8 +7,9 @@ export type Hooks = { readonly threadReply?: ArgvTemplate; readonly threadDone?:
 export type GuardThresholds = { readonly loadAlert: number; readonly loadOk: number; readonly memFreeMinPct: number; readonly diskFreeMinGb: number; readonly panesMax: number };
 export type RoleConfig = { model: string | null; effort: string | null };
 export type RuntimeConfig = {
-  kind: "codex"; binary: string; externalBinary?: string; requiredVersion: string; startupTimeoutMs: number; rpcTimeoutMs: number;
+  kind: "codex" | "omp"; binary: string; externalBinary?: string; requiredVersion: string; startupTimeoutMs: number; rpcTimeoutMs: number;
   settingsHome?: string;
+  omp?: { registryDir: string; extensionPath: string; provider: string; approvalMode: "always-ask" | "always-ask-cached" | "yolo" };
   heartbeatIntervalMs: number; heartbeatTimeoutMs: number;
   sandbox: "read-only" | "workspace-write" | "danger-full-access";
   approvalPolicy: "untrusted" | "on-request" | "never";
@@ -44,7 +45,15 @@ export const parseConfig = (raw: Record<string, any>, home = homedir()): DoriCon
   const cfg: DoriConfig = { ...base, ...raw, runtime: { ...base.runtime, ...raw.runtime, roles: {
     lead: { ...base.runtime.roles.lead, ...raw.runtime?.roles?.lead }, lane: { ...base.runtime.roles.lane, ...raw.runtime?.roles?.lane },
   } }, guard: { ...base.guard, ...raw.guard }, hooks: { ...base.hooks, ...raw.hooks } };
-  if (cfg.runtime.kind !== "codex" || !cfg.runtime.binary || !/^\d+\.\d+\.\d+$/.test(cfg.runtime.requiredVersion)) throw new Error("A pinned Codex runtime is required");
+  if (!["codex", "omp"].includes(cfg.runtime.kind) || !cfg.runtime.binary || !/^\d+\.\d+\.\d+$/.test(cfg.runtime.requiredVersion)) throw new Error("A pinned runtime is required");
+  if (cfg.runtime.kind === "omp") {
+    const omp = cfg.runtime.omp;
+    if (typeof raw.runtime?.binary !== "string" || !raw.runtime.binary.startsWith("/") || !raw.runtime?.requiredVersion) throw new Error("OMP requires an explicitly pinned binary and version");
+    if (!omp || ![omp.registryDir, omp.extensionPath].every(p => typeof p === "string" && p.startsWith("/")) || !omp.provider || !["always-ask", "always-ask-cached", "yolo"].includes(omp.approvalMode)) throw new Error("OMP requires explicit registryDir, extensionPath, provider and approvalMode");
+    if (raw.runtime?.sandbox !== "danger-full-access") throw new Error("OMP does not implement the Codex OS sandbox; explicitly configure danger-full-access for an isolated OMP profile");
+    if (!cfg.runtime.settingsHome || !cfg.runtime.settingsHome.startsWith("/") || [resolve(home, ".omp"), resolve(home, ".omp", "agent"), resolve(home, ".codex")].includes(resolve(cfg.runtime.settingsHome))) throw new Error("OMP requires an explicit isolated settingsHome (PI_CODING_AGENT_DIR)");
+    if (!raw.stateDir || resolve(expandHome(process.env.DORI_STATE_DIR ?? raw.stateDir, home)) === resolve(base.stateDir)) throw new Error("OMP requires an explicit isolated stateDir");
+  }
   if (cfg.runtime.externalBinary !== undefined && (typeof cfg.runtime.externalBinary !== "string" || !cfg.runtime.externalBinary.trim())) throw new Error("externalBinary must be a nonempty executable path or command");
   if (cfg.runtime.settingsHome !== undefined && (typeof cfg.runtime.settingsHome !== "string" || !cfg.runtime.settingsHome)) throw new Error("settingsHome must be a directory path");
   if (cfg.leadWorkspace !== undefined && typeof cfg.leadWorkspace !== "string") throw new Error("leadWorkspace must be a string");
@@ -53,8 +62,8 @@ export const parseConfig = (raw: Record<string, any>, home = homedir()): DoriCon
   for (const [key, value] of Object.entries(cfg.runtime)) if (key.endsWith("Ms") && (!Number.isFinite(value) || Number(value) <= 0)) throw new Error(`Invalid ${key}`);
   if (cfg.runtime.heartbeatTimeoutMs <= cfg.runtime.heartbeatIntervalMs) throw new Error("heartbeat timeout must exceed interval");
   for (const role of Object.values(cfg.runtime.roles)) {
-    if (role.model !== null && (typeof role.model !== "string" || !role.model || role.model.includes("/"))) throw new Error("Use a Codex model ID, not a provider/model route");
-    if (role.effort !== null && !["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(role.effort)) throw new Error("Invalid reasoning effort");
+    if (role.model !== null && (typeof role.model !== "string" || !role.model || (cfg.runtime.kind === "codex" && role.model.includes("/")))) throw new Error("Use a Codex model ID, not a provider/model route");
+    if (role.effort !== null && !(cfg.runtime.kind === "omp" ? ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"] : ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]).includes(role.effort)) throw new Error("Invalid reasoning effort");
   }
   for (const n of [cfg.nudgeAfterMin, cfg.postAfterMin, cfg.closeAfterMin, cfg.heavySlots, cfg.heavyMaxLoad]) if (!Number.isFinite(n) || n <= 0) throw new Error("Intervals and limits must be positive");
   if (!Number.isFinite(cfg.workThresholdSec) || cfg.workThresholdSec <= 0) throw new TypeError("workThresholdSec must be a positive number");

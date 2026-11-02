@@ -59,6 +59,49 @@ class ActivationTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True), patch.object(activate.shutil, "which", return_value="/usr/bin/bun"), patch.object(activate, "command", side_effect=self.command):
             return activate.activate(self.args)
 
+    def omp_context(self):
+        self.args.runtime = "omp"
+        session_file = self.config.parent / "session.jsonl"
+        session_file.write_text("{}\n")
+        self.args.session_file = str(session_file)
+        self.args.terminal_id = "term_omp"
+        self.config.write_text('{"runtime":{"kind":"omp"}}')
+        self.agent = {"agent": "omp", "pane_id": PANE, "terminal_id": "term_omp",
+                      "agent_session": {"agent": "omp", "kind": "path", "source": "herdr:omp", "value": str(session_file)}}
+        self.lead["runtime"].update({"kind": "omp", "omp": {"target": {
+            "sessionId": SESSION, "sessionFile": str(session_file), "paneId": PANE, "terminalId": "term_omp"}}})
+
+    def test_omp_requires_exact_native_metadata_and_explicit_profile(self):
+        self.args.runtime = "omp"
+        with self.assertRaisesRegex(activate.ActivationError, "session-file"):
+            self.run_helper()
+        self.assertEqual(self.calls, [])
+        self.omp_context()
+        result = self.run_helper()
+        self.assertEqual(result["runtime"], "omp")
+        self.assertEqual(result["terminal_id"], "term_omp")
+        self.assertIn("--session-file", self.calls[2][0])
+        self.assertIn("--terminal-id", self.calls[2][0])
+
+    def test_omp_wrong_terminal_or_service_native_metadata_rejects(self):
+        self.omp_context()
+        self.args.terminal_id = "wrong"
+        with self.assertRaisesRegex(activate.ActivationError, "exactly one"):
+            self.run_helper()
+        self.assertEqual(len(self.calls), 2)
+        self.calls.clear()
+        self.args.terminal_id = "term_omp"
+        self.lead["runtime"]["omp"]["target"]["sessionFile"] = "/wrong"
+        with self.assertRaisesRegex(activate.ActivationError, "native session metadata"):
+            self.run_helper()
+
+    def test_omp_cannot_attach_using_codex_config(self):
+        self.omp_context()
+        self.config.write_text("{}")
+        with self.assertRaisesRegex(activate.ActivationError, "OMP service profile"):
+            self.run_helper()
+        self.assertEqual(len(self.calls), 1)
+
     def test_activation_uses_current_source_and_scoped_bridge_without_spawning(self):
         result = self.run_helper()
         self.assertEqual(result["status"], "active")
