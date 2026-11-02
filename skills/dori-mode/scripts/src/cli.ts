@@ -24,6 +24,7 @@ const help = `dori — messenger lead and lanes (Codex default, explicit OMP pro
   lead-handoff --from-thread-id UUID --thread-id UUID --pane ID --cwd DIR --operation-id ID (--mail-id ID ... | --no-mail)
   launch KEY --title T --brief FILE --done SIGNALS [--thread REF] [--cwd DIR] [--model M] [--worktree]
   input KEY --text-file FILE [--operation-id ID]
+  input-status lead --text-file FILE --operation-id ID
   report KEY --kind milestone|blocker|question|done --text-file FILE --event-id ID
   reply --thread REF --text-file FILE [--operation-id ID]
   claim-done [KEY] --evidence TEXT
@@ -49,7 +50,7 @@ const scopedInvocation = ["DORI_CONTEXT", "DORI_LANE_KEY", "DORI_LANE_TOKEN"].so
 // Scoped executables are service clients, never entrypoints to local lifecycle,
 // migration or messenger utilities. Apply this gate before any local handler,
 // even when the context is missing, malformed or already revoked.
-const scopedCommands = new Set(["", "help", "status", "health", "can-launch", "launch", "adopt", "input", "reply", "report", "claim-done", "object-done", "pause", "resume", "close", "reopen", "recover", "sync", "approval", "mail", "work", "lead-detach", "watch", "freshness", "dead-panes", "guard", "mcp-server"]);
+const scopedCommands = new Set(["", "help", "status", "health", "can-launch", "launch", "adopt", "input", "input-status", "reply", "report", "claim-done", "object-done", "pause", "resume", "close", "reopen", "recover", "sync", "approval", "mail", "work", "lead-detach", "watch", "freshness", "dead-panes", "guard", "mcp-server"]);
 const scopedHelp = `iyen — scoped service commands
 
   help | status [key] | health | can-launch
@@ -70,7 +71,7 @@ Service authorization applies to every operation. Attached lead lifecycle uses l
 Unknown deliveries are never automatically replayed.`;
 const flags = parseArgs({ args: rest, allowPositionals: true, strict: true, options: Object.fromEntries([
   ...["title", "brief", "done", "thread", "model", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "from-thread-id", "session-file", "terminal-id", "response-file", "state-dir", "handoff-file", "key", "box", "state"].map(k => [k, { type: "string" }]),
-  ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help", "new-session", "no-mail"].map(k => [k, { type: "boolean" }]),
+  ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help", "new-session", "no-mail", "json"].map(k => [k, { type: "boolean" }]),
   ["mail-id", { type: "string", multiple: true }],
   ["reason", { type: "string", multiple: true }],
   ["tag", { type: "string", multiple: true }],
@@ -138,6 +139,7 @@ try {
     case "launch": case "adopt":
       result = await call(command, { key, title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), cwd: opt("cwd"), model: opt("model"), worktree: Boolean(values.worktree), operationId, pane: opt("pane"), threadId: opt("thread-id"), transferConfirmed: Boolean(values["transfer-confirmed"]) }); break;
     case "input": case "reply": result = await call(command, { key, text, thread: opt("thread"), operationId }); break;
+    case "input-status": result = await call(command, { key, text, operationId: need("operation-id") }); break;
     case "report": result = await call(command, { key, text, kind: need("kind"), eventId: need("event-id") }); break;
     case "claim-done": result = await call(command, { key, evidence: need("evidence") }); break;
     case "object-done": result = await call(command, { key, reasons: values.reason }); break;

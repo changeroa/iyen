@@ -105,6 +105,84 @@ test("unknown OMP mail survives restart and only exact read-only operation recei
     received = true; expect(await s.handle("mail-resolve", { box: "inbox", id: "lost", state: "sent", evidence: "receipt" }, { role: "admin" })).toMatchObject({ state: "sent", receiptKind: "omp-session-entry" }); expect(inputs).toBe(1);
   } finally { x.f.cleanup(); }
 });
+test("scoped receipt lookup reconciles a lost native ACK while busy without submitting again", async () => {
+  let inputs = 0, received = false;
+  const x = await setup((method, p) => {
+    if (method === "input") { inputs++; throw new Error("lost native ACK"); }
+    if (method === "operation") return received ? { status: "received", receipt: receipt(x.f, p.operationId, "original") } : { status: "absent" };
+    throw new Error("Unexpected mutation");
+  });
+  try {
+    const attached = await x.s.handle("lead-activate", x.args, { role: "admin" });
+    const caller = { role: "lead" as const, key: "lead", instance: attached.lead.runtime.hostInstanceId };
+    const args = { key: "lead", text: "original", operationId: "lost-native" };
+    expect(await x.s.handle("input-status", args, caller)).toEqual({ status: "missing", operationId: args.operationId });
+    await expect(x.s.handle("input", args, caller)).rejects.toThrow();
+    const restarted = new DoriService(x.config, x.runner);
+    expect(await restarted.handle("input-status", args, caller)).toEqual({ status: "unknown", operationId: args.operationId });
+    x.f.snapshot.state = "running"; received = true;
+    expect(await restarted.handle("input-status", args, caller)).toMatchObject({ status: "received", receiptKind: "omp-session-entry", receipt: receipt(x.f, args.operationId, args.text) });
+    expect(await restarted.handle("input-status", args, caller)).toMatchObject({ status: "received" });
+    expect(inputs).toBe(1);
+    await expect(restarted.handle("input-status", { ...args, text: "changed" }, caller)).rejects.toThrow("mismatch");
+    await expect(restarted.handle("input-status", args, { role: "lane", key: "worker" })).rejects.toThrow("capability");
+    await restarted.handle("lead-detach", { threadId: x.args.threadId }, caller);
+    await expect(restarted.handle("input-status", args, caller)).rejects.toThrow();
+  } finally { x.f.cleanup(); }
+});
+test("scoped queued receipt lookup does not start input and native held or unavailable input is not ready", async () => {
+  let mutations = 0;
+  const x = await setup(() => { mutations++; throw new Error("No native input permitted"); });
+  try {
+    const attached = await x.s.handle("lead-activate", x.args, { role: "admin" });
+    const caller = { role: "lead" as const, key: "lead", instance: attached.lead.runtime.hostInstanceId };
+    const args = { key: "lead", text: "queued", operationId: "queued-native" };
+    expect((await x.s.handle("status", { key: "lead" }, caller)).inputReady).toBe(true);
+    x.f.snapshot.held = true;
+    expect(await x.s.handle("status", { key: "lead" }, caller)).toMatchObject({ inputReady: false, readiness: "busy" });
+    x.f.snapshot.held = false; x.f.snapshot.capabilities.input = false;
+    expect((await x.s.handle("status", { key: "lead" }, caller)).inputReady).toBe(false);
+    x.f.snapshot.capabilities.input = true; x.f.snapshot.goal = { status: "paused", objective: "saved goal", tokenBudget: null };
+    expect((await x.s.handle("status", { key: "lead" }, caller)).inputReady).toBe(false);
+    await x.s.registry.update("lead", lane => ({ ...lane, dispatchBlocked: true }));
+    expect(await x.s.handle("input", args, caller)).toMatchObject({ queued: true });
+    expect(await x.s.handle("input-status", args, caller)).toEqual({ status: "queued", operationId: args.operationId });
+    expect(mutations).toBe(0);
+  } finally { x.f.cleanup(); }
+});
+test("activated bridge exposes JSON receipt lookup through its real scoped CLI", async () => {
+  let inputs = 0;
+  const x = await setup((method, p) => {
+    if (method === "input") { inputs++; return { receipt: receipt(x.f, p.operationId, p.text) }; }
+    if (method === "operation") return { status: "received", receipt: receipt(x.f, p.operationId, "bridge message") };
+    throw new Error("Unexpected mutation");
+  });
+  const { serviceSocket } = await import("../src/ipc.ts");
+  atomicJson(join(x.config.stateDir, "control.json"), { token: "fixture-admin" });
+  const server = Bun.serve({ unix: serviceSocket(x.config.stateDir), async fetch(request) {
+    try {
+      const caller = await x.s.authorize(request.headers.get("authorization")!.replace("Bearer ", ""));
+      const { action, args } = await request.json() as any;
+      return Response.json({ result: await x.s.handle(action, args, caller) });
+    } catch (error) { return Response.json({ error: (error as Error).message }, { status: 409 }); }
+  } });
+  try {
+    const attached = await x.s.handle("lead-activate", x.args, { role: "admin" });
+    const textFile = join(x.f.directory, "message.txt"); await Bun.write(textFile, "bridge message");
+    const call = async (...args: string[]) => {
+      const child = Bun.spawn([attached.bridge, ...args, "--json"], { stdout: "pipe", stderr: "pipe" });
+      const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      if (code) throw new Error(err);
+      return JSON.parse(out);
+    };
+    expect(await call("status", "lead")).toMatchObject({ identityVerified: true, inputReady: true, bridge: attached.bridge });
+    const args = ["lead", "--text-file", textFile, "--operation-id", "bridge-receipt"];
+    expect(await call("input-status", ...args)).toMatchObject({ status: "missing" });
+    expect(await call("input", ...args)).toMatchObject({ receiptKind: "omp-session-entry" });
+    expect(await call("input-status", ...args)).toMatchObject({ status: "received", receiptKind: "omp-session-entry" });
+    expect(inputs).toBe(1);
+  } finally { server.stop(true); x.f.cleanup(); }
+});
 test("managed service pause is not blocked behind pending input receipt", async () => {
   const f = ompFixture(), config = profile(f.directory), s = new DoriService(config, association(f));
   let done!: (v: unknown) => void, started!: () => void, held = false; const inputStarted = new Promise<void>(r => { started = r; }); const instance = "host-instance";

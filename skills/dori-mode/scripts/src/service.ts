@@ -557,9 +557,12 @@ export class DoriService {
     const current = await this.lane(lane.key);
     const stillAttached = !current.runtime?.external?.detachedAt && current.runtime?.state !== "stopped";
     const identityVerified = Boolean(snap) && stillAttached && current.runtime?.hostInstanceId === lane.runtime.hostInstanceId;
+    const inputReady = identityVerified && !current.dispatchBlocked && !this.pendingHandoff() &&
+      !this.inbox.list().some(row => row.target === lane.key && row.attachmentInstance === current.runtime?.hostInstanceId && ["sending", "unknown"].includes(row.state)) &&
+      (current.runtime?.kind === "omp" ? snap?.inputReady === true : snap?.state === "idle");
     return { ...current, mode: "external-current-session", bridge: current.runtime?.external?.bridge, identityVerified,
       verifiedIdentity: identityVerified ? { threadId: current.runtime?.threadId, pane: current.pane, cwd: current.cwd, model: current.runtime?.model, effort: current.runtime?.effort } : null,
-      readiness: !stillAttached ? "detached" : !identityVerified || current.dispatchBlocked ? "held" : snap?.state === "idle" ? "ready" : "busy" };
+      inputReady, readiness: !stillAttached ? "detached" : !identityVerified || current.dispatchBlocked ? "held" : inputReady ? "ready" : "busy" };
   }
   private async assertPriorTuiGone(source: Attachment, target: Pick<HandoffArgs, "threadId" | "pane" | "sessionFile">): Promise<void> {
     const unknown = () => new Error("Prior lead TUI ownership is unverified; inspect Herdr and retry activation, or use explicit lead-handoff");
@@ -926,6 +929,37 @@ export class DoriService {
       return this.workQueue.run(args.id, async () => ({ workThresholdSec, work: await timers.stop(args.id) }));
     }
     if (action === "status") return key ? this.publicLane(await this.lane(key)) : Promise.all((await this.registry.list()).map(lane => this.publicLane(lane)));
+    if (action === "input-status") {
+      if (caller.role !== "lead" || caller.key !== "lead" || !caller.instance || key !== "lead") throw new Error("Input receipt lookup requires the current scoped lead capability");
+      if (typeof args.text !== "string" || !args.text || typeof args.operationId !== "string" || !args.operationId) throw new Error("text and operationId required");
+      return this.dispatchQueue.run(key, async () => {
+        const lane = await this.lane(key), runtime = lane.runtime;
+        const assertCurrent = (current: Lane) => {
+          if (!runtime?.omp || current.runtime?.kind !== "omp" || current.runtime.backend !== "external-current-session" ||
+            current.runtime.hostInstanceId !== caller.instance || current.runtime.hostInstanceId !== runtime.hostInstanceId || current.runtime.generation !== runtime.generation ||
+            current.runtime.state === "stopped" || current.runtime.external?.detachedAt || current.runtime.omp?.detachedAt || !current.runtime.omp ||
+            !sameOmpTarget(current.runtime.omp.target, runtime.omp.target) || current.cleanupFence || this.pendingHandoff()) throw new Error("OMP receipt attachment changed or unavailable");
+        };
+        assertCurrent(lane);
+        const row = this.inbox.get(args.operationId);
+        if (!row) return { status: "missing", operationId: args.operationId };
+        if (row.target !== key || row.text !== args.text || row.attachmentInstance !== caller.instance || this.attachment(lane).excludedInboxIds.includes(row.id)) throw new Error("Input receipt payload or attachment mismatch");
+        const provenance = row.ompProvenance;
+        if (provenance && (provenance.attachmentInstanceId !== caller.instance || provenance.attachmentGeneration !== runtime!.generation || !sameOmpTarget(provenance.target, runtime!.omp!.target))) throw new Error("Input receipt provenance mismatch");
+        if (row.state === "queued") return { status: "queued", operationId: row.id };
+        if (!provenance) throw new Error("Input receipt native provenance missing");
+        const captured = JSON.stringify(row);
+        const result = await callOmp(provenance.target, "operation", { operationId: row.id, text: row.text }, this.config, this.runner);
+        return withBindingFence(this.config.stateDir, async () => {
+          assertCurrent(await this.lane(key));
+          if (JSON.stringify(this.inbox.get(row.id)) !== captured) throw new Error("Input receipt changed during reconciliation");
+          if (result.status !== "received" || !validReceipt(result.receipt, provenance.target, row.id, payloadHash(row.text))) return { status: "unknown", operationId: row.id };
+          const receipt = { turnId: result.receipt.receiptId, receiptKind: "omp-session-entry" as const, receipt: result.receipt };
+          this.inbox.mark(row.id, { state: "sent", ...receipt });
+          return { status: "received", operationId: row.id, ...receipt };
+        });
+      });
+    }
     if (action === "can-launch") return canLaunch(await sampleHost(this.runner), this.config.guard);
     if (action === "launch") {
       if (key === "lead" || args.role === "lead") throw new Error("Iyen lead must attach to the current session; use lead-attach");

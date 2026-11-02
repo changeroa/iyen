@@ -55,7 +55,8 @@ export const prepareOmpHostSocket = async (stateDir: string, boot: Pick<Bootstra
   }
   atomicJson(ownerPath, { pid: process.pid, instance: boot.instance, generation: boot.generation });
 };
-export const ompSnapshot = (snap: OmpSnapshot): RuntimeSnapshot => ({ threadId: snap.identity.sessionId, state: snap.state, activeTurnId: snap.activeRunId, goal: snap.goal });
+export const ompSnapshot = (snap: OmpSnapshot): RuntimeSnapshot => ({ threadId: snap.identity.sessionId, state: snap.state, activeTurnId: snap.activeRunId, goal: snap.goal,
+  held: snap.held, inputReady: !snap.held && snap.goal?.status !== "paused" && snap.state === "idle" && snap.capabilities.input && snap.capabilities.durableReceipts });
 export const ompVersionMatches = (output: string, version: string): boolean => output.trim() === version || output.trim() === `omp ${version}`;
 export const discoverOmpSafe = async (dir: string): Promise<OmpTarget[]> => {
   try { return await discoverOmp(dir); }
