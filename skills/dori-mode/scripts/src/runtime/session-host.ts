@@ -7,6 +7,7 @@ import type { DoriConfig } from "../config.ts";
 import { atomicJson, SerialQueue } from "../journal.ts";
 import { hostSocket, ipc, readJson, serviceSocket, socketDir } from "../ipc.ts";
 import { run } from "../run.ts";
+import { runOmpSessionHost } from "./omp-integration.ts";
 import { safeEnvironment } from "./codex.ts";
 import { HerdrSession } from "./herdr.ts";
 import { quoteForPane } from "../launch.ts";
@@ -63,6 +64,7 @@ export const startSessionHost = (stateDir: string, key: string): void => {
 export const runSessionHost = async (stateDir: string, key: string): Promise<void> => {
   const boot = readJson<Bootstrap>(bootstrapPath(stateDir, key)), config = boot.config;
   if (key === "lead" || boot.role === "lead") throw new Error("Iyen lead must attach to the current session; use lead-attach");
+  if (config.runtime.kind === "omp") return runOmpSessionHost(stateDir, boot);
   const socket = hostSocket(stateDir, key), endpoint = backendSocket(stateDir, key);
   if (existsSync(socket)) {
     try { await ipc(socket, boot.hostToken, "inspect", {}, 1000); throw new Error("An existing session-host still owns this thread"); }

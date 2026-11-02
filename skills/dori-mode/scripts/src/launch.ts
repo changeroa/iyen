@@ -14,7 +14,7 @@ export const validateLaunch = async (deps: FlowDeps, input: LaunchInput): Promis
   if (!LANE_KEY.test(input.key)) throw new LaunchError("Invalid lane key");
   if (await deps.registry.read(input.key)) throw new LaunchError(`lane ${input.key} already exists`);
   const errors = doneSyntaxErrors(input.done); if (errors.length) throw new LaunchError(`Done line is not checkable: ${errors.join("; ")}`);
-  if (input.model?.includes("/")) throw new LaunchError("Use a Codex model ID");
+  if (deps.config.runtime.kind === "codex" && input.model?.includes("/")) throw new LaunchError("Use a Codex model ID");
 };
 export const footer = (lane: Lane): string => `\n## Dori lane contract\nKey: ${lane.key}\nThread: ${lane.thread}\nDone = ${lane.done}\nUse dori report ${lane.key} --kind milestone --text-file PATH --event-id ID at milestones.\nUse dori claim-done ${lane.key} --evidence TEXT when complete, then stay idle. Dori verifies evidence and closes after five minutes without an objection. Do not delete worktrees or spawn unregistered agents.\n`;
 export const launchLane = async (deps: FlowDeps, input: LaunchInput, boot: (lane: Lane) => Promise<void>): Promise<{ lane: Lane; startup: string }> => {
@@ -38,7 +38,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, boot: (lane
   }
   const brief = join(deps.config.stateDir, "briefs", `${input.key}.md`);
   let lane: Lane = { key: input.key, title: input.title, thread: input.thread ?? "none", role: input.role ?? "lane", brief, done: input.done, cwd, repository: original, baseSha, worktrees,
-    model: input.model, status: "working", cycle: 1, openedAt: iso(deps.clock), runtime: { kind: "codex", state: "starting", hostInstanceId: "", generation: 0, binaryVersion: deps.config.runtime.requiredVersion } };
+    model: input.model, status: "working", cycle: 1, openedAt: iso(deps.clock), runtime: { kind: deps.config.runtime.kind, state: "starting", hostInstanceId: "", generation: 0, binaryVersion: deps.config.runtime.requiredVersion } };
   mkdirSync(join(deps.config.stateDir, "briefs"), { recursive: true, mode: 0o700 });
   await Bun.write(brief, briefText + (lane.role === "lead" ? "" : footer(lane)));
   await deps.registry.write(lane);

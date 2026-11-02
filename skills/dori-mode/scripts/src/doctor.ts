@@ -1,9 +1,40 @@
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import type { DoriConfig } from "./config.ts";
 import { run } from "./run.ts";
+import { connectOmp } from "./runtime/omp/client.ts";
+import { discoverOmpSafe, ompVersionMatches, verifyOmpHerdr } from "./runtime/omp-integration.ts";
 import { startCodex } from "./runtime/codex.ts";
 export const doctor = async (config: DoriConfig): Promise<{ ok: boolean; checks: { name: string; ok: boolean; detail: string }[] }> => {
   const checks: { name: string; ok: boolean; detail: string }[] = [];
+  if (config.runtime.kind === "omp") {
+    const binary = await run([config.runtime.binary, "--version"], { timeoutMs: 10000 });
+    checks.push({ name: "omp", ok: binary.code === 0 && ompVersionMatches(binary.out, config.runtime.requiredVersion), detail: `requires ${config.runtime.requiredVersion}` });
+    const bun = (process.versions.bun ?? "0.0.0").split(".").map(Number);
+    checks.push({ name: "bun", ok: bun[0]! > 1 || bun[0] === 1 && (bun[1]! > 4 || bun[1] === 4 && bun[2]! >= 4), detail: `running ${process.versions.bun ?? "unavailable"}; OMP requires tested Bun >=1.4.4` });
+    const omp = config.runtime.omp;
+    checks.push({ name: "policy", ok: config.runtime.sandbox === "danger-full-access" && !!omp?.approvalMode, detail: "OMP has no Codex OS sandbox; explicit approvalMode and isolated unsandboxed profile required" });
+    checks.push({ name: "extension", ok: !!omp && existsSync(omp.extensionPath), detail: "Explicit Iyen control extension must be loaded in the existing TUI; no automatic injection" });
+    try {
+      const st = lstatSync(omp!.registryDir);
+      checks.push({ name: "registry", ok: st.isDirectory() && !st.isSymbolicLink() && st.uid === process.getuid?.() && (st.mode & 0o077) === 0, detail: "private owner-only controller registry" });
+      const targets = await discoverOmpSafe(omp!.registryDir);
+      checks.push({ name: "controllers", ok: targets.length > 0, detail: targets.length ? `${targets.length} descriptors; each authenticated below` : "No controller; explicitly load extension in main OMP TUI with IYEN_OMP_REGISTRY_DIR" });
+      for (const target of targets) {
+        let c;
+        try {
+          await verifyOmpHerdr(target); c = await connectOmp(target, { timeoutMs: config.runtime.rpcTimeoutMs });
+          const snap = await c.inspect(), managed = target.role === "managed-lane";
+          const selected = config.runtime.roles[managed ? "lane" : "lead"];
+          checks.push({ name: `${target.laneKey}:identity`, ok: target.runtimeVersion === config.runtime.requiredVersion, detail: "authenticated native session/file/pane/terminal/generation" });
+          checks.push({ name: `${target.laneKey}:receipts`, ok: snap.capabilities.durableReceipts && snap.capabilities.input, detail: "durable transcript receipt storage" });
+          checks.push({ name: `${target.laneKey}:model`, ok: !managed || snap.provider === omp!.provider && snap.model === selected.model && snap.effort === selected.effort, detail: `${snap.provider}/${snap.model}; effort ${snap.effort ?? "unavailable"}` });
+          checks.push({ name: `${target.laneKey}:control`, ok: !managed || snap.capabilities.hold && snap.capabilities.release && snap.capabilities.stop, detail: managed ? "managed hold/release/stop capability" : "borrowed lead inspect/input only; detach does not stop TUI" });
+        } catch { checks.push({ name: `${target.laneKey}:controller`, ok: false, detail: "Exact live OMP identity/capabilities unavailable" }); }
+        finally { c?.close(); }
+      }
+    } catch { checks.push({ name: "registry", ok: false, detail: "Registry missing or unsafe; explicitly configure/load the control extension" }); }
+    return { ok: checks.every(c => c.ok), checks };
+  }
   for (const [name, argv] of [["codex", [config.runtime.binary, "--version"]], ["herdr", ["herdr", "--version"]], ["git", ["git", "--version"]], ["gh", ["gh", "--version"]]] as const) {
     const result = await run(argv, { timeoutMs: 10000 });
     checks.push({ name, ok: result.code === 0 && (name !== "codex" || result.out === `codex-cli ${config.runtime.requiredVersion}`), detail: name === "codex" ? `requires ${config.runtime.requiredVersion}` : result.code === 0 ? "available" : "unavailable" });

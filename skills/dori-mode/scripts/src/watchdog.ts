@@ -7,14 +7,18 @@ import { serviceClient } from "./ipc.ts";
 import { readStartupHealth } from "./health.ts";
 import { statusOf, type Lane } from "./registry.ts";
 import { run, type Runner } from "./run.ts";
-import { observeExternal, sharedDaemon, THREAD_UUID, type Attachment } from "./runtime/external-current-session.ts";
+import { observeExternal, sharedDaemon, THREAD_UUID, type Attachment as CodexAttachment } from "./runtime/external-current-session.ts";
+import { connectOmp } from "./runtime/omp/client.ts";
+import { sameIdentity, identityOf, type OmpTarget, type OmpIdentity } from "./runtime/omp/contract.ts";
+import { verifyOmpHerdr } from "./runtime/omp-integration.ts";
 import { operationText } from "./runtime/herdr.ts";
 import { acquireFileFence, withBindingFence, runBindingCommand } from "./binding-fence.ts";
 import { receipt, readThread, readLoadedThreads, readOptionalGoal, readTurns } from "./runtime/observer.ts";
 
 const read = <T>(path: string): T | null => { try { return JSON.parse(readFileSync(path, "utf8")); } catch { return null; } };
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
-export type TargetBinding = Pick<Attachment, "instance" | "generation" | "pane" | "threadId" | "cwd" | "socketPath">;
+type Attachment = CodexAttachment & { omp?: OmpTarget };
+export type TargetBinding = Pick<Attachment, "instance" | "generation" | "pane" | "threadId" | "cwd" | "socketPath"> & { native?: OmpIdentity };
 export type WatchTarget = { binding: TargetBinding; attachment: Attachment; lane: Lane; deliberateHold: boolean; handoffPending: boolean };
 // Never construct Registry/Mailbox here: their recovery writes service-owned state.
 const readWatchLane = (dir: string): Lane | null => {
@@ -48,7 +52,8 @@ export const readWatchTarget = (dir: string): WatchTarget | null => {
       !/^[\w:.-]{1,100}$/.test(a.pane) || typeof a.cwd !== "string" || !a.cwd.startsWith("/") || typeof a.socketPath !== "string" || !a.socketPath.startsWith("/") ||
       a.instance !== r.hostInstanceId || a.generation !== r.generation || a.threadId !== r.threadId || a.pane !== lane.pane || a.cwd !== lane.cwd || a.socketPath !== ext.socketPath ||
       a.binary !== ext.binary || a.binaryVersion !== r.binaryVersion || ext.rebind || !Array.isArray(a.excludedInboxIds)) return null;
-    return { attachment: a, lane, binding: { instance: a.instance, generation: a.generation, pane: a.pane, threadId: a.threadId, cwd: a.cwd, socketPath: a.socketPath },
+    if (r.kind === "omp" && (!a.omp || !r.omp || !sameIdentity(a.omp, r.omp.target) || r.omp.attachmentInstanceId !== a.instance || r.omp.attachmentGeneration !== a.generation)) return null;
+    return { attachment: a, lane, binding: { instance: a.instance, generation: a.generation, pane: a.pane, threadId: a.threadId, cwd: a.cwd, socketPath: a.socketPath, ...(a.omp ? { native: identityOf(a.omp) } : {}) },
       deliberateHold: Boolean((lane.dispatchBlocked || r.held) && lane.holdReason !== "recovery") || ["owner-pause", "done-review"].includes(lane.holdReason ?? "") || ["paused", "done-claimed", "verified-done", "closed"].includes(statusOf(lane)),
       handoffPending: existsSync(join(dir, "attachments/handoff.json")) };
   } catch { return null; }
@@ -160,6 +165,35 @@ export class DeliveryWatchdog {
       const deadline = setTimeout(stopped, Math.max(100, timeoutMs * 6));
       const runner: Runner = (argv, opts) => (this.opts.runner ?? run)(argv, { ...opts, timeoutMs, signal: controller.signal });
       const runtime = { ...this.config.runtime, rpcTimeoutMs: timeoutMs };
+      if (target.lane.runtime?.kind === "omp") {
+        try {
+          const native = target.attachment.omp;
+          if (!native || !valid()) return state;
+          await verifyOmpHerdr(native, runner);
+          const c = await connectOmp(native, { timeoutMs });
+          try {
+            const snap = await c.inspect();
+            if (!valid() || snap.goal?.status === "paused" || snap.held || !["idle", "running"].includes(snap.state) || !snap.capabilities.input || !snap.capabilities.durableReceipts) return state;
+            const op = await c.operation(incident.id, incident.text);
+            if (op.status === "received" && valid()) { incident.notification = "sent"; incident.turnId = op.receipt.receiptId; atomicJson(statePath(dir), state); return state; }
+            if (incident.notification === "unknown" || op.status !== "absent" || controller.signal.aborted) return state;
+            let delivery: Promise<Awaited<ReturnType<typeof c.input>>> | undefined;
+            await withBindingFence(dir, async () => {
+              if (!valid() || controller.signal.aborted) return;
+              incident.notification = "unknown"; atomicJson(statePath(dir), state);
+              delivery = c.input(incident.text, incident.id);
+              // Receipt waiting cannot hold the shared Iyen mutation fence.
+              void delivery.catch(() => {});
+            }, controller.signal);
+            if (delivery) {
+              const result = await delivery;
+              if (valid()) { incident.notification = "sent"; incident.turnId = result.receipt.receiptId; atomicJson(statePath(dir), state); }
+            }
+          } finally { c.close(); }
+        } catch { /* OMP uncertainties stay unknown, never enter Codex observation or fallback transport. */ }
+        finally { clearTimeout(deadline); this.opts.signal?.removeEventListener("abort", stopped); }
+        return state;
+      }
       try { await (this.opts.observe ?? observeExternal)(runner, runtime, target.attachment, async observer => {
         const cancel = () => observer.close(); controller.signal.addEventListener("abort", cancel, { once: true });
         if (controller.signal.aborted) { observer.close(); return; }

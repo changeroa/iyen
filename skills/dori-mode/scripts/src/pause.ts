@@ -13,7 +13,7 @@ export const pauseLane = async (deps: FlowDeps, lane: Lane, note: string): Promi
   try {
     // Persist intent before interrupting; a restart must retain what explicit resume owes.
     const snapshot = await deps.runtime.inspect(lane.key);
-    if (snapshot.state === "running" && snapshot.activeTurnId && !snapshot.goal) {
+    if (lane.runtime?.kind !== "omp" && snapshot.state === "running" && snapshot.activeTurnId && !snapshot.goal) {
       await deps.registry.update(lane.key, current => ({ ...current, pausedContinuation: current.pausedContinuation ?? {
         id: `owner-resume:${lane.key}:${crypto.randomUUID()}`, interruptedTurnId: snapshot.activeTurnId!, at: new Date(deps.clock.now()).toISOString(),
       } }));
@@ -31,7 +31,7 @@ export const resumeLane = async (deps: FlowDeps, lane: Lane, note: string): Prom
     if (statusOf(lane) === "done-claimed") await deps.runtime.hold(lane.key, "automatic");
     else {
       const released = await deps.runtime.release(lane.key, "user");
-      if (statusOf(lane) === "paused" && lane.pausedContinuation && !released.goal) {
+      if (lane.runtime?.kind !== "omp" && statusOf(lane) === "paused" && lane.pausedContinuation && !released.goal) {
         if (!deps.queueInput) throw new Error("Durable continuation queue unavailable");
         // Queue before clearing the dispatch barrier. The inbox owns receipts and
         // unknown outcomes; neither a crash nor a repeated resume replays the task.

@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { installWatchdog } from "./watchdog-install.ts";
 import { runWatchdog } from "./watchdog.ts";
 import { readStartupHealth } from "./health.ts";
-const help = `dori — Codex-only messenger lead and lanes
+const help = `dori — messenger lead and lanes (Codex default, explicit OMP profiles)
 
   doctor | serve | status [key] | health | paths
   watchdog once|loop|status|install [--apply]
@@ -41,6 +41,7 @@ const help = `dori — Codex-only messenger lead and lanes
   send slack|telegram|discord --to TARGET --text TEXT [--thread ID] [--edit ID]
   presence slack|discord | transcribe FILE | inbound slack [--loop MIN]
 
+OMP activation/handoff additionally requires --session-file PATH --terminal-id ID and an explicit OMP profile.
 Always start dori serve before lifecycle commands. Operations with unknown delivery are not replayed.
 Use --operation-id to repeat a request safely; status/mail list show durable outcomes.`;
 const [command = "", ...rest] = process.argv.slice(2);
@@ -68,7 +69,7 @@ const scopedHelp = `iyen — scoped service commands
 Service authorization applies to every operation. Attached lead lifecycle uses lead-detach.
 Unknown deliveries are never automatically replayed.`;
 const flags = parseArgs({ args: rest, allowPositionals: true, strict: true, options: Object.fromEntries([
-  ...["title", "brief", "done", "thread", "model", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "from-thread-id", "response-file", "state-dir", "handoff-file", "key", "box", "state"].map(k => [k, { type: "string" }]),
+  ...["title", "brief", "done", "thread", "model", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "from-thread-id", "session-file", "terminal-id", "response-file", "state-dir", "handoff-file", "key", "box", "state"].map(k => [k, { type: "string" }]),
   ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help", "new-session", "no-mail"].map(k => [k, { type: "boolean" }]),
   ["mail-id", { type: "string", multiple: true }],
   ["reason", { type: "string", multiple: true }],
@@ -117,14 +118,14 @@ try {
   const operationId = opt("operation-id") ?? crypto.randomUUID();
   let result: any;
   switch (command) {
-    case "lead-activate": result = await call(command, { threadId: need("thread-id"), pane: need("pane"), cwd: need("cwd") }); break;
-    case "lead": case "lead-attach": result = await call("lead-attach", { threadId: need("thread-id"), pane: need("pane"), cwd: need("cwd") }); break;
+    case "lead-activate": result = await call(command, { threadId: need("thread-id"), pane: need("pane"), cwd: need("cwd"), sessionFile: opt("session-file"), terminalId: opt("terminal-id") }); break;
+    case "lead": case "lead-attach": result = await call("lead-attach", { threadId: need("thread-id"), pane: need("pane"), cwd: need("cwd"), sessionFile: opt("session-file"), terminalId: opt("terminal-id") }); break;
     case "lead-detach": result = await call(command, { threadId: need("thread-id") }); break;
     case "lead-handoff-preview": case "lead-handoff": {
       const mailIds = values["mail-id"] as string[] | undefined;
       if (values["no-mail"] && mailIds?.length) throw new Error("Choose --mail-id or --no-mail, not both");
       if (command === "lead-handoff" && !mailIds?.length && !values["no-mail"]) throw new Error("Explicit --mail-id selections or --no-mail required");
-      result = await call(command, { fromThreadId: need("from-thread-id"), threadId: need("thread-id"), pane: need("pane"), cwd: need("cwd"),
+      result = await call(command, { fromThreadId: need("from-thread-id"), threadId: need("thread-id"), pane: need("pane"), cwd: need("cwd"), sessionFile: opt("session-file"), terminalId: opt("terminal-id"),
         ...(command === "lead-handoff" ? { operationId: need("operation-id"), mailIds: mailIds ?? [] } : mailIds ? { mailIds } : {}) });
       break;
     }

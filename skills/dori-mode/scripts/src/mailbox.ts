@@ -4,7 +4,8 @@ import { atomicJson, SerialQueue } from "./journal.ts";
 import { readJson } from "./ipc.ts";
 import { fill, type ArgvTemplate } from "./config.ts";
 import type { Runner } from "./run.ts";
-export type Mail = { id: string; target: string; text: string; state: "queued" | "sending" | "sent" | "unknown"; turnId?: string; thread?: string; source?: string; at: string; attachmentInstance?: string };
+import type { OmpReceipt } from "./runtime/omp/contract.ts";
+export type Mail = { id: string; target: string; text: string; state: "queued" | "sending" | "sent" | "unknown"; turnId?: string; receiptKind?: "omp-session-entry"; receipt?: OmpReceipt; thread?: string; source?: string; at: string; attachmentInstance?: string };
 // Only a pre-submission refusal can return mail to queued. Any attempted send
 // remains unknown until reconciled, even if the transport reports failure.
 export class DeliveryDeferred extends Error {}

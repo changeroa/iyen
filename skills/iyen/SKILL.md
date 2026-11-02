@@ -206,3 +206,72 @@ python3 /absolute/path/to/iyen/scripts/activate.py stop --session CURRENT_UUID
 
 Stop detaches Iyen routing and revokes the bridge. It leaves this Codex conversation
 usable. Do not close the pane, stop the shared daemon, or change unrelated workers.
+
+## Explicit OMP profile
+
+Codex remains the default. OMP is an explicit opt-in with an existing isolated
+service config, separate state directory and `runtime.settingsHome` passed as
+`PI_CODING_AGENT_DIR`. Preserve installed Codex config and history. An OMP UUID
+is native OMP identity; never reuse a Codex UUID or convert its history.
+
+The current main OMP TUI must already load the Iyen control extension and publish
+into the explicitly configured private `IYEN_OMP_REGISTRY_DIR`. Missing extension
+means attachment unavailable. Do not inject into, restart, or replace the user's
+conversation to manufacture a controller. Verify the exact native UUID, canonical
+JSONL path and Herdr pane/terminal association (`herdr:omp`, path kind); focus,
+mtime and cwd alone cannot select a session.
+
+```sh
+python3 /absolute/path/to/iyen/scripts/activate.py start --runtime omp --session OMP_UUID --session-file /absolute/native-session.jsonl --pane VERIFIED_PANE --terminal-id VERIFIED_TERMINAL --config /absolute/isolated-omp/config.json
+```
+
+Use the same `--runtime omp`, `--session-file`, `--terminal-id` and explicit profile
+for status, stop and handoff. Existing same-session activation is idempotent.
+Native controller restart/switch changes identity and requires explicit
+reconciliation; a new attachment excludes old mail. Handoff keeps its stable
+operation ID and explicit selected mail rules. Stop only detaches Iyen and
+revokes its bridge; it never aborts or closes the borrowed OMP TUI or its goal.
+
+OMP has no Codex OS sandbox. Its profile must explicitly select
+`danger-full-access` and an OMP approval mode; requesting `read-only` or
+`workspace-write` fails. Scoped service controls and tool approval remain
+required and do not provide OS isolation. Managed workers expose `iyen_control`
+through the lane-scoped MCP context and cannot spawn native subagents. Managed
+hold/release requires the Iyen OMP fork’s `executionHold` capability; upstream
+18.15.0 alone is insufficient. A verified execution barrier is mandatory; unsupported
+capabilities block readiness. Reply receipts use exact durable OMP user entries,
+never Codex turn IDs. Unknown delivery stays fenced and is never replayed.
+
+Implementation validation uses isolated local fixture profiles. No production
+activation, installed service/config overwrite or real messenger posting is part
+of this migration validation.
+
+A separate profile uses these runtime fields (replace every example path):
+
+```json
+{
+  "schemaVersion": 2,
+  "stateDir": "/absolute/isolated-omp/state",
+  "runtime": {
+    "kind": "omp",
+    "binary": "/absolute/fork/omp",
+    "requiredVersion": "18.15.0",
+    "settingsHome": "/absolute/isolated-omp/agent",
+    "sandbox": "danger-full-access",
+    "roles": { "lane": { "model": "EXPLICIT_MODEL", "effort": "medium" } },
+    "omp": {
+      "registryDir": "/absolute/isolated-omp/controllers",
+      "extensionPath": "/absolute/iyen/skills/dori-mode/scripts/src/runtime/omp/extension.ts",
+      "provider": "EXPLICIT_PROVIDER",
+      "approvalMode": "always-ask"
+    }
+  }
+}
+```
+
+Run doctor using the explicit profile and a compatible Bun (tested >=1.4.4).
+Doctor reads controller evidence without sending model prompts. Missing extension,
+receipt storage or fork hold support is a blocker, not permission to replace the
+conversation or weaken policy. Managed launch establishes an allowlisted `env -i`
+environment; service/admin and messenger tokens are excluded. Auth remains in the
+explicit worker profile or the existing narrow provider environment boundary.
