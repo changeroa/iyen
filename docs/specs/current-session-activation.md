@@ -198,3 +198,17 @@ recovery command does not grant attached-lead self-restart. A safe same-session
 lead restart requires a separately authenticated, idle-fenced native shutdown
 and controlled startup/activation primitive; a PID lookup or pane typing is not
 such a primitive.
+
+When a managed OMP host is still alive but its uncertain inputs have already been
+retired or reconciled, `recover KEY --stop-current --operation-id STABLE_ID
+--text-file FILE` explicitly requests proven exit before same-session recovery.
+The service pins the lead scope, worker controller and host generation and records
+stop intent before dispatch. Uncertain stop outcomes are not resubmitted; inspect
+and reconcile the original operation instead. This cannot bypass unknown/sending
+inbox input or pending abandonment, target a borrowed lead, or create a new native
+session. Reusing the operation with changed target or continuation is rejected.
+
+Native stop intent is controller-epoch scoped. A parent-verified fresh managed
+resume with an initially open native execution barrier retains the saved owner
+hold but does not inherit the old process's stop intent. A same-process extension
+reload with a still-held barrier must retain that stop intent and refuse release.

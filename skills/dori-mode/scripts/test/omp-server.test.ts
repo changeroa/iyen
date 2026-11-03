@@ -1,12 +1,12 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
-import { mkdirSync, unlinkSync } from "node:fs";
+import { mkdirSync, unlinkSync, readFileSync, writeFileSync } from "node:fs";
 import { connectOmp } from "../src/runtime/omp/client.ts";
 import { OmpError, parseRequest, payloadHash, type OmpGoal } from "../src/runtime/omp/contract.ts";
 import { OmpControlServer, hasAsyncWork, type OmpContext, type OmpExecutionHoldState } from "../src/runtime/omp/server.ts";
 import { ompFixture } from "./fixtures/omp.ts";
 
-function harness(options: { borrowed?: boolean; nativeHold?: boolean; busy?: boolean; receipt?: boolean; timeout?: number } = {}) {
+function harness(options: { borrowed?: boolean; nativeHold?: boolean; busy?: boolean; receipt?: boolean; timeout?: number; onShutdown?: () => void } = {}) {
   const f = ompFixture(); if (options.borrowed) { f.target.role = "attached-lead"; f.identity.role = "attached-lead"; }
   let idle = !options.busy, leaf: string | null = null, goal: OmpGoal = null, pending = false, async: unknown = null;
   let core: OmpExecutionHoldState = { sessionId: f.identity.sessionId, generation: 0, status: "open" };
@@ -16,7 +16,7 @@ function harness(options: { borrowed?: boolean; nativeHold?: boolean; busy?: boo
     mode: "tui", agent: { kind: "main" }, cwd: f.directory, model: { id: "test", provider: "fixture" },
     sessionManager: { getSessionId: () => f.identity.sessionId, getSessionFile: () => f.identity.sessionFile, getLeafId: () => leaf, ensureOnDisk: async () => {} },
     isIdle: () => idle, hasPendingMessages: () => pending, getAsyncJobSnapshot: () => async, getPendingPlanReview: () => undefined,
-    abort: () => { aborts++; idle = true; }, shutdown: () => { shut++; },
+    abort: () => { aborts++; idle = true; }, shutdown: () => { shut++; options.onShutdown?.(); },
     sessionModes: { getState: () => ({ goal: goal ? { ...goal, tokenBudget: goal.tokenBudget ?? undefined } : { status: "inactive" }, loop: { status: "inactive" } }), set: async request => {
       calls.push(`goal:${request.action}`); if (goal) goal = { ...goal, status: request.action === "pause" ? "paused" : "active" }; return { ok: true, state: {} };
     } },
@@ -319,4 +319,49 @@ test("stop intent does not suppress genuine model or compaction failures", async
     const page: any = await h.dispatch("failures", { after: 0, limit: 100 });
     expect(page.records.map((record: any) => [record.phase, record.category])).toEqual([["model", "authentication"], ["compaction", "authentication"]]);
   } finally { h.cleanup(); }
+});
+
+for (const legacy of [false, true]) test(`confirmed fresh managed startup retains hold without old stop intent (legacy=${legacy})`, async () => {
+  const stopped = Promise.withResolvers<void>(), h = harness({ onShutdown: stopped.resolve });
+  let resumed: OmpControlServer | undefined;
+  try {
+    await h.dispatch("stop", { operationId: "old-process-stop" });
+    await stopped.promise;
+    expect(h.shutdowns()).toBe(1);
+    h.server.close();
+    if (legacy) {
+      const path = join(h.directory, "journal", "control.json"), saved = JSON.parse(readFileSync(path, "utf8"));
+      delete saved.controllerInstanceId;
+      writeFileSync(path, JSON.stringify(saved));
+    }
+    h.setCore({ sessionId: h.identity.sessionId, generation: 0, status: "open" });
+    const target = { ...h.target, instanceId: "fresh-native-controller", generation: h.target.generation + 1 };
+    resumed = new OmpControlServer(target, "fixture-bearer", join(h.directory, "journal"), () => h.ctx,
+      { getThinkingLevel: () => "medium", sendUserMessage: () => { throw new Error("Unexpected replay"); } }, { timeoutMs: 100, startHeld: true });
+    await resumed.listen();
+    expect(resumed.snapshot().held).toBe(true);
+    const result = await resumed.dispatch(parseRequest({ protocol: 1, id: "release-fresh", token: "fixture-bearer",
+      target: { ...h.identity, instanceId: target.instanceId, generation: target.generation }, method: "release",
+      params: { operationId: "fresh-explicit-resume", origin: "user" } })) as { held: boolean };
+    expect(result.held).toBe(false);
+    expect(h.shutdowns()).toBe(1);
+  } finally { resumed?.close(); h.cleanup(); }
+});
+
+test("extension reload in the still-held stopping native epoch cannot clear stop intent", async () => {
+  const stopped = Promise.withResolvers<void>(), h = harness({ onShutdown: stopped.resolve });
+  let reloaded: OmpControlServer | undefined;
+  try {
+    await h.dispatch("stop", { operationId: "stop-still-alive" });
+    await stopped.promise;
+    h.server.close();
+    const target = { ...h.target, instanceId: "extension-reload", generation: h.target.generation + 1 };
+    reloaded = new OmpControlServer(target, "fixture-bearer", join(h.directory, "journal"), () => h.ctx,
+      { getThinkingLevel: () => "medium", sendUserMessage: () => { throw new Error("Unexpected replay"); } }, { timeoutMs: 100, startHeld: true });
+    await reloaded.listen();
+    await expect(reloaded.dispatch(parseRequest({ protocol: 1, id: "unsafe-release", token: "fixture-bearer",
+      target: { ...h.identity, instanceId: target.instanceId, generation: target.generation }, method: "release",
+      params: { operationId: "unsafe-release", origin: "user" } }))).rejects.toThrow("shutdown intent");
+    expect(reloaded.snapshot().held).toBe(true);
+  } finally { reloaded?.close(); h.cleanup(); }
 });

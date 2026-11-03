@@ -31,6 +31,7 @@ const help = `dori — messenger lead and lanes (Codex default, explicit OMP pro
   object-done KEY --reason TEXT [--reason TEXT]
   pause KEY | resume KEY | close KEY [--note TEXT]
   recover KEY | reopen KEY [--text-file FILE] [--new-session --handoff-file FILE]
+  recover KEY --stop-current --operation-id ID [--text-file FILE] (managed OMP only)
   adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS --transfer-confirmed
   sync [--write] | can-launch | watch | freshness | dead-panes | guard
   approval list | approval respond ID --response-file FILE [--operation-id ID (required for native OMP)]
@@ -63,6 +64,7 @@ const scopedHelp = `iyen — scoped service commands
   claim-done KEY --evidence TEXT | object-done KEY --reason TEXT
   pause KEY | resume KEY | close KEY [--note TEXT]
   recover KEY | reopen KEY [--text-file FILE]
+  recover KEY --stop-current --operation-id ID [--text-file FILE] (managed OMP only)
   adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS --transfer-confirmed
   sync [--write] | approval list | mail list
   mail resolve ID --box inbox --state sent --evidence TEXT
@@ -74,7 +76,7 @@ Service authorization applies to every operation. Attached lead lifecycle uses l
 Unknown deliveries are never automatically replayed.`;
 const flags = parseArgs({ args: rest, allowPositionals: true, strict: true, options: Object.fromEntries([
   ...["title", "brief", "done", "thread", "model", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "from-thread-id", "session-file", "terminal-id", "response-file", "state-dir", "handoff-file", "key", "box", "state"].map(k => [k, { type: "string" }]),
-  ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help", "new-session", "no-mail", "json"].map(k => [k, { type: "boolean" }]),
+  ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help", "new-session", "stop-current", "no-mail", "json"].map(k => [k, { type: "boolean" }]),
   ["mail-id", { type: "string", multiple: true }],
   ["reason", { type: "string", multiple: true }],
   ["tag", { type: "string", multiple: true }],
@@ -147,7 +149,7 @@ try {
     case "claim-done": result = await call(command, { key, evidence: need("evidence") }); break;
     case "object-done": result = await call(command, { key, reasons: values.reason }); break;
     case "pause": case "resume": case "close": result = await call(command, { key, note: opt("note") }); break;
-    case "reopen": case "recover": result = await call(command, { key, text, operationId, threadId: opt("thread-id"), newSession: Boolean(values["new-session"]), handoff: opt("handoff-file") ? await Bun.file(need("handoff-file")).text() : undefined }); break;
+    case "reopen": case "recover": result = await call(command, { key, text, operationId: values["stop-current"] ? need("operation-id") : operationId, stopCurrent: Boolean(values["stop-current"]), threadId: opt("thread-id"), newSession: Boolean(values["new-session"]), handoff: opt("handoff-file") ? await Bun.file(need("handoff-file")).text() : undefined }); break;
     case "status": case "can-launch": result = await call(command, { key }); break;
     case "sync": result = await call(command, { write: Boolean(values.write) }); break;
     case "approval":
