@@ -1057,11 +1057,14 @@ export class DoriService {
     }
     if (action === "mail-list") return { inbox: this.inbox.list(), outbox: this.outbox.list(), operations: this.operations.list(), failures: this.failures.list() };
     if (action === "mail-resolve") {
-      if (caller.role !== "admin" || !["sent", "queued"].includes(args.state) || !args.evidence) throw new Error("Explicit reconciliation evidence required");
+      const scopedLead = caller.role === "lead" && caller.key === "lead" && !!caller.instance && args.box === "inbox" && args.state === "sent";
+      if ((caller.role !== "admin" && !scopedLead) || !["sent", "queued"].includes(args.state) || !args.evidence) throw new Error("Explicit reconciliation evidence required");
+      const leadScope = scopedLead ? this.attachment(await this.lane("lead")) : undefined;
       const box = args.box === "inbox" ? this.inbox : args.box === "outbox" ? this.outbox : undefined;
       if (!box || box.get(args.id)?.state !== "unknown") throw new Error("Only unknown mail can be reconciled");
       const row = box.get(args.id)!;
       const lane = await this.registry.read(row.target);
+      if (scopedLead && (lane?.runtime?.kind !== "omp" || lane.runtime.backend !== "herdr-tui" || lane.key === "lead" || lane.role === "lead")) throw new Error("Scoped reconciliation requires a managed OMP worker");
       if (box === this.inbox && (row.ompProvenance || lane?.runtime?.kind === "omp" || this.config.runtime.kind === "omp")) {
         if (lane?.runtime?.kind !== "omp") throw new Error("OMP current native attachment missing; delivery remains unknown");
         const epoch = lane.runtime.hostInstanceId, generation = lane.runtime.generation;
@@ -1082,6 +1085,10 @@ export class DoriService {
         const op = await callOmp(target, "operation", { operationId: row.id, text: row.text }, this.config, this.runner);
         if (op.status !== "received" || !validReceipt(op.receipt, target, row.id, payloadHash(row.text))) throw new Error("OMP exact durable receipt unavailable; delivery remains unknown");
         return withBindingFence(this.config.stateDir, async () => {
+          if (leadScope) {
+            const currentScope = this.attachment(await this.lane("lead"));
+            if (currentScope.instance !== leadScope.instance || currentScope.generation !== leadScope.generation || this.pendingHandoff()) throw new Error("Lead attachment changed during reconciliation");
+          }
           const current = await this.lane(row.target);
           assertCurrent(current);
           const latest = box.get(row.id);
