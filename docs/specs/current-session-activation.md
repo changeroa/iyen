@@ -175,6 +175,14 @@ Integration must run the behavioral suite, including
 verify a real owner Slack/native roundtrip. Native SDK deployment, extension
 reload and explicit activation/reconciliation belong to the integrator.
 
+Live acceptance must use a fresh ordinary owner reply, not a token command or a
+previously rejected source. Verify the conjunction: inbox delivery to the lead
+with its real native receipt; `nativeResponses` linking that same source and
+thread to an `applied` outcome in the original native request epoch; the actual
+ask tool's returned selection; and a meaningful sent reply in the original
+owner thread. A question notification, source ACK, or native tool return alone
+is not an end-to-end acceptance result. Never synthesize the owner's answer.
+
 ## Deliberate retirement of managed OMP input
 
 An authorized current attached lead or operator may retire a historical managed
