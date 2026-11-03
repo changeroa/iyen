@@ -68,12 +68,16 @@ export async function resumeUncertain(deps: FlowDeps, inbox: Mailbox, operations
   if (row.state !== "queued") snapshot = await deps.runtime.inspect(args.key);
   else {
     const before = await deps.runtime.inspect(args.key);
-    if (before.held !== true || before.state !== "idle" || before.activeTurnId || before.threadId !== intent.target.sessionId) throw new Error("Original native execution hold is not settled");
+    if (before.threadId !== intent.target.sessionId || !["idle", "running"].includes(before.state) || typeof before.held !== "boolean") throw new Error("Original native execution state is not verified");
     assertScope((await deps.registry.read(args.key))!, intent);
     assertInbox();
-    operations.mark(id, { state: "sending" });
-    try { snapshot = await release(intent); }
-    catch (error) { operations.mark(id, { state: "unknown" }); throw error; }
+    if (!before.held) snapshot = before;
+    else {
+      if (before.state !== "idle" || before.activeTurnId) throw new Error("Original native execution hold is not settled");
+      operations.mark(id, { state: "sending" });
+      try { snapshot = await release(intent); }
+      catch (error) { operations.mark(id, { state: "unknown" }); throw error; }
+    }
   }
   if (snapshot.held !== false || snapshot.threadId !== intent.target.sessionId || !["idle", "running"].includes(snapshot.state)) {
     operations.mark(id, { state: "unknown" });
