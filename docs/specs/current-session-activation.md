@@ -239,3 +239,31 @@ Native stop intent is controller-epoch scoped. A parent-verified fresh managed
 resume with an initially open native execution barrier retains the saved owner
 hold but does not inherit the old process's stop intent. A same-process extension
 reload with a still-held barrier must retain that stop intent and refuse release.
+
+## Explicit execution-only recovery with uncertain input
+
+Ordinary resume continues to reject unresolved OMP delivery. After an explicit
+owner decision, the current scoped lead may instead use:
+
+```text
+resume KEY --allow-unknown --operation-id STABLE_ID --evidence OWNER_DECISION \
+  --expected-instance ORIGINAL_HOST_ID --expected-generation ORIGINAL_GENERATION
+```
+
+This is restricted to the original registered managed native session and settled
+execution hold. Every uncertain input must retain its original controller,
+attachment generation and payload. Sending inputs, pending abandonment, a newer
+pause or a changed native scope reject recovery. Borrowed leads remain excluded.
+
+The durable control operation releases execution, not delivery uncertainty:
+original inbox rows stay unchanged and are never submitted again. Existing native
+parked input may be handled as execution continues; the owner's decision must
+cover that consequence. Lost release acknowledgement permits read-only
+observation of the same native process, never a second release request. A new
+uncertain input requires a new owner decision.
+
+Managed-lane control input is kept unattempted in the durable queue while native
+work is busy. Only idle admission submits it. This avoids turning a normal
+in-flight task's steering delay into another receipt timeout and automatic hold;
+ordinary owner conversation to the attached lead retains its existing routing.
+
