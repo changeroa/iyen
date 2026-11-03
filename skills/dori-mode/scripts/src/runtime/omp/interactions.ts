@@ -171,6 +171,12 @@ export class NativeInteractionRelay {
   }
   list(): RelayedInteraction[] { return Object.values(this.state.requests).filter(r => r.state === "open"); }
   unrouted(): readonly { key: string; request: NativeUserInteraction; reason: string }[] { return this.blocked; }
+  responseHistory() {
+    return Object.values(this.state.responses).map(operation => {
+      const row = this.state.requests[operation.token];
+      return { operation, binding: row ? { key: row.key, target: row.target, attachment: row.attachment, generation: row.generation } : undefined };
+    });
+  }
   /** The lead supplies semantics; authenticated delivered conversation supplies authority. */
   respondFromLead(token: string, response: NativeInteractionResponse, sourceMessageId: string): Promise<NativeInteractionStatus> {
     return this.queue.run("relay", async () => {
@@ -218,6 +224,7 @@ export class NativeInteractionRelay {
       if (Object.values(this.state.responses).some(op => op.token === token && ["sending", "unknown", "applied"].includes(op.state))) {
         throw new Error("Native response already attempted; reconcile without replay");
       }
+      const sourceSnapshot = structuredClone(mail);
       const current = await this.deps.call(lane, "interactions", {});
       if (!Array.isArray(current) || !current.some(r => validInteraction(r, row.target.sessionId) && isDeepStrictEqual(r, row.request))) {
         this.request({ ...row, state: "stale" }); throw new Error("Native request completed locally or changed");
@@ -228,7 +235,7 @@ export class NativeInteractionRelay {
         !currentLane || !this.matches(row, currentLane) || currentLane.dispatchBlocked || currentLane.runtime?.held || statusOf(currentLane) === "paused" ||
         !currentLead || !this.matches({ key: lead.key, target: runtime.omp.target, attachment: runtime.hostInstanceId, generation: runtime.generation }, currentLead) ||
         currentLead.dispatchBlocked || currentLead.runtime?.held || statusOf(currentLead) === "paused" ||
-        !isDeepStrictEqual(this.deps.inbox.get(mail.id), mail)) throw new Error("Native response binding changed during observation");
+        !isDeepStrictEqual(this.deps.inbox.get(mail.id), sourceSnapshot)) throw new Error("Native response binding changed during observation");
       const currentOwner = this.owner(currentLane, row.request, latest);
       if (!currentOwner || currentOwner.thread !== row.thread || currentOwner.source !== row.source || currentOwner.owner !== row.owner) {
         throw new Error("Native request owner/thread binding changed");

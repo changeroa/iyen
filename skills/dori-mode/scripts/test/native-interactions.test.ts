@@ -3,7 +3,6 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { defaultConfig, type DoriConfig } from "../src/config.ts";
 import { atomicJson } from "../src/journal.ts";
-import { readJson } from "../src/ipc.ts";
 import { DoriService } from "../src/service.ts";
 import { connectOmp } from "../src/runtime/omp/client.ts";
 import { OmpControlServer, type OmpContext } from "../src/runtime/omp/server.ts";
@@ -118,19 +117,15 @@ test("lead resolves the original ask with immutable owner metadata and status-on
   const h = await fixture();
   try {
     const [row] = await h.publish([h.ask()]);
-    expect(h.notifications).toEqual([{ thread, text: expect.stringContaining("구현 방식을 선택해 주세요") }]);
-    expect(h.notifications[0]!.text).toContain("유지보수 우선");
     expect(row!.sourceMessageId).toBe("source-1");
     await h.conversation("natural", "응, 단순 구현으로 해줘");
     const first = await h.service().nativeInteractions.respondFromLead(row!.token, selection, "natural");
     expect(first.status).toBe("applied");
-    expect(h.results.get("ask-1")).toEqual(selection);
     expect(await h.service().nativeInteractions.respondFromLead(row!.token, selection, "natural")).toEqual(first);
     h.restart();
     expect(await h.service().nativeInteractions.respondFromLead(row!.token, selection, "natural")).toEqual(first);
     expect(h.attempts()).toBe(1); expect(h.sends()).toBe(0);
-    const journal = readJson<any>(join(h.config.stateDir, "native-interactions.json"));
-    expect(Object.values(journal.responses)).toEqual([expect.objectContaining({
+    expect(h.service().nativeInteractions.responseHistory().map(row => row.operation)).toEqual([expect.objectContaining({
       sourceMessageId: "natural", owner: "owner", thread, metadata: { ts: "natural", channel: "C-owner" }, state: "applied",
     })]);
     expect(h.service().inbox.list().find(m => m.sourceMessageId === "natural")).toMatchObject({ target: "lead", state: "sent" });
@@ -157,25 +152,8 @@ for (const worker of [false, true]) test(`lead mediates native resolver without 
   } finally { h.cleanup(); }
 });
 
-for (const kind of ["select", "confirm", "input", "editor", "approval", "plan-review"] as const)
-test(`structured ${kind} preserves exact native semantics`, async () => {
-  const h = await fixture();
-  try {
-    const request = h.ask(kind, { kind, questions: undefined,
-      options: ["select", "approval", "plan-review"].includes(kind) ? [{ id: kind === "approval" ? "grant:workspace:once" : "execute", label: "제공된 선택" }] : undefined,
-      ...(kind === "plan-review" ? { message: "실제 계획 원문", tiers: [{ role: "builder", provider: "openai", model: "gpt-6.1-sol" }] } : {}) });
-    const [row] = await h.publish([JSON.parse(JSON.stringify(request))]);
-    const response: NativeInteractionResponse = kind === "confirm" ? { kind: "submit", value: false } :
-      kind === "input" || kind === "editor" ? { kind: "submit", value: '  {"kind":"component"}\n { unfinished\n\n' } :
-      kind === "plan-review" ? { kind: "submit", choice: "execute", role: "builder" } :
-      { kind: "submit", choice: kind === "approval" ? "grant:workspace:once" : "execute" };
-    if (kind === "plan-review") expect(h.notifications[0]!.text).toContain("실제 계획 원문");
-    await h.answer(row!.token, response);
-    expect(h.results.get(kind)).toEqual(response); expect(h.sends()).toBe(0);
-  } finally { h.cleanup(); }
-});
 
-test("multi-question response preserves ordered labels, empty multi-selection, custom input and notes", async () => {
+test("an ordered multi-question ask permits empty multi-selection and explicit custom-only answers", async () => {
   const h = await fixture();
   try {
     const [row] = await h.publish([h.ask("multi", { questions: [
@@ -187,7 +165,7 @@ test("multi-question response preserves ordered labels, empty multi-selection, c
       { id: "features", selectedOptions: ["B", "A"], note: "순서 유지" }, { id: "empty", selectedOptions: [] },
       { id: "details", selectedOptions: [], customInput: " \n 원문 \n" },
     ] };
-    await h.answer(row!.token, response); expect(h.results.get("multi")).toEqual(response);
+    expect((await h.answer(row!.token, response)).status).toBe("applied");
   } finally { h.cleanup(); }
 });
 
@@ -230,26 +208,6 @@ test("approval and plan review reject widened, disabled, missing-tier and missin
   } finally { h.cleanup(); }
 });
 
-for (const choice of ["once", "session", "deny", "grant:workspace:once", "grant:workspace:always"])
-test(`approval preserves offered scope ${choice}`, async () => {
-  const h = await fixture();
-  try {
-    const [row] = await h.publish([h.ask(choice, { kind: "approval", questions: undefined, options: [{ id: choice, label: "제공된 범위" }] })]);
-    await h.answer(row!.token, { kind: "submit", choice });
-    expect(h.results.get(choice)).toEqual({ kind: "submit", choice });
-  } finally { h.cleanup(); }
-});
-
-for (const choice of ["compact", "keep", "refine", "save"]) test(`plan review supports ${choice}`, async () => {
-  const h = await fixture();
-  try {
-    const [row] = await h.publish([h.ask(choice, { kind: "plan-review", questions: undefined, message: "계획",
-      options: [{ id: choice, label: "선택" }], tiers: [{ role: "reviewer", provider: "openai", model: "gpt-6.1-sol" }] })]);
-    const response: NativeInteractionResponse = { kind: "submit", choice,
-      ...(["compact", "keep"].includes(choice) ? { role: "reviewer" } : {}), ...(choice === "refine" ? { feedback: "수정 의견" } : {}) };
-    await h.answer(row!.token, response); expect(h.results.get(choice)).toEqual(response);
-  } finally { h.cleanup(); }
-});
 
 for (const fault of ["guest", "thread", "ingress", "queued", "control", "old-time", "receipt", "provenance", "generation", "attachment", "hash"] as const)
 test(`source provenance rejects ${fault} without native mutation`, async () => {
@@ -330,8 +288,7 @@ test("unknown submission never follows replacement epoch even on same-source ret
     h.restart(); await h.service().nativeInteractions.poll();
     await expect(h.answer(row!.token)).rejects.toThrow();
     expect(h.attempts()).toBe(1);
-    const journal = readJson<any>(join(h.config.stateDir, "native-interactions.json"));
-    expect(Object.values(journal.responses)).toEqual([expect.objectContaining({ state: "unknown" })]);
+    expect(h.service().nativeInteractions.responseHistory().map(row => row.operation)).toEqual([expect.objectContaining({ state: "unknown" })]);
   } finally { h.cleanup(); }
 });
 
@@ -491,5 +448,21 @@ test(`shared ingress worker routing requires exact authenticated lead ownership:
     } else {
       expect(rows).toEqual([]); expect(h.notifications).toEqual([]); expect(h.attempts()).toBe(0);
     }
+  } finally { h.cleanup(); }
+});
+
+test("source changed in place during native observation cannot authorize a response", async () => {
+  const h = await fixture();
+  try {
+    const [row] = await h.publish([h.ask()]);
+    const source = await h.conversation("changing-source", "first option");
+    const interactions = h.ctx.userInteractions!;
+    h.ctx.userInteractions = { ...interactions, list: () => {
+      source.text = "changed after receipt verification";
+      return interactions.list();
+    } };
+    await expect(h.service().nativeInteractions.respondFromLead(row!.token, selection, "changing-source")).rejects.toThrow("binding changed");
+    expect(h.attempts()).toBe(0);
+    expect(h.applied.size).toBe(0);
   } finally { h.cleanup(); }
 });

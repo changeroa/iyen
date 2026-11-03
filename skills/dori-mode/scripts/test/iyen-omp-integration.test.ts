@@ -7,7 +7,7 @@ import { DoriService } from "../src/service.ts";
 import { hostSocket } from "../src/ipc.ts";
 import { bootstrapPath } from "../src/runtime/session-host.ts";
 import { ompManagedEnvironment, ompProfileEnvironment, ompPaneCommand, ompVersionMatches, verifyOmpHerdr, discoverOmpSafe, waitForOmpDetach, stopOmpManagedProcess } from "../src/runtime/omp-integration.ts";
-import { payloadHash } from "../src/runtime/omp/contract.ts";
+import { payloadHash, type NativeUserInteraction, type NativeInteractionStatus } from "../src/runtime/omp/contract.ts";
 import { readWatchTarget, DeliveryWatchdog } from "../src/watchdog.ts";
 import { ompFixture } from "./fixtures/omp.ts";
 import type { Runner } from "../src/run.ts";
@@ -594,5 +594,52 @@ for (const changedEpoch of [false, true]) test(`recovery stop uncertainty is dur
     await expect(x.s.handle("recover", args, caller)).rejects.toThrow();
     expect(stops).toBe(1);
     expect((await x.s.registry.read("recover-worker"))?.runtime?.threadId).toBe(target.sessionId);
+  } finally { x.f.cleanup(); }
+});
+
+test("current lead resolves native ask from a naturally delivered authenticated owner source, never an arbitrary source ID", async () => {
+  let request!: NativeUserInteraction, submissions = 0, applied: NativeInteractionStatus | undefined;
+  const x = await setup(async (method, params) => {
+    if (method === "input") return { receipt: receipt(x.f, params.operationId, params.text) };
+    if (method === "interactions") return [request];
+    if (method === "interaction-respond") {
+      submissions++;
+      applied = { status: "applied", operationId: params.operationId, requestId: request.id, responseHash: payloadHash(JSON.stringify(params.response)) };
+      return applied;
+    }
+    if (method === "interaction-response-status") return applied ?? { status: "missing", operationId: params.operationId };
+    throw new Error("Unexpected native mutation");
+  });
+  try {
+    x.config.ingress.push({ id: "owner", command: ["fixture"], owners: ["victor"] });
+    const attached = await x.s.handle("lead-activate", x.args, { role: "admin" });
+    const caller = { role: "lead" as const, key: "lead", instance: attached.lead.runtime.hostInstanceId };
+    const deliver = async (id: string, text: string, thread = "chat:original") => {
+      const event = { id, text, thread, user: "victor", metadata: { sourceMessage: id } };
+      await x.s.receive("owner", event);
+      const mail = x.s.inbox.get(`inbound:owner:${thread}:${id}`)!;
+      await x.s.deps.runtime.input("lead", mail.text, mail.id);
+      return mail.id;
+    };
+    const initiating = await deliver("owner-task", "질문해줘");
+    request = { id: "native-question", sessionId: x.f.identity.sessionId, kind: "ask", title: "Choice", createdAt: new Date(Date.now() - 1000).toISOString(),
+      sourceOperationHash: payloadHash(initiating), questions: [{ id: "choice", question: "Which one?", options: [{ label: "first" }, { label: "second" }] }] };
+    await x.s.nativeInteractions.poll();
+    const token = x.s.nativeInteractions.list()[0]!.token;
+    const response = { kind: "submit", answers: [{ id: "choice", selectedOptions: ["first"] }] };
+    await expect(x.s.handle("approval-respond", { id: token, response }, caller)).rejects.toThrow();
+    await expect(x.s.handle("approval-respond", { id: token, response, sourceMessageId: "invented-source" }, caller)).rejects.toThrow();
+    await deliver("other-thread", "1", "chat:other");
+    await expect(x.s.handle("approval-respond", { id: token, response, sourceMessageId: "other-thread" }, caller)).rejects.toThrow();
+    expect(submissions).toBe(0);
+    await deliver("natural-answer", "1");
+    const args = { id: token, response, sourceMessageId: "natural-answer" };
+    await expect(x.s.handle("approval-respond", args, { ...caller, instance: "revoked-instance" })).rejects.toThrow();
+    const result = await x.s.handle("approval-respond", args, caller);
+    expect(result).toMatchObject({ status: "applied", requestId: request.id, responseHash: payloadHash(JSON.stringify(response)) });
+    expect(await x.s.handle("approval-respond", args, caller)).toEqual(result);
+    await expect(x.s.handle("approval-respond", { ...args, response: { kind: "submit", answers: [{ id: "choice", selectedOptions: ["second"] }] } }, caller)).rejects.toThrow();
+    expect(submissions).toBe(1);
+    expect(x.s.inbox.get("inbound:owner:chat:original:natural-answer")).toMatchObject({ target: "lead", state: "sent", sourceMessageId: "natural-answer", ownerUser: "victor", metadata: { sourceMessage: "natural-answer" } });
   } finally { x.f.cleanup(); }
 });

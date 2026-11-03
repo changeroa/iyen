@@ -20,6 +20,7 @@ export const abandonManagedInput = async (
     if (!row) throw new Error("Unknown mail");
     if (deps.inbox.list().some(other => other.id !== row!.id && other.abandonment?.operationId === args.operationId)) throw new Error("Abandonment operation ID reused with different input");
     let intent = row.abandonment;
+    const resumedIntent = !!intent;
     if (intent && (intent.operationId !== args.operationId || intent.evidence !== args.evidence)) throw new Error("Abandonment operation conflicts with original intent");
     if (intent && intent.outcome !== "pending") {
       // Completed retries return the original durable result, even after recovery.
@@ -94,7 +95,10 @@ export const abandonManagedInput = async (
     });
     // Never hold/release/input, discover another controller, or infer exit from idle.
     // RuntimeControl.stop proves native PID exit AND Herdr detach, or throws.
-    await deps.runtime.stop(row.target);
+    if (!resumedIntent) await deps.runtime.stop(row.target);
+    // A persisted pending intent may already have requested native shutdown.
+    // Only the same epoch's durable exit proof can finish it; never resend stop.
+    else if ((await deps.registry.read(row.target))?.runtime?.state !== "stopped") throw new Error("Original stop outcome unconfirmed; reconcile exact-process exit without resubmitting stop");
     await assertCurrent(true);
     return deps.inbox.mark(row.id, {
       state: "abandoned", abandonment: { ...capturedIntent, outcome: "abandoned", completedAt: iso(deps.clock), processStoppedAt: iso(deps.clock) },

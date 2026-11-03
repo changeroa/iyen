@@ -35,6 +35,7 @@ const help = `dori — messenger lead and lanes (Codex default, explicit OMP pro
   adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS --transfer-confirmed
   sync [--write] | can-launch | watch | freshness | dead-panes | guard
   approval list | approval respond ID --response-file FILE [--operation-id ID (required for native OMP)]
+  approval respond ID --response-file FILE --source-message-id ID (current attached lead)
   mail list | mail resolve ID --box inbox|outbox --state queued|sent --evidence TEXT
   mail abandon ID --operation-id ID --evidence TEXT
   migrate --dry-run | migrate --apply
@@ -67,6 +68,7 @@ const scopedHelp = `iyen — scoped service commands
   recover KEY --stop-current --operation-id ID [--text-file FILE] (managed OMP only)
   adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS --transfer-confirmed
   sync [--write] | approval list | mail list
+  approval respond ID --response-file FILE --source-message-id ID
   mail resolve ID --box inbox --state sent --evidence TEXT
   mail abandon ID --operation-id ID --evidence TEXT
   work start --title T [--tag TAG ...] [--thread REF] [--operation-id UUID]
@@ -75,7 +77,7 @@ const scopedHelp = `iyen — scoped service commands
 Service authorization applies to every operation. Attached lead lifecycle uses lead-detach.
 Unknown deliveries are never automatically replayed.`;
 const flags = parseArgs({ args: rest, allowPositionals: true, strict: true, options: Object.fromEntries([
-  ...["title", "brief", "done", "thread", "model", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "from-thread-id", "session-file", "terminal-id", "response-file", "state-dir", "handoff-file", "key", "box", "state"].map(k => [k, { type: "string" }]),
+  ...["title", "brief", "done", "thread", "model", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "from-thread-id", "session-file", "terminal-id", "response-file", "source-message-id", "state-dir", "handoff-file", "key", "box", "state"].map(k => [k, { type: "string" }]),
   ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help", "new-session", "stop-current", "no-mail", "json"].map(k => [k, { type: "boolean" }]),
   ["mail-id", { type: "string", multiple: true }],
   ["reason", { type: "string", multiple: true }],
@@ -153,7 +155,7 @@ try {
     case "status": case "can-launch": result = await call(command, { key }); break;
     case "sync": result = await call(command, { write: Boolean(values.write) }); break;
     case "approval":
-      result = key === "list" ? await call("approval-list") : key === "respond" ? await call("approval-respond", { id: flags.positionals[1], response: await Bun.file(need("response-file")).json(), operationId: opt("operation-id") }) : (() => { throw new Error("approval list|respond required"); })(); break;
+      result = key === "list" ? await call("approval-list") : key === "respond" ? await call("approval-respond", { id: flags.positionals[1], response: await Bun.file(need("response-file")).json(), operationId: opt("operation-id"), sourceMessageId: opt("source-message-id") }) : (() => { throw new Error("approval list|respond required"); })(); break;
     case "mail":
       result = key === "list" ? await call("mail-list") :
         key === "abandon" ? await call("mail-abandon", { id: flags.positionals[1], operationId: need("operation-id"), evidence: need("evidence") }) :

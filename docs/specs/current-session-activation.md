@@ -109,35 +109,39 @@ must all match. Other threads, old epochs, missing receipts or multiple owners i
 that thread do not qualify. Historical records without owner identity are not
 backfilled by guessing: a fresh authenticated owner message supplies the binding.
 
-Slack notices retain the actual native question, plan, labels, option IDs,
-descriptions and execution tiers, with Korean instructions and a stable
-`iyen-…` token. Reply using `답변 TOKEN RESPONSE`. A single ask accepts an exact
-label or displayed number (numeric text always means the displayed index), or
-`직접:<TEXT>`; every character after the colon, including whitespace, is preserved.
-Multi-question/multi-select replies use the advertised native JSON response with
-all ordered question IDs; an empty multi-selection is valid. Confirm uses
-`true`/`false`; input/editor preserve raw text, ordinary JSON and incomplete code,
-or accept an explicit native submit/cancel JSON envelope. Select/approval use exact
-offered IDs. Plan review supports execute/compact/keep/refine/save; approval requires
-an explicit offered role when tiers are shown, and feedback applies only to refine.
-Remote approval/save authorizes exactly the advertised plan snapshot, never a newer
-local draft. Remote execution gets a separate durable plan reference and does not
-overwrite newer draft edits. Dismiss/reopen a review to advertise a new revision.
-Disabled choices are rejected. Approval never treats a generic
-“yes” as permission or widens an offered grant. Cancellation is `답변 TOKEN 취소`.
-Secret dialogs expose only a redacted local-required notice and reject all
-remote responses.
+Slack notices retain the actual native question, plan, labels, descriptions and
+execution tiers. Owners reply normally in the original thread: a number, “yes”,
+a correction, prose or multiple answers. No token, JSON envelope or prescribed
+command syntax is required. The ingress service does not interpret these messages
+or select a pending question; every new authenticated owner message reaches the
+lead with its original source ID, thread and metadata.
 
-All native answers require the advertised token. Bare selections receive a
-clarification, not an inferred answer. Guests, quoted tokens, cross-thread
-responses, obsolete epochs and locally completed/expired requests cannot resolve
-a dialog. Ordinary conversation remains lead-only, including conversation in a
-worker report thread; validated native answers are control traffic.
-Malformed or stale authenticated native answers are recorded as handled control
-and receive thread feedback, rather than restarting the ingress producer. Replayed
-or edited source IDs cannot become a fresh answer when a later question opens.
-Native owner/operator answers cannot cross a paused/held or dispatch-blocked lane.
-Resume/reconcile first, then send a fresh answer; a rejected old source is not replayed.
+The lead interprets the conversation and chooses the exact pending native request
+and structural answer. Ask answers preserve ordered question IDs and selected
+labels/custom input; select and approval use offered choice IDs; confirm uses a
+boolean; input/editor preserve the owner's intended text. Plan review preserves
+the offered choice, role and feedback. The lead asks conversationally only when
+the intended question or decision is genuinely ambiguous. Quoted/forwarded guest
+content does not grant authority, and ordinary discussion is not an approval.
+Approval scope cannot be widened or a disabled choice selected.
+
+The current attached lead submits its interpreted response with
+`approval respond REQUEST_ID --response-file FILE --source-message-id SOURCE_ID`.
+Internal request IDs remain exact targeting metadata, not syntax the owner must
+type. The service requires a real authenticated owner source already delivered
+to the current lead, exact original thread/owner, a current native receipt and
+attachment, and an answer accepted after the question was created. Arbitrary
+source IDs, guest/cross-thread sources, stale epochs and reused source decisions
+are rejected. A source rejected by the previous parser is not retroactively
+replayed. Paused/held or dispatch-blocked requests require reconciliation first.
+
+Remote approval/save authorizes exactly the advertised plan snapshot, never a
+newer local draft. Remote execution gets a separate durable plan reference and
+does not overwrite newer draft edits. Secret dialogs remain redacted and
+local-only. Native response intent is durable before submission; repeated sources
+reconcile the original operation rather than resubmitting uncertain answers.
+Previously recorded notice text and unknown outbound outcomes remain immutable
+across a wording cutover; new notices use natural reply guidance.
 OMP lanes are not automatically nudged for periodic progress merely because they
 are idle or old. Explicit reports still follow the configured durable report path.
 The existing Codex freshness policy is unchanged.
@@ -156,6 +160,10 @@ status is queried in that same epoch; missing/pending status is not permission t
 retry. Existing durable outbox unknown outcomes are likewise never replayed.
 Native epoch replacement invalidates pending replies and requires explicit
 attachment reconciliation; it does not recover a dialog in another session.
+`mail list` exposes `nativeResponses` with the original response operation and
+exact request binding. Inspect its native outcome, source ID and controller/
+attachment epochs without reading raw service journals. A native tool return
+alone does not prove that a Slack owner supplied the answer.
 
 Existing OMP borrowed-lead observation reconciles at most one unknown input receipt
 read-only per inspection, with exact payload, controller and attachment fences.
@@ -192,6 +200,9 @@ than replaying input. Completed retirement is immutable. Outbox and borrowed-lea
 input cannot use this command. Retire any misrouted queued input before recovering
 the original managed session; recovery must not silently create a replacement
 native session or requeue retired messages.
+A retry of a pending abandonment queries the original input receipt but does
+not issue another native stop. It can finish from the same epoch's already
+durable `stopped` proof; otherwise uncertainty stays fenced for reconciliation.
 
 Borrowed-lead native `hold`, `release` and `stop` remain forbidden. This managed
 recovery command does not grant attached-lead self-restart. A safe same-session
