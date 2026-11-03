@@ -3,6 +3,8 @@ import { chmodSync, realpathSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { OMP_MAX_FRAME_BYTES, OmpError, assertIdentity, exactKeys, identityOf, markedText, object, parseRequest, payloadHash,
+  validInteraction, validInteractionStatus, assertInteractionAnswer,
+  type NativeUserInteractions, type NativeInteractionResponse, type NativeUserInteraction,
   type OmpGoal, type OmpIdentity, type OmpOperation, type OmpRequest, type OmpSnapshot, type OmpTarget } from "./contract.ts";
 import { FailureJournal, failureCategory } from "./failures.ts";
 import { OperationJournal, ReceiptPending, durableJson, persistedReceipt, privateDirectory, readPrivateJson } from "./receipts.ts";
@@ -16,6 +18,7 @@ export type OmpContext = {
   getPendingPlanReview(): unknown;
   getAsyncJobSnapshot(): unknown;
   executionHold?: OmpExecutionHold;
+  userInteractions?: NativeUserInteractions;
   sessionModes?: {
     getState(): { goal: { status: string; objective?: string; tokenBudget?: number }; loop: { status: string } };
     set(request: { mode: "goal"; action: "pause" | "resume" }): Promise<{ ok: boolean; state: unknown }>;
@@ -115,6 +118,21 @@ export class OmpControlServer {
       realpathSync(this.target.sessionFile) !== this.target.sessionFile) throw new OmpError("identity-mismatch", "OMP live identity changed; outcome unknown", true);
     return ctx;
   }
+  private interactions(ctx: OmpContext): NativeUserInteractions {
+    const native = ctx.userInteractions;
+    if (!native || typeof native.list !== "function" || typeof native.respond !== "function" || typeof native.responseStatus !== "function")
+      throw new OmpError("interactions-unavailable", "Native user interaction capability unavailable", false);
+    return native;
+  }
+  private listInteractions(ctx: OmpContext): NativeUserInteraction[] {
+    const rows = this.interactions(ctx).list();
+    if (!Array.isArray(rows) || !rows.every(row => validInteraction(row, this.target.sessionId)) || new Set(rows.map(row => row.id)).size !== rows.length)
+      throw new OmpError("invalid-interactions", "Native interaction list invalid", false);
+    // Secret dialogs are local-only. Do not expose their title, default or payload.
+    return rows.map(row => row.secret ? { id: row.id, sessionId: row.sessionId, kind: row.kind, title: "로컬에서 비밀 입력이 필요합니다", secret: true,
+      createdAt: row.createdAt, ...(row.expiresAt ? { expiresAt: row.expiresAt } : {}),
+      ...(row.sourceEntryId ? { sourceEntryId: row.sourceEntryId } : {}), ...(row.sourceOperationHash ? { sourceOperationHash: row.sourceOperationHash } : {}) } : row);
+  }
   private goal(ctx: OmpContext): OmpGoal {
     const goal = ctx.sessionModes?.getState().goal;
     if (!goal || goal.status === "inactive") return null;
@@ -127,16 +145,19 @@ export class OmpControlServer {
     try { persistedReceipt(this.identity, ctx.sessionManager.getLeafId(), "", "capability-probe"); }
     catch { durable = false; }
     const managed = this.target.role === "managed-lane", modes = ctx.sessionModes, core = this.core(ctx), barrier = !!core;
-    const waiting = this.approvals.size > 0 || !!ctx.getPendingPlanReview();
+    let interactionReady = false;
+    let dialogs: NativeUserInteraction[] = [];
+    try { dialogs = this.listInteractions(ctx); interactionReady = true; } catch { /* Never advertise unavailable/malformed native capability. */ }
+    const waiting = dialogs.some(r => r.kind === "approval" || r.kind === "plan-review") || this.approvals.size > 0 || !!ctx.getPendingPlanReview();
     const nativeHeld = managed && core?.getState().status === "held";
     const pending = (nativeHeld || this.parkedData ? hasActiveAsyncExecution(ctx.getAsyncJobSnapshot()) : ctx.hasPendingMessages() || hasAsyncWork(ctx.getAsyncJobSnapshot())) || this.continuing || this.compacting || this.retrying || this.awaitingErrorSettle;
     const idle = ctx.isIdle() && this.tools.size === 0 && !pending;
     const failureHealthy = !managed || (!!this.failures?.available && !this.failureGap);
     const failed = this.modelFailed || this.compactionFailed || !failureHealthy;
-    return { identity: this.identity, state: waiting ? "waiting_approval" : this.inputTools.size ? "waiting_input" : managed && core?.getState().status === "holding" ? "pausing" : failed ? "failed" : !this.observedSafeSettle || this.retrying || this.awaitingErrorSettle ? "recovering" : idle ? "idle" : this.state.held ? "pausing" : "running",
+    return { identity: this.identity, state: waiting ? "waiting_approval" : dialogs.length || this.inputTools.size ? "waiting_input" : managed && core?.getState().status === "holding" ? "pausing" : failed ? "failed" : !this.observedSafeSettle || this.retrying || this.awaitingErrorSettle ? "recovering" : idle ? "idle" : this.state.held ? "pausing" : "running",
       held: this.state.held || (managed && !!core && core.getState().status !== "open"), activeRunId: idle ? undefined : this.runId,
       goal: this.goal(ctx), model: ctx.model?.id ?? "", provider: ctx.model?.provider ?? "", effort: this.api.getThinkingLevel(), eventSequence: this.sequence,
-      capabilities: { inspect: true, input: durable && !failed && !this.compacting && !this.retrying && !this.awaitingErrorSettle && this.observedSafeSettle && (!managed || barrier), durableReceipts: durable, durableFailures: managed && failureHealthy, hold: managed && !!modes && barrier, release: managed && !!modes && barrier, stop: managed && !!modes && barrier, goals: !!modes } };
+      capabilities: { inspect: true, interactions: interactionReady, input: durable && !failed && !this.compacting && !this.retrying && !this.awaitingErrorSettle && this.observedSafeSettle && (!managed || barrier), durableReceipts: durable, durableFailures: managed && failureHealthy, hold: managed && !!modes && barrier, release: managed && !!modes && barrier, stop: managed && !!modes && barrier, goals: !!modes } };
   }
   get identity(): OmpIdentity { return identityOf(this.target); }
   private recordFailure(executionId: string | undefined, phase: "model" | "compaction", error: unknown): void {
@@ -221,6 +242,32 @@ export class OmpControlServer {
     assertIdentity(request.target, this.identity); this.live(); await this.options.verifyAssociation?.(); this.live();
     const p = request.params, id = p.operationId as string, digest = p.payloadHash as string;
     if (request.method === "inspect") return this.snapshot();
+    if (request.method === "interactions") return this.listInteractions(this.live());
+    if (request.method === "interaction-response-status") {
+      const result = this.interactions(this.live()).responseStatus(id);
+      if (!validInteractionStatus(result, id)) throw new OmpError("invalid-interaction-status", "Native response status invalid");
+      return result;
+    }
+    if (request.method === "interaction-respond") {
+      const native = this.interactions(this.live()), response = p.response as NativeInteractionResponse;
+      const responseHash = payloadHash(JSON.stringify(response));
+      const prior = native.responseStatus(id);
+      if (!validInteractionStatus(prior, id)) throw new OmpError("invalid-interaction-status", "Native response status invalid");
+      if (prior.status !== "missing") {
+        if (prior.requestId !== p.requestId || prior.responseHash !== responseHash) throw new OmpError("interaction-operation-conflict", "Response operation reused with different payload", false);
+        if (prior.status === "pending") throw new OmpError("interaction-pending", "Native response is pending; reconcile status", true);
+        return prior;
+      }
+      const dialog = this.listInteractions(this.live()).find(row => row.id === p.requestId);
+      if (!dialog || (dialog.expiresAt && Date.parse(dialog.expiresAt) <= Date.now())) throw new OmpError("interaction-stale", "Native request expired or completed locally", false);
+      assertInteractionAnswer(dialog, response);
+      // Native resolver owns local/remote races and idempotence; never sendUserMessage/abort.
+      const result = await native.respond(dialog.id, response, id);
+      this.live();
+      if (!validInteractionStatus(result, id) || !["applied", "stale"].includes(result.status) || result.requestId !== dialog.id || result.responseHash !== responseHash)
+        throw new OmpError("invalid-interaction-receipt", "Native response outcome unknown", true);
+      return result;
+    }
     if (request.method === "failures") {
       if (!this.failures) throw new OmpError("role-forbidden", "Borrowed OMP lead does not expose failures", false);
       return this.failures.page(p.after as number, p.limit as number);

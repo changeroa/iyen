@@ -33,7 +33,7 @@ const help = `dori — messenger lead and lanes (Codex default, explicit OMP pro
   recover KEY | reopen KEY [--text-file FILE] [--new-session --handoff-file FILE]
   adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS --transfer-confirmed
   sync [--write] | can-launch | watch | freshness | dead-panes | guard
-  approval list | approval respond ID --response-file FILE
+  approval list | approval respond ID --response-file FILE [--operation-id ID (required for native OMP)]
   mail list | mail resolve ID --box inbox|outbox --state queued|sent --evidence TEXT
   migrate --dry-run | migrate --apply
   work start --title T [--tag TAG ...] [--thread REF] [--operation-id UUID]
@@ -149,7 +149,7 @@ try {
     case "status": case "can-launch": result = await call(command, { key }); break;
     case "sync": result = await call(command, { write: Boolean(values.write) }); break;
     case "approval":
-      result = key === "list" ? await call("approval-list") : key === "respond" ? await call("approval-respond", { id: flags.positionals[1], response: await Bun.file(need("response-file")).json() }) : (() => { throw new Error("approval list|respond required"); })(); break;
+      result = key === "list" ? await call("approval-list") : key === "respond" ? await call("approval-respond", { id: flags.positionals[1], response: await Bun.file(need("response-file")).json(), operationId: opt("operation-id") }) : (() => { throw new Error("approval list|respond required"); })(); break;
     case "mail":
       result = key === "list" ? await call("mail-list") : await call("mail-resolve", { id: flags.positionals[1], box: need("box"), state: need("state"), evidence: need("evidence") }); break;
     case "watch": case "freshness": case "dead-panes": case "guard":

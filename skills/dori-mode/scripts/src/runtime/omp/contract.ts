@@ -21,18 +21,21 @@ export type OmpSnapshot = {
   identity: OmpIdentity;
   state: "starting" | "idle" | "running" | "waiting_approval" | "waiting_input" | "pausing" | "recovering" | "failed" | "stopped";
   held: boolean; activeRunId?: string; goal: OmpGoal; model: string; provider: string; effort?: string;
-  capabilities: { inspect: true; input: boolean; durableReceipts: boolean; durableFailures: boolean; hold: boolean; release: boolean; stop: boolean; goals: boolean };
+  capabilities: { inspect: true; input: boolean; durableReceipts: boolean; durableFailures: boolean; hold: boolean; release: boolean; stop: boolean; goals: boolean; interactions?: boolean };
   eventSequence: number;
 };
 export type OmpOperation = { status: "absent" }
   | { status: "reserved" | "attempted" | "unknown"; operationId: string; payloadHash: string }
   | { status: "received"; receipt: OmpReceipt };
-export type OmpMethod = "inspect" | "failures" | "input" | "operation" | "hold" | "release" | "stop";
+export type OmpMethod = "inspect" | "failures" | "input" | "operation" | "hold" | "release" | "stop" | "interactions" | "interaction-respond" | "interaction-response-status";
 export type OmpRequest = { protocol: 1; id: string; token: string; target: OmpIdentity; method: OmpMethod; params: Record<string, unknown> };
 export type OmpResponse = { protocol: 1; id: string; identity: OmpIdentity } & (
   { result: unknown; error?: never } | { error: { code: string; message: string; attempted: boolean }; result?: never });
 export type OmpController = {
   inspect(): Promise<OmpSnapshot>;
+  interactions(): Promise<NativeUserInteraction[]>;
+  interactionRespond(requestId: string, response: NativeInteractionResponse, operationId: string): Promise<NativeInteractionReceipt>;
+  interactionResponseStatus(operationId: string): Promise<NativeInteractionStatus>;
   failures(after: number, limit?: number): Promise<OmpFailurePage>;
   input(text: string, operationId: string): Promise<{ receipt: OmpReceipt }>;
   operation(operationId: string, text: string): Promise<OmpOperation>;
@@ -84,16 +87,17 @@ export function validSnapshot(value: unknown, target: OmpIdentity): value is Omp
   const goal = value.goal, caps = value.capabilities;
   return (goal === null || (object(goal) && exactKeys(goal, ["status", "objective", "tokenBudget"]) && ["active", "paused"].includes(goal.status as string) &&
     nonempty(goal.objective) && (goal.tokenBudget === null || (Number.isSafeInteger(goal.tokenBudget) && (goal.tokenBudget as number) > 0)))) &&
-    object(caps) && exactKeys(caps, ["inspect", "input", "durableReceipts", "durableFailures", "hold", "release", "stop", "goals"]) && caps.inspect === true &&
+    object(caps) && exactKeys(caps, ["inspect", "input", "durableReceipts", "durableFailures", "hold", "release", "stop", "goals"], ["interactions"]) && caps.inspect === true &&
     Object.values(caps).every(v => typeof v === "boolean");
 }
 export function parseRequest(value: unknown): OmpRequest {
   if (!object(value) || !exactKeys(value, ["protocol", "id", "token", "target", "method", "params"]) || value.protocol !== 1 ||
     !nonempty(value.id) || !nonempty(value.token) || !validIdentity(value.target) || !object(value.params) ||
-    !["inspect", "failures", "input", "operation", "hold", "release", "stop"].includes(value.method as string)) throw new OmpError("invalid-request", "Invalid OMP request", false);
+    !["inspect", "failures", "input", "operation", "hold", "release", "stop", "interactions", "interaction-respond", "interaction-response-status"].includes(value.method as string)) throw new OmpError("invalid-request", "Invalid OMP request", false);
   const p = value.params, method = value.method;
-  const fields = method === "inspect" ? [] : method === "failures" ? ["after", "limit"] : method === "input" ? ["operationId", "text", "payloadHash"] : method === "operation" ? ["operationId", "payloadHash"] : method === "stop" ? ["operationId"] : ["operationId", "origin"];
-  if (!exactKeys(p, fields) || (method !== "inspect" && method !== "failures" && !nonempty(p.operationId)) ||
+  const fields = method === "inspect" || method === "interactions" ? [] : method === "interaction-respond" ? ["operationId", "requestId", "response"] : method === "interaction-response-status" ? ["operationId"] : method === "failures" ? ["after", "limit"] : method === "input" ? ["operationId", "text", "payloadHash"] : method === "operation" ? ["operationId", "payloadHash"] : method === "stop" ? ["operationId"] : ["operationId", "origin"];
+  if (!exactKeys(p, fields) || (!["inspect", "interactions", "failures"].includes(method as string) && !nonempty(p.operationId)) ||
+    (method === "interaction-respond" && (!nonempty(p.requestId) || !validInteractionResponse(p.response))) ||
     (method === "failures" && !validFailureRequest(p.after, p.limit)) ||
     ((method === "input" || method === "operation") && !hash(p.payloadHash)) ||
     (method === "input" && (typeof p.text !== "string" || payloadHash(p.text) !== p.payloadHash)) ||
@@ -128,4 +132,101 @@ export function validateFailurePage(value: unknown, target: Pick<OmpIdentity, "s
   const count = Math.min(limit, (value.highWatermark as number) - after);
   return value.records.length === count && value.through === after + count && value.hasMore === ((value.through as number) < (value.highWatermark as number)) &&
     value.records.every((row, index) => validateFailureRecord(row, value.streamId as string, after + index + 1));
+}
+
+export type NativeUserInteraction = {
+  id: string; sessionId: string; kind: "ask" | "select" | "confirm" | "input" | "editor" | "approval" | "plan-review";
+  title: string; message?: string;
+  questions?: { id: string; question: string; header?: string; options: { label: string; description?: string; preview?: string }[]; multi?: boolean; recommended?: number }[];
+  options?: { id: string; label: string; description?: string; disabled?: boolean }[];
+  placeholder?: string; defaultValue?: string; secret?: boolean;
+  tiers?: { role: string; provider: string; model: string; thinkingLevel?: string }[];
+  sourceEntryId?: string; sourceOperationHash?: string; toolCallId?: string; createdAt: string; expiresAt?: string;
+};
+export type NativeInteractionResponse = { kind: "cancel" } | {
+  kind: "submit"; answers?: { id: string; selectedOptions: string[]; customInput?: string; note?: string }[];
+  value?: string | boolean; choice?: string; feedback?: string; role?: string;
+};
+export type NativeInteractionReceipt = { status: "applied" | "stale"; requestId: string; operationId: string; responseHash: string };
+export type NativeInteractionStatus = { status: "missing" | "pending" | "applied" | "stale"; requestId?: string; operationId: string; responseHash?: string };
+export type NativeUserInteractions = {
+  list(): NativeUserInteraction[];
+  respond(requestId: string, response: NativeInteractionResponse, operationId: string): Promise<NativeInteractionReceipt>;
+  responseStatus(operationId: string): NativeInteractionStatus;
+};
+const strings = (v: Record<string, unknown>, keys: string[]): boolean => keys.every(k => v[k] === undefined || typeof v[k] === "string");
+const unique = (values: string[]): boolean => new Set(values).size === values.length;
+export function validInteraction(value: unknown, sessionId: string): value is NativeUserInteraction {
+  if (!object(value) || !exactKeys(value, ["id", "sessionId", "kind", "title", "createdAt"],
+    ["message", "questions", "options", "placeholder", "defaultValue", "secret", "tiers", "sourceEntryId", "sourceOperationHash", "toolCallId", "expiresAt"]) ||
+    !nonempty(value.id) || value.sessionId !== sessionId || !["ask", "select", "confirm", "input", "editor", "approval", "plan-review"].includes(value.kind as string) ||
+    typeof value.title !== "string" || typeof value.createdAt !== "string" || !Number.isFinite(Date.parse(value.createdAt)) ||
+    (value.expiresAt !== undefined && (typeof value.expiresAt !== "string" || !Number.isFinite(Date.parse(value.expiresAt)))) ||
+    !strings(value, ["message", "placeholder", "defaultValue", "sourceEntryId", "toolCallId"]) ||
+    (value.sourceOperationHash !== undefined && !hash(value.sourceOperationHash)) || (value.secret !== undefined && typeof value.secret !== "boolean")) return false;
+  if (value.sourceEntryId !== undefined && !nonempty(value.sourceEntryId)) return false;
+  if (value.questions !== undefined) {
+    if (!Array.isArray(value.questions) || !value.questions.length || !value.questions.every(q => object(q) &&
+      exactKeys(q, ["id", "question", "options"], ["header", "multi", "recommended"]) && nonempty(q.id) && typeof q.question === "string" &&
+      strings(q, ["header"]) && (q.multi === undefined || typeof q.multi === "boolean") && Array.isArray(q.options) &&
+      q.options.every(o => object(o) && exactKeys(o, ["label"], ["description", "preview"]) && nonempty(o.label) && strings(o, ["description", "preview"])) &&
+      unique(q.options.map((o: { label: string }) => o.label)) &&
+      (q.recommended === undefined || (Number.isSafeInteger(q.recommended) && (q.recommended as number) >= 0 && (q.recommended as number) < q.options.length)))) return false;
+    if (!unique(value.questions.map(q => q.id))) return false;
+  }
+  if (value.options !== undefined && (!Array.isArray(value.options) || !value.options.every(o => object(o) &&
+    exactKeys(o, ["id", "label"], ["description", "disabled"]) && nonempty(o.id) && typeof o.label === "string" && strings(o, ["description"]) &&
+    (o.disabled === undefined || typeof o.disabled === "boolean")) || !unique(value.options.map(o => o.id)))) return false;
+  if (value.tiers !== undefined && (!Array.isArray(value.tiers) || !value.tiers.every(t => object(t) &&
+    exactKeys(t, ["role", "provider", "model"], ["thinkingLevel"]) && nonempty(t.role) && nonempty(t.provider) && nonempty(t.model) && strings(t, ["thinkingLevel"])) ||
+    !unique(value.tiers.map(t => t.role)))) return false;
+  return (value.secret === true || value.kind !== "ask" || Array.isArray(value.questions)) &&
+    (value.secret === true || !["select", "approval", "plan-review"].includes(value.kind as string) || (Array.isArray(value.options) && value.options.length > 0));
+}
+export function validInteractionResponse(value: unknown): value is NativeInteractionResponse {
+  if (!object(value)) return false;
+  if (value.kind === "cancel") return exactKeys(value, ["kind"]);
+  return value.kind === "submit" && exactKeys(value, ["kind"], ["answers", "value", "choice", "feedback", "role"]) &&
+    strings(value, ["choice", "feedback", "role"]) && (value.value === undefined || typeof value.value === "string" || typeof value.value === "boolean") &&
+    (value.answers === undefined || (Array.isArray(value.answers) && value.answers.every(a => object(a) &&
+      exactKeys(a, ["id", "selectedOptions"], ["customInput", "note"]) && nonempty(a.id) && Array.isArray(a.selectedOptions) &&
+      a.selectedOptions.every(v => typeof v === "string") && unique(a.selectedOptions) && strings(a, ["customInput", "note"]))));
+}
+/** Validate against the currently open request, never a reconstructed/default choice. */
+export function assertInteractionAnswer(request: NativeUserInteraction, response: NativeInteractionResponse): void {
+  const invalid = () => { throw new OmpError("invalid-interaction-answer", "Answer does not match the offered native request", false); };
+  if (!validInteractionResponse(response) || request.secret) return invalid();
+  if (response.kind === "cancel") return;
+  const fields = request.kind === "ask" ? ["answers"] : request.kind === "confirm" || request.kind === "input" || request.kind === "editor" ? ["value"] :
+    request.kind === "plan-review" ? ["choice", "feedback", "role"] : ["choice"];
+  if (!exactKeys(response as unknown as Record<string, unknown>, ["kind"], fields)) return invalid();
+  if (request.kind === "ask") {
+    if (!response.answers || response.answers.length !== request.questions!.length) return invalid();
+    request.questions!.forEach((q, i) => {
+      const a = response.answers![i]!;
+      if (a.id !== q.id || (!q.multi && a.selectedOptions.length + Number(!!a.customInput?.trim()) !== 1) ||
+        a.selectedOptions.some(label => !q.options.some(o => o.label === label))) invalid();
+    });
+  } else if (request.kind === "confirm") {
+    if (typeof response.value !== "boolean") return invalid();
+  } else if (request.kind === "input" || request.kind === "editor") {
+    if (typeof response.value !== "string") return invalid();
+  } else {
+    if (!request.options?.some(o => o.id === response.choice && !o.disabled)) return invalid();
+    if (request.kind === "approval" && !/^(once|session|deny|grant:.+:(once|always))$/.test(response.choice!)) return invalid();
+    if (request.kind === "plan-review") {
+      if (!["execute", "compact", "keep", "refine", "save"].includes(response.choice!)) return invalid();
+      if (response.choice === "refine" && !response.feedback?.trim()) return invalid();
+      if (response.feedback?.trim() && response.choice !== "refine") return invalid();
+      const approves = ["execute", "compact", "keep"].includes(response.choice!);
+      if (response.role !== undefined && (!approves || !request.tiers?.some(t => t.role === response.role))) return invalid();
+      if (approves && request.tiers?.length && !response.role) return invalid();
+    }
+  }
+}
+export function validInteractionStatus(value: unknown, operationId: string): value is NativeInteractionStatus {
+  return object(value) && exactKeys(value, ["status", "operationId"], ["requestId", "responseHash"]) && value.operationId === operationId &&
+    ["missing", "pending", "applied", "stale"].includes(value.status as string) &&
+    (value.requestId === undefined || nonempty(value.requestId)) && (value.responseHash === undefined || hash(value.responseHash)) &&
+    (!["applied", "stale"].includes(value.status as string) || (nonempty(value.requestId) && hash(value.responseHash)));
 }

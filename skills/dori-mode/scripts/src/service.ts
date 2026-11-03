@@ -30,6 +30,7 @@ import type { Turn } from "./runtime/generated/v2/Turn.ts";
 import { callOmp, findOmpTarget, verifyOmpHerdr, sameOmpTarget } from "./runtime/omp-integration.ts";
 import { connectOmp } from "./runtime/omp/client.ts";
 import { sameIdentity, validReceipt, payloadHash, object, exactKeys, validateFailureRecord, type OmpTarget } from "./runtime/omp/contract.ts";
+import { NativeInteractionRelay } from "./runtime/omp/interactions.ts";
 type Attachment = CodexAttachment & { omp?: OmpTarget };
 
 export type Caller = { role: "admin" | "lead" | "lane" | "host"; key?: string; instance?: string };
@@ -54,6 +55,7 @@ export class DoriService {
   readonly operations: Mailbox;
   readonly failures: Mailbox;
   readonly deps: FlowDeps;
+  readonly nativeInteractions: NativeInteractionRelay;
   private workQueue = new SerialQueue();
   private launchQueue = new SerialQueue();
   private dispatchQueue = new SerialQueue();
@@ -141,6 +143,30 @@ export class DoriService {
         const lane = await this.lane(key);
         this.putInbox({ id: operationId, target: key, text, thread: lane.thread, state: "queued", at: new Date().toISOString(), attachmentInstance: this.intakeInstance(lane) });
       }) };
+    this.nativeInteractions = new NativeInteractionRelay({
+      stateDir: config.stateDir, inbox: this.inbox, ingress: config.ingress,
+      lanes: () => this.registry.list(),
+      call: async (lane, action, args) => {
+        const runtime = lane.runtime, target = runtime?.omp?.target;
+        if (runtime?.kind !== "omp" || !target || runtime.threadId !== target.sessionId || runtime.omp!.attachmentInstanceId !== runtime.hostInstanceId ||
+          runtime.omp!.attachmentGeneration !== runtime.generation) throw new Error("Native interaction epoch unavailable");
+        const assertCurrent = async () => {
+          const current = await this.lane(lane.key), active = current.runtime;
+          if (this.pendingHandoff() || active?.kind !== "omp" || !active.omp || active.hostInstanceId !== runtime.hostInstanceId ||
+            active.generation !== runtime.generation || active.threadId !== target.sessionId || active.omp.attachmentInstanceId !== runtime.hostInstanceId ||
+            active.omp.attachmentGeneration !== runtime.generation || !sameOmpTarget(active.omp.target, target) || active.external?.detachedAt ||
+            active.state === "stopped" || ["closed", "done-claimed", "verified-done"].includes(statusOf(current)) || current.cleanupFence)
+            throw new Error("Native interaction epoch changed");
+        };
+        await assertCurrent();
+        const result = await callOmp(target, action, args, config, runner);
+        await assertCurrent(); return result;
+      },
+      post: async (id, thread, text, key) => {
+        this.outbox.put({ id, target: thread, text, state: "queued", at: new Date().toISOString() });
+        if (config.hooks.threadReply) await this.deps.post!(id, config.hooks.threadReply, { key, thread, text });
+      },
+    });
     this.phase = "ready"; this.writeHealth();
   }
   private healthSnapshot: Record<string, unknown> = {};
@@ -536,6 +562,9 @@ export class DoriService {
       await assertCurrent();
       if (action === "inspect") {
         const snap = result as RuntimeSnapshot;
+        const uncertain = this.inbox.list().find(row => row.target === "lead" && row.attachmentInstance === saved.instance &&
+          row.state === "unknown" && !saved.excludedInboxIds.includes(row.id));
+        if (uncertain) await this.reconcileOmpLeadInput(uncertain.text, uncertain.id, saved.instance).catch(() => {});
         await this.registry.update("lead", l => {
           if (l.runtime?.hostInstanceId !== saved.instance || l.runtime.generation !== saved.generation) return l;
           const recover = l.holdReason === "recovery" && !["paused", "done-claimed", "verified-done", "closed"].includes(statusOf(l)) && ["idle", "running"].includes(snap.state) && !this.inbox.list().some(row => row.target === "lead" && row.attachmentInstance === saved.instance && ["sending", "unknown"].includes(row.state));
@@ -548,6 +577,33 @@ export class DoriService {
       if (!(error instanceof DeliveryDeferred)) await this.holdExternal(saved.instance, new ExternalSessionError("identity-unverified", "OMP exact target unavailable or changed; explicit revalidation required"));
       throw error;
     }
+  }
+  private async reconcileOmpLeadInput(text: string, operationId: string, instance: string): Promise<unknown> {
+    const lane = await this.lane("lead"), runtime = lane.runtime;
+    const assertCurrent = (current: Lane) => {
+      if (!runtime?.omp || current.runtime?.kind !== "omp" || current.runtime.backend !== "external-current-session" ||
+        current.runtime.hostInstanceId !== instance || current.runtime.hostInstanceId !== runtime.hostInstanceId || current.runtime.generation !== runtime.generation ||
+        current.runtime.state === "stopped" || current.runtime.external?.detachedAt || current.runtime.omp?.detachedAt || !current.runtime.omp ||
+        !sameOmpTarget(current.runtime.omp.target, runtime.omp.target) || current.cleanupFence || this.pendingHandoff()) throw new Error("OMP receipt attachment changed or unavailable");
+    };
+    assertCurrent(lane);
+    const row = this.inbox.get(operationId);
+    if (!row) return { status: "missing", operationId };
+    if (row.target !== "lead" || row.text !== text || row.attachmentInstance !== instance || this.attachment(lane).excludedInboxIds.includes(row.id)) throw new Error("Input receipt payload or attachment mismatch");
+    const provenance = row.ompProvenance;
+    if (provenance && (provenance.attachmentInstanceId !== instance || provenance.attachmentGeneration !== runtime!.generation || !sameOmpTarget(provenance.target, runtime!.omp!.target))) throw new Error("Input receipt provenance mismatch");
+    if (row.state === "queued") return { status: "queued", operationId: row.id };
+    if (!provenance) throw new Error("Input receipt native provenance missing");
+    const captured = JSON.stringify(row);
+    const result = await callOmp(provenance.target, "operation", { operationId: row.id, text: row.text }, this.config, this.runner);
+    return withBindingFence(this.config.stateDir, async () => {
+      assertCurrent(await this.lane("lead"));
+      if (JSON.stringify(this.inbox.get(row.id)) !== captured) throw new Error("Input receipt changed during reconciliation");
+      if (result.status !== "received" || !validReceipt(result.receipt, provenance.target, row.id, payloadHash(row.text))) return { status: "unknown", operationId: row.id };
+      const receipt = { turnId: result.receipt.receiptId, receiptKind: "omp-session-entry" as const, receipt: result.receipt };
+      this.inbox.mark(row.id, { state: "sent", ...receipt });
+      return { status: "received", operationId: row.id, ...receipt };
+    });
   }
   private async publicLane(lane: Lane, dispatchLocked = false): Promise<any> {
     if (lane.runtime?.backend === "external-current-session" && !dispatchLocked) return this.dispatchQueue.run(lane.key, async () => this.publicLane(await this.lane(lane.key), true));
@@ -900,7 +956,7 @@ export class DoriService {
       await this.registry.update(lane.key, l => ({ ...l,
         ...(args.runtime.held && !l.dispatchBlocked ? { dispatchBlocked: true, holdReason: "recovery" as const } : {}),
         runtime: { ...args.runtime as RuntimeRef, lastHeartbeatAt: new Date().toISOString() } }));
-      if (action === "host-event" && args.event?.id !== undefined) {
+      if (lane.runtime.kind === "codex" && action === "host-event" && args.event?.id !== undefined) {
         const id = args.event.method === "tui/inputRequired" ? `${lane.key}:${args.event.id}` : `${args.instance}:${args.event.id}`;
         this.outbox.put({ id: `approval:${id}`, target: lane.thread, text: JSON.stringify({ lane: lane.key, id, method: args.event.method, params: args.event.params }), state: "queued", at: new Date().toISOString() });
         this.putInbox({ id: `approval-notice:${id}`, target: "lead", text: `Approval or input required for ${lane.key}. Inspect dori approval list. ID: ${id}`, state: "queued", at: new Date().toISOString() });
@@ -948,33 +1004,7 @@ export class DoriService {
     if (action === "input-status") {
       if (caller.role !== "lead" || caller.key !== "lead" || !caller.instance || key !== "lead") throw new Error("Input receipt lookup requires the current scoped lead capability");
       if (typeof args.text !== "string" || !args.text || typeof args.operationId !== "string" || !args.operationId) throw new Error("text and operationId required");
-      return this.dispatchQueue.run(key, async () => {
-        const lane = await this.lane(key), runtime = lane.runtime;
-        const assertCurrent = (current: Lane) => {
-          if (!runtime?.omp || current.runtime?.kind !== "omp" || current.runtime.backend !== "external-current-session" ||
-            current.runtime.hostInstanceId !== caller.instance || current.runtime.hostInstanceId !== runtime.hostInstanceId || current.runtime.generation !== runtime.generation ||
-            current.runtime.state === "stopped" || current.runtime.external?.detachedAt || current.runtime.omp?.detachedAt || !current.runtime.omp ||
-            !sameOmpTarget(current.runtime.omp.target, runtime.omp.target) || current.cleanupFence || this.pendingHandoff()) throw new Error("OMP receipt attachment changed or unavailable");
-        };
-        assertCurrent(lane);
-        const row = this.inbox.get(args.operationId);
-        if (!row) return { status: "missing", operationId: args.operationId };
-        if (row.target !== key || row.text !== args.text || row.attachmentInstance !== caller.instance || this.attachment(lane).excludedInboxIds.includes(row.id)) throw new Error("Input receipt payload or attachment mismatch");
-        const provenance = row.ompProvenance;
-        if (provenance && (provenance.attachmentInstanceId !== caller.instance || provenance.attachmentGeneration !== runtime!.generation || !sameOmpTarget(provenance.target, runtime!.omp!.target))) throw new Error("Input receipt provenance mismatch");
-        if (row.state === "queued") return { status: "queued", operationId: row.id };
-        if (!provenance) throw new Error("Input receipt native provenance missing");
-        const captured = JSON.stringify(row);
-        const result = await callOmp(provenance.target, "operation", { operationId: row.id, text: row.text }, this.config, this.runner);
-        return withBindingFence(this.config.stateDir, async () => {
-          assertCurrent(await this.lane(key));
-          if (JSON.stringify(this.inbox.get(row.id)) !== captured) throw new Error("Input receipt changed during reconciliation");
-          if (result.status !== "received" || !validReceipt(result.receipt, provenance.target, row.id, payloadHash(row.text))) return { status: "unknown", operationId: row.id };
-          const receipt = { turnId: result.receipt.receiptId, receiptKind: "omp-session-entry" as const, receipt: result.receipt };
-          this.inbox.mark(row.id, { state: "sent", ...receipt });
-          return { status: "received", operationId: row.id, ...receipt };
-        });
-      });
+      return this.dispatchQueue.run(key, () => this.reconcileOmpLeadInput(args.text, args.operationId, caller.instance!));
     }
     if (action === "can-launch") return canLaunch(await sampleHost(this.runner), this.config.guard);
     if (action === "launch") {
@@ -1050,6 +1080,10 @@ export class DoriService {
     if (action === "approval-list") return this.approvals();
     if (action === "approval-respond") {
       if (caller.role !== "admin") throw new Error("Approval requires the authenticated owner control channel");
+      if (typeof args.id === "string" && args.id.startsWith("iyen-")) {
+        if (typeof args.operationId !== "string" || !args.operationId) throw new Error("Native approval response requires stable --operation-id");
+        return this.nativeInteractions.respondOperator(args.id, args.response, args.operationId);
+      }
       const approvals = await this.approvals(); const selected = approvals.find(a => a.id === args.id);
       if (!selected) throw new Error("Expired approval");
       const boot = readJson<Bootstrap>(bootstrapPath(this.config.stateDir, selected.key));
@@ -1159,6 +1193,7 @@ export class DoriService {
   async approvals(): Promise<{ id: string; key: string; requestId: string; request: unknown }[]> {
     const result: { id: string; key: string; requestId: string; request: unknown }[] = [];
     for (const lane of await this.registry.open()) {
+      if (lane.runtime?.kind === "omp") continue;
       if (!lane.runtime?.threadId || lane.runtime.backend === "external-current-session") continue;
       try {
         const boot = readJson<Bootstrap>(bootstrapPath(this.config.stateDir, lane.key));
@@ -1166,6 +1201,8 @@ export class DoriService {
         result.push(...requests.map(r => ({ id: `${boot.instance}:${r.id}`, key: lane.key, requestId: r.id, request: r.request })));
       } catch { /* disconnected requests cannot be answered */ }
     }
+    await this.nativeInteractions.poll();
+    result.push(...this.nativeInteractions.list().map(row => ({ id: row.token, key: row.key, requestId: row.request.id, request: row.request })));
     return result;
   }
   notifyFailures(): Promise<void> { return this.withIntake(() => this.notifyFailuresScoped()); }
@@ -1204,11 +1241,40 @@ export class DoriService {
     const ingress = this.config.ingress.find(i => i.id === source);
     if (!ingress || !ingress.owners.includes(event.user) || !event.id || !event.thread || typeof event.text !== "string") throw new Error("Untrusted or incomplete inbound event");
     const id = `inbound:${source}:${event.thread}:${event.id}`;
+    const previous = this.inbox.get(id);
+    if (previous?.target === "owner-control" && !event.control) {
+      // A source ACK retry is not a fresh answer, even if its request appeared later.
+      if (previous.text !== event.text) {
+        const rejection = `native-source-conflict:${payloadHash(JSON.stringify([id, event.text]))}`;
+        if (this.config.hooks.threadReply) await this.deps.post!(rejection, this.config.hooks.threadReply,
+          { key: "lead", thread: event.thread, text: "이미 처리한 원본 메시지 ID의 응답 내용을 바꿔 적용하지 않습니다. 원래 질문의 토큰으로 새 메시지를 보내 주세요." }).catch(() => {});
+      }
+      return;
+    }
     const known = (await this.registry.list()).find(l => l.thread === event.thread && l.role !== "lead");
+    let nativeControl = false;
+    if (this.config.runtime.kind === "omp" && !previous && !event.control) {
+      try { nativeControl = await this.nativeInteractions.receive(source, event); }
+      catch (error) {
+        if (!/^답변(?:\s|$)/.test(event.text)) throw error;
+        // Invalid/stale owner answers are durable rejected control, not a receiver crash.
+        nativeControl = true;
+        const rejection = `native-answer-rejected:${payloadHash(id)}`;
+        if (this.config.hooks.threadReply) await this.deps.post!(rejection, this.config.hooks.threadReply,
+          { key: "lead", thread: event.thread, text: "이 응답의 적용을 확인하지 못했습니다. 질문 토큰·스레드·제공된 선택 및 승인 범위를 확인해 주세요. 이 메시지를 자동 재전송하지 않으며, 결과가 불확실한 요청은 먼저 기존 처리 결과를 확인합니다." }).catch(() => {});
+      }
+    }
+    if (nativeControl) {
+      this.putInbox({ id, target: "owner-control", text: event.text, source, sourceMessageId: event.id, ownerUser: event.user,
+        ...(event.metadata !== undefined ? { metadata: event.metadata } : {}), thread: event.thread, state: "sent", at: new Date().toISOString() });
+      this.ingressHealth.set(source, { process: this.ingressHealth.get(source)?.process ?? "starting", lastAcceptedAt: new Date().toISOString() });
+      return;
+    }
     if (event.control) {
       const allowed = ["pause", "resume", "object-done", "approval-respond"];
       if (!allowed.includes(event.control.action)) throw new Error("Unsupported inbound control");
       if (event.control.action === "approval-respond") {
+        if (typeof event.control.args?.id === "string" && event.control.args.id.startsWith("iyen-")) throw new Error("Native replies require the explicit answer token in authenticated owner text");
         const request = (await this.approvals()).find(a => a.id === event.control.args?.id);
         if (!request || (await this.lane(request.key)).thread !== event.thread) throw new Error("Approval belongs to another thread");
       } else if (!known || event.control.args?.key !== known.key) throw new Error("Control belongs to another lane");
@@ -1219,14 +1285,14 @@ export class DoriService {
     }
     // A lane's thread is its report destination, not ownership of owner input.
     // Preserve accepted delivery targets across retries; never relabel unknown work.
-    const previous = this.inbox.get(id);
     const target = previous?.target ?? "lead";
     const intakeLane = target === "lead" ? await this.registry.read("lead") : null;
     const envelope = `Owner message in ${event.thread}${known && statusOf(known) === "closed" ? ` (closed lane ${known.key}; reopen if appropriate)` : ""}:`;
     // Retries of pre-metadata intake must retain the original operation text,
     // including when its delivery is uncertain. New events carry the source ID.
     const text = previous?.text === `${envelope}\n${event.text}` ? previous.text : `${envelope}\nSource message ID: ${event.id}\n${event.text}`;
-    this.putInbox({ id, target, attachmentInstance: this.intakeInstance(intakeLane), thread: event.thread, text, source, state: "queued", at: new Date().toISOString() });
+    this.putInbox({ id, target, attachmentInstance: this.intakeInstance(intakeLane), thread: event.thread, text, source, sourceMessageId: event.id,
+      ownerUser: event.user, ...(event.metadata !== undefined ? { metadata: event.metadata } : {}), state: "queued", at: new Date().toISOString() });
     this.ingressHealth.set(source, { process: this.ingressHealth.get(source)?.process ?? "starting", lastAcceptedAt: new Date().toISOString() });
   }
   tick(): Promise<void> { return this.withIntake(() => this.tickScoped()); }
@@ -1235,12 +1301,13 @@ export class DoriService {
       await this.deps.runtime.inspect("lead").catch(() => {}); await this.health(); return;
     }
     const once = async (name: string, fn: () => Promise<unknown>) => {
-      const interval = name === "inbox" || name === "failures" || name === "external-observation" ? 1000 : name === "done" ? 30000 : name === "launch-queue" ? 10000 : 60000;
+      const interval = ["inbox", "failures", "external-observation", "native-interactions"].includes(name) ? 1000 : name === "done" ? 30000 : name === "launch-queue" ? 10000 : 60000;
       if (this.ticks.has(name) || Date.now() - (this.lastTick.get(name) ?? 0) < interval) return;
       this.lastTick.set(name, Date.now()); this.ticks.add(name);
       try { await fn(); } catch { console.error(`MONITOR_ERROR ${name}`); } finally { this.ticks.delete(name); }
     };
     await Promise.all([
+      once("native-interactions", () => this.nativeInteractions.poll()),
       once("external-observation", async () => {
         const lead = await this.registry.read("lead");
         if (lead?.runtime?.backend === "external-current-session" && lead.runtime.state !== "stopped" && !lead.runtime.external?.detachedAt) await this.deps.runtime.inspect(lead.key).catch(() => {});

@@ -20,6 +20,8 @@ python3 /path/to/iyen/skills/iyen/scripts/activate.py start --session UUID --pan
 
 不要覆盖已有配置。先停止旧工作进程，再运行 migrate。进行中的任务需要停止确认和交接文档；旧会话 ID 不会转换成 Codex thread ID。实际消息接入需要收到 ACK 后才推进游标的 ingress 适配器。
 
+这不是禁止 OMP 的原生 `ask`。在支持该功能的原生 SDK 中，真正等待中的问题、选择、输入和审批会发送到原始所有者会话，回复再返回同一个原生 UI 请求。普通对话仍只交给主代理；UI 回复须验证请求 ID、会话、控制器代次、所有者及线程。歧义、过期或已在本地完成的请求不会被误批准。仅重启 Iyen 服务不能给旧进程增加原生能力；原生更新改变代次时，必须明确重新激活并验证连接。
+
 ```sh
 dori migrate --dry-run
 dori migrate --apply --handoff-file /path/to/handoff.json

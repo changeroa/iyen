@@ -77,3 +77,77 @@ deliveries never replay. Rebinding must fence stale observations and remain
 retryable after an interrupted persistence operation. Status exposes a sanitized
 hold reason; an acknowledgment during a hold must describe saved input waiting
 for reconnection rather than imply that processing started.
+
+## OMP native owner interactions
+
+Native UI relay requires `ExtensionContext.userInteractions`
+(`list`, `respond`, `responseStatus`). Older SDKs advertise interaction capability
+as unavailable; doctor reports that the UI relay is not ready. Existing borrowed
+lead ordinary durable messaging remains available during a staged service upgrade.
+New managed startup requires the native interaction capability. Updating service
+code does not upgrade an already-running native session: native reload/restart and
+any new attachment activation require explicit owner authorization.
+The extension observes `user_interaction_requested` and
+`user_interaction_resolved`; polling also discovers dialogs already open at
+reconnect. The exact-target control channel supports `interactions`,
+`interaction-respond` and `interaction-response-status` for both borrowed leads
+and managed lanes. These methods never inject a user message or abort an ask.
+
+Configure the existing owner-filtered `ingress` and `hooks.threadReply`; no
+additional account, daemon or notification hook is used. Native requests are
+correlated using their initiating entry ID/operation hash and durable inbox
+receipt. Source message IDs, owner IDs and metadata are retained. A lead whose
+request omits source provenance is relayed only when its current attachment has
+one unambiguous authenticated owner thread. Explicit unmatched or contradictory
+lead provenance is withheld. A worker's unmapped launch source may use its
+registered report thread only when one configured ingress/owner can be identified;
+contradictory known provenance cannot use that fallback.
+
+Slack notices retain the actual native question, plan, labels, option IDs,
+descriptions and execution tiers, with Korean instructions and a stable
+`iyen-…` token. Reply using `답변 TOKEN RESPONSE`. A single ask accepts an exact
+label or displayed number (numeric text always means the displayed index), or
+`직접:<TEXT>`; every character after the colon, including whitespace, is preserved.
+Multi-question/multi-select replies use the advertised native JSON response with
+all ordered question IDs; an empty multi-selection is valid. Confirm uses
+`true`/`false`; input/editor preserve raw text, ordinary JSON and incomplete code,
+or accept an explicit native submit/cancel JSON envelope. Select/approval use exact
+offered IDs. Plan review supports execute/compact/keep/refine/save; approval requires
+an explicit offered role when tiers are shown, and feedback applies only to refine.
+Remote approval/save authorizes exactly the advertised plan snapshot, never a newer
+local draft. Remote execution gets a separate durable plan reference and does not
+overwrite newer draft edits. Dismiss/reopen a review to advertise a new revision.
+Disabled choices are rejected. Approval never treats a generic
+“yes” as permission or widens an offered grant. Cancellation is `답변 TOKEN 취소`.
+Secret dialogs expose only a redacted local-required notice and reject all
+remote responses.
+
+All native answers require the advertised token. Bare selections receive a
+clarification, not an inferred answer. Guests, quoted tokens, cross-thread
+responses, obsolete epochs and locally completed/expired requests cannot resolve
+a dialog. Ordinary conversation remains lead-only, including conversation in a
+worker report thread; validated native answers are control traffic.
+Malformed or stale authenticated native answers are recorded as handled control
+and receive thread feedback, rather than restarting the ingress producer. Replayed
+or edited source IDs cannot become a fresh answer when a later question opens.
+
+`approval list` includes real native payloads instead of an OMP TUI placeholder.
+For authenticated operator tooling, `approval respond TOKEN --response-file FILE
+--operation-id SOURCE_MESSAGE_ID` resolves the same native dialog. Preserve that
+operation identity when reconciling. Codex approval commands are unchanged.
+`native-interactions.json` durably stores advertised bindings and response
+operations before submission. After an uncertain response, only read-only native
+status is queried in that same epoch; missing/pending status is not permission to
+retry. Existing durable outbox unknown outcomes are likewise never replayed.
+Native epoch replacement invalidates pending replies and requires explicit
+attachment reconciliation; it does not recover a dialog in another session.
+
+Existing OMP borrowed-lead observation reconciles at most one unknown input receipt
+read-only per inspection, with exact payload, controller and attachment fences.
+Only a real durable native receipt marks it sent; absence remains held. This clears
+lost-ACK delivery barriers without resubmitting owner input or report messages.
+
+Integration must run the behavioral suite, including
+`test/native-interactions.test.ts`, against the merged implementation, then
+verify a real owner Slack/native roundtrip. Native SDK deployment, extension
+reload and explicit activation/reconciliation belong to the integrator.

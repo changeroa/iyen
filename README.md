@@ -81,6 +81,10 @@ The Iyen skill guides read receipts and replies: after reading an owner message,
 
 Ordinary authenticated owner messages always go to the lead, including follow-ups in a worker's report thread. The lead explicitly forwards worker instructions; a lane/thread association never captures the conversation. Explicit owner UI controls retain their lane/thread checks. Previously accepted queued or unknown entries are preserved for reconciliation, not automatically moved or replayed.
 
+Native `ask` remains available. The native interaction bridge relays the actual pending question, selection, input or approval to its original owner thread and applies the owner's reply to the same native UI request. It is not a new prompt into a worker or a notification-only substitute. Replies are correlated with request IDs and exact session/controller generations; ambiguous or approval answers require the advertised request token. Local completion, expiration and session changes invalidate stale messenger replies. Secret-entry dialogs are not a credential collection channel through Slack.
+
+This path requires native SDK support for listing and answering real pending UI requests. Restarting the Iyen service does not retrofit an already-running older native process. Preserve the same native session when updating it; a changed controller epoch requires explicit activation and verification of the new scoped binding. A version string or configured profile alone does not establish interaction readiness.
+
 The service supervises configured ingress commands. They emit normalized owner messages with stable IDs and advance source cursors only after a durable protocol ACK. The delivered envelope includes the source message ID separately from the reply thread. This internal ACK is not a messenger reply or a read receipt. Raw human-readable messenger watch output is not accepted directly. Thread hooks keep account credentials outside worker environments. See the exact [adapter and approval contracts](skills/dori-mode/references/scripts.md).
 
 ## Migration and recovery

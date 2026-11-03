@@ -122,6 +122,9 @@ export const callOmp = async (target: OmpTarget, action: string, args: any, conf
   const controller = await connectOmp(target, { timeoutMs: config.runtime.rpcTimeoutMs });
   try {
     if (action === "inspect") return ompSnapshot(await controller.inspect());
+    if (action === "interactions" || action === "approvals") return await controller.interactions();
+    if (action === "interaction-respond") return await controller.interactionRespond(args.requestId, args.response, args.operationId);
+    if (action === "interaction-response-status") return await controller.interactionResponseStatus(args.operationId);
     if (action === "input") {
       const snap = await controller.inspect();
       if (snap.held || snap.goal?.status === "paused" || !["idle", "running"].includes(snap.state) || !snap.capabilities.input || !snap.capabilities.durableReceipts) throw new DeliveryDeferred("OMP is held or not ready for durable input");
@@ -206,7 +209,7 @@ const runOmpOwnedSessionHost = async (stateDir: string, boot: Bootstrap): Promis
     }
   }
   if (!target || !snap) throw new Error("OMP controller startup unconfirmed; no handshake input sent");
-  if (snap.provider !== omp.provider || snap.model !== role.model || snap.effort !== role.effort || target.runtimeVersion !== config.runtime.requiredVersion || !snap.capabilities.durableReceipts || !snap.capabilities.durableFailures || !snap.capabilities.hold || !snap.capabilities.release || !snap.capabilities.stop) throw new Error("OMP managed capabilities/model/effort mismatch");
+  if (snap.provider !== omp.provider || snap.model !== role.model || snap.effort !== role.effort || target.runtimeVersion !== config.runtime.requiredVersion || !snap.capabilities.durableReceipts || !snap.capabilities.durableFailures || snap.capabilities.interactions !== true || !snap.capabilities.hold || !snap.capabilities.release || !snap.capabilities.stop) throw new Error("OMP managed capabilities/model/effort mismatch");
   const pinned = target;
   let held = Boolean(boot.blocked || boot.threadId), closing = false, nativeStopped = false, lastAck = Date.now();
   if (held) snap = await callOmp(pinned, "hold", { origin: "automatic" }, config).then(async () => {
@@ -236,11 +239,12 @@ const runOmpOwnedSessionHost = async (stateDir: string, boot: Bootstrap): Promis
         if (action === "release" && snap!.held) throw new Error("OMP release unconfirmed");
         held = action === "hold"; persist(); }
       else if (action === "operation") result = await callOmp(pinned, action, args, config);
-      else if (action === "approvals") { const s = await inspect(); result = s.state.startsWith("waiting_") ? [{ id: `omp:${pinned.sessionId}`, request: { pane: boot.pane, message: "Inspect and answer the actual OMP TUI" } }] : []; }
+      else if (["interactions", "interaction-respond", "interaction-response-status"].includes(action)) result = await callOmp(pinned, action, args, config);
+      else if (action === "approvals") result = (await callOmp(pinned, "interactions", {}, config)).map((request: { id: string }) => ({ id: request.id, request }));
       else if (action === "stop") {
         held = true; persist(); await stopOmpManagedProcess(pinned, pid, config);
         nativeStopped = true; closing = true; result = { stopped: true };
-      } else throw new Error("Unsupported OMP host action; approvals stay in the real TUI");
+      } else throw new Error("Unsupported OMP host action");
       return Response.json({ result });
     } catch (error) { return Response.json({ error: error instanceof Error ? error.message : "OMP host failed" }, { status: 409 }); }
   } });
@@ -249,7 +253,6 @@ const runOmpOwnedSessionHost = async (stateDir: string, boot: Bootstrap): Promis
   await service("host-register", { runtime: runtime(), pid: process.pid });
   const shutdown = () => { held = true; closing = true; persist(); };
   process.once("SIGTERM", shutdown); process.once("SIGINT", shutdown);
-  let blockedNotice: string | undefined;
   try {
     while (!closing) {
       try {
@@ -257,12 +260,6 @@ const runOmpOwnedSessionHost = async (stateDir: string, boot: Bootstrap): Promis
         const failures = await connectOmp(pinned, { timeoutMs: config.runtime.rpcTimeoutMs });
         try { await drainOmpFailures(failures, pinned, failureCursorPath(stateDir, pinned), event => service("host-event", { event, runtime: runtime() })); }
         finally { failures.close(); }
-        if (snap!.state.startsWith("waiting_")) {
-          blockedNotice ??= `omp-wait:${pinned.sessionId}:${snap!.eventSequence}`;
-          await service("host-event", { event: { id: blockedNotice, method: "tui/inputRequired", params: { pane: boot.pane, message: "Inspect and answer the actual OMP TUI; no automated approval was sent" } }, runtime: runtime() });
-        } else if (blockedNotice) {
-          await service("host-event", { event: { method: "tui/inputResolved", params: { requestId: blockedNotice } }, runtime: runtime() }); blockedNotice = undefined;
-        }
         await service("host-heartbeat", { runtime: runtime() }); lastAck = Date.now(); }
       catch { if (Date.now() - lastAck >= config.runtime.heartbeatTimeoutMs) { held = true; persist(); await callOmp(pinned, "hold", { origin: "automatic" }, config).catch(() => {}); } }
       await Bun.sleep(config.runtime.heartbeatIntervalMs);
