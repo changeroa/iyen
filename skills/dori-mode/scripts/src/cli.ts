@@ -24,7 +24,7 @@ const help = `dori — messenger lead and lanes (Codex default, explicit OMP pro
   lead-handoff --from-thread-id UUID --thread-id UUID --pane ID --cwd DIR --operation-id ID (--mail-id ID ... | --no-mail)
   launch KEY --title T --brief FILE --done SIGNALS [--thread REF] [--cwd DIR] [--model M] [--worktree]
   input KEY --text-file FILE [--operation-id ID]
-  input-status lead --text-file FILE --operation-id ID
+  input-status KEY --operation-id ID [--text-file FILE]
   report KEY --kind milestone|blocker|question|done --text-file FILE --event-id ID
   reply --thread REF --text-file FILE [--operation-id ID]
   claim-done [KEY] --evidence TEXT
@@ -60,6 +60,7 @@ const scopedHelp = `iyen — scoped service commands
   lead-detach --thread-id UUID
   launch KEY --title T --brief FILE --done SIGNALS [--thread REF] [--cwd DIR] [--model M] [--worktree]
   input KEY --text-file FILE [--operation-id ID]
+  input-status KEY --operation-id ID [--text-file FILE]
   reply --thread REF --text-file FILE [--operation-id ID]
   report KEY --kind milestone|blocker|question|done --text-file FILE --event-id ID
   claim-done KEY --evidence TEXT | object-done KEY --reason TEXT
