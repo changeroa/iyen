@@ -31,8 +31,11 @@ import type { Turn } from "./runtime/generated/v2/Turn.ts";
 
 import { callOmp, findOmpTarget, verifyOmpHerdr, sameOmpTarget } from "./runtime/omp-integration.ts";
 import { connectOmp } from "./runtime/omp/client.ts";
-import { sameIdentity, validReceipt, payloadHash, object, exactKeys, validateFailureRecord, type OmpTarget } from "./runtime/omp/contract.ts";
+import { sameIdentity, validReceipt, payloadHash, object, exactKeys, validateFailureRecord, validLaunchMetadata, type OmpLaunchMetadata, type OmpTarget } from "./runtime/omp/contract.ts";
 import { NativeInteractionRelay } from "./runtime/omp/interactions.ts";
+import { LeadRestartCoordinator, restartAuthorization, type RestartRecord } from "./lead-restart-coordinator.ts";
+import { pinRestartProcess, restartProcessExited, discoverRestartTarget, validateRestartProfile } from "./lead-restart-launcher.ts";
+import { restartNativePrepare, restartNativeInspect, restartNativeCommit, restartNativeStart, restartNativeAttest, restartNativeStage, restartNativeStaged, restartNativeRelease } from "./lead-restart-transport.ts";
 type Attachment = CodexAttachment & { omp?: OmpTarget };
 
 export type Caller = { role: "admin" | "lead" | "lane" | "host"; key?: string; instance?: string };
@@ -58,6 +61,7 @@ export class DoriService {
   readonly failures: Mailbox;
   readonly deps: FlowDeps;
   readonly nativeInteractions: NativeInteractionRelay;
+  readonly leadRestarts: LeadRestartCoordinator;
   private workQueue = new SerialQueue();
   private launchQueue = new SerialQueue();
   private dispatchQueue = new SerialQueue();
@@ -103,6 +107,7 @@ export class DoriService {
       inspect: async key => (await this.registry.read(key))?.runtime?.kind === "omp" ? call(key, "inspect") : this.dispatchQueue.run(key, () => call(key, "inspect")),
       input: (key, text, operationId) => this.withIntake(() => this.dispatchQueue.run(key, async () => {
         const lane = await this.registry.read(key);
+        if (key === "lead" && this.leadRestarts.hasActive()) throw new DeliveryDeferred("Lead restart fences native input");
         if (!lane || lane.dispatchBlocked || statusOf(lane) === "closed") throw new Error("Lane dispatch is blocked");
         const mail = this.putInbox({ id: operationId, target: key, text, thread: lane.thread, state: "queued", at: new Date().toISOString() });
         if (lane.runtime?.kind === "omp" && lane.runtime.backend === "herdr-tui") {
@@ -158,7 +163,7 @@ export class DoriService {
           runtime.omp!.attachmentGeneration !== runtime.generation) throw new Error("Native interaction epoch unavailable");
         const assertCurrent = async () => {
           const current = await this.lane(lane.key), active = current.runtime;
-          if (this.pendingHandoff() || active?.kind !== "omp" || !active.omp || active.hostInstanceId !== runtime.hostInstanceId ||
+          if (lane.key === "lead" && this.leadRestarts?.hasActive() || this.pendingHandoff() || active?.kind !== "omp" || !active.omp || active.hostInstanceId !== runtime.hostInstanceId ||
             active.generation !== runtime.generation || active.threadId !== target.sessionId || active.omp.attachmentInstanceId !== runtime.hostInstanceId ||
             active.omp.attachmentGeneration !== runtime.generation || !sameOmpTarget(active.omp.target, target) || active.external?.detachedAt ||
             active.state === "stopped" || ["closed", "done-claimed", "verified-done"].includes(statusOf(current)) || current.cleanupFence)
@@ -177,6 +182,37 @@ export class DoriService {
         if (config.hooks.threadReply) await this.deps.post!(id, config.hooks.threadReply, { key, thread, text: immutableText });
       },
     });
+    this.leadRestarts = new LeadRestartCoordinator(config.stateDir, {
+      reject: async record => {
+        for (const mail of this.inbox.list()) {
+          if (mail.target === "lead" && mail.attachmentInstance === record.launch.instance) {
+            if (mail.state !== "queued" || mail.ompProvenance || mail.receipt || mail.abandonment) throw new Error("Refused restart input provenance changed");
+            this.inbox.mark(mail.id, { attachmentInstance: record.authorization.scope.instance });
+          }
+        }
+      },
+      assertScope: record => this.assertRestartScope(record),
+      prepare: record => restartNativePrepare(record),
+      inspect: (record, fresh) => restartNativeInspect(record, fresh),
+      commit: record => restartNativeCommit(record),
+      exited: record => restartProcessExited(record, runner),
+      start: record => restartNativeStart(record, runner),
+      discover: record => discoverRestartTarget(record, runner),
+      attest: record => restartNativeAttest(record, runner),
+      rotate: record => this.rotateRestartAttachment(record),
+      stage: record => restartNativeStage(record),
+      staged: record => this.reconcileRestartContinuation(record),
+      release: record => restartNativeRelease(record),
+      finish: record => this.finishRestart(record),
+    });
+    for (const mail of this.inbox.list()) {
+      if (mail.target !== "lead" || !mail.attachmentInstance) continue;
+      const instance = this.leadRestarts.intakeInstance(mail.attachmentInstance);
+      if (instance !== mail.attachmentInstance) {
+        if (mail.state !== "queued" || mail.ompProvenance || mail.receipt || mail.abandonment) throw new Error("Refused restart intake has attempted provenance");
+        this.inbox.mark(mail.id, { attachmentInstance: instance });
+      }
+    }
     this.phase = "ready"; this.writeHealth();
   }
   private healthSnapshot: Record<string, unknown> = {};
@@ -209,7 +245,8 @@ export class DoriService {
     const queue = { queued: queued.length, unknown: rows.filter(row => row.state === "unknown").length, sending: rows.filter(row => row.state === "sending").length,
       oldestQueuedAt: oldest === undefined ? null : new Date(oldest).toISOString(), oldestQueuedAgeMs: oldest === undefined ? null : Math.max(0, this.deps.clock.now() - oldest) };
     const target = readWatchTarget(this.config.stateDir);
-    this.healthSnapshot = { delivery, queue, ingress: this.ingressStatus(), target: target ? { binding: target.binding, deliberateHold: target.deliberateHold, handoffPending: target.handoffPending, verified: false, source: "saved-binding" } : null }; this.writeHealth();
+    this.healthSnapshot = { delivery, queue, restart: this.leadRestarts.active() ? this.leadRestarts.status(this.leadRestarts.active()!.operationId) : null,
+      ingress: this.ingressStatus(), target: target ? { binding: target.binding, deliberateHold: target.deliberateHold, handoffPending: target.handoffPending, verified: false, source: "saved-binding" } : null }; this.writeHealth();
     return { ...readJson<any>(join(this.config.stateDir, "service-health.json")), serviceReachable: true, sampledAt: new Date().toISOString() };
   }
   private activeHandoffPath(): string { return join(this.config.stateDir, "attachments", "handoff.json"); }
@@ -220,6 +257,8 @@ export class DoriService {
     return readJson<HandoffIntent>(this.handoffPath(operationId));
   }
   private captureIntakeInstance(): string {
+    const restart = this.leadRestarts?.active();
+    if (restart) return this.leadRestarts.intakeInstance(restart.launch.instance);
     const pending = this.pendingHandoff();
     if (pending && pending.status !== "committed") return pending.beforeAttachment.instance;
     if (existsSync(this.attachmentPath())) return readJson<Attachment>(this.attachmentPath()).instance;
@@ -234,13 +273,15 @@ export class DoriService {
     return lane?.runtime?.backend === "external-current-session" ? this.intakeScope.getStore() ?? this.captureIntakeInstance() : undefined;
   }
   private putInbox(mail: Mail): Mail {
-    return this.inbox.put(mail.target === "lead" ? { ...mail, attachmentInstance: mail.attachmentInstance ?? this.intakeScope.getStore() ?? this.captureIntakeInstance() } : mail);
+    return this.inbox.put(mail.target === "lead" ? { ...mail,
+      attachmentInstance: this.leadRestarts.intakeInstance(mail.attachmentInstance ?? this.intakeScope.getStore() ?? this.captureIntakeInstance()) } : mail);
   }
   private putFailure(mail: Mail): Mail {
     const owned: OwnedFailure = { ...mail, leadIntakeInstance: this.intakeScope.getStore() ?? this.captureIntakeInstance() };
     return this.failures.put(owned);
   }
   private assertNoPendingLeadMutation(): void {
+    if (this.leadRestarts.hasActive()) throw new Error("Lead restart incomplete; lead mutations remain fenced");
     if (this.pendingHandoff()) throw new Error("Lead handoff incomplete; mutations are held until its recorded operation finishes");
   }
   private blocksPendingMutation(action: string, args: any, caller: Caller): boolean {
@@ -414,6 +455,107 @@ export class DoriService {
       throw error;
     }
   }
+  private async acceptLeadRestart(operationId: string, sourceMessageId: string) {
+    const before = await this.lane("lead"), saved = this.attachment(before);
+    const authorization = restartAuthorization(this.config, before, this.inbox.list(), sourceMessageId);
+    if (this.nativeInteractions.responseHistory().some(({ operation }) => operation.source === authorization.source &&
+      operation.sourceMessageId === sourceMessageId && operation.thread === authorization.thread)) throw new Error("Interaction answer cannot authorize a restart");
+    const client = await connectOmp(authorization.scope.target, { timeoutMs: this.config.runtime.rpcTimeoutMs });
+    let launchMetadata: OmpLaunchMetadata;
+    const config = structuredClone(this.config);
+    try {
+      const snap = await client.inspect();
+      if (snap.capabilities.leadRestart !== true) throw new Error("Lead restart unavailable in the currently loaded native runtime; explicit first operator bootstrap required. No source consumed.");
+      if (snap.held || snap.goal || !["idle", "running"].includes(snap.state) || (await client.interactions()).length) throw new Error("Native pause, handoff or outstanding question fences restart");
+      if (!validLaunchMetadata(snap.launchMetadata) || snap.launchMetadata.agentDir !== snap.launchMetadata.settingsHome ||
+        snap.launchMetadata.provider !== snap.provider || snap.launchMetadata.model !== snap.model || snap.launchMetadata.effort !== snap.effort ||
+        snap.model !== before.runtime?.model || snap.effort !== before.runtime.effort || snap.launchMetadata.approvalMode === "write")
+        throw new Error("Effective native launch profile is missing, mismatched or unsupported; no source consumed");
+      launchMetadata = structuredClone(snap.launchMetadata);
+      config.runtime.settingsHome = launchMetadata.agentDir;
+      config.runtime.omp!.provider = launchMetadata.provider;
+      config.runtime.omp!.approvalMode = snap.launchMetadata.approvalMode;
+      config.runtime.roles.lead = { model: launchMetadata.model, effort: launchMetadata.effort ?? null };
+    } finally { client.close(); }
+    validateRestartProfile(config, authorization.scope.target, resolve(config.stateDir, "attachments", "restart-bootstrap", `${payloadHash(operationId)}.json`), launchMetadata);
+    const process = await pinRestartProcess(authorization.scope.target, this.config.runtime.omp!.registryDir, this.runner);
+    const instance = crypto.randomUUID(), at = new Date().toISOString();
+    const bridge = resolve(this.config.stateDir, "clients", "attached-lead", instance, "iyen");
+    const record: RestartRecord = { version: 1, operationId, authorization, launchMetadata, authorizationHash: payloadHash(JSON.stringify({ authorization, launchMetadata })),
+      phase: "authorized", before, config, createdAt: at, updatedAt: at, process,
+      launch: { instance, generation: saved.generation + 1, token: crypto.randomUUID(), bridge,
+        bootstrapFile: resolve(this.config.stateDir, "attachments", "restart-bootstrap", `${payloadHash(operationId)}.json`) },
+      continuation: { operationId: `lead-restart-continuation:${operationId}`,
+        text: `The owner-authorized native lead restart ${operationId} is complete; do not restart again.\nOriginal authenticated owner source: ${authorization.source}/${sourceMessageId}\nOriginal thread: ${authorization.thread}\nInvoke this exact freshly rotated scoped CLI bridge for every Iyen action: ${bridge}\nAll prior/inherited Iyen capabilities and bridge paths are revoked; do not use them.\nPreserve existing persona/profile configuration. Reconcile unknown side effects; never replay historical mailbox input. Continue the original owner conversation using its preserved provenance.\nOriginal owner request:\n${authorization.mail.text}` } };
+    return withBindingFence(this.config.stateDir, async () => {
+      this.assertNoPendingLeadMutation();
+      const current = await this.lane("lead");
+      if (current.revision !== before.revision || !sameJson(this.inbox.get(authorization.mail.id), authorization.mail)) throw new Error("Restart source changed during preparation");
+      return this.leadRestarts.accept(record);
+    });
+  }
+  private async assertRestartScope(record: RestartRecord): Promise<void> {
+    const current = await this.lane("lead"), runtime = current.runtime, old = record.authorization.scope;
+    const rotated = runtime?.hostInstanceId === record.launch.instance && runtime.generation === record.launch.generation;
+    if (this.pendingHandoff() || !runtime?.omp || runtime.external?.detachedAt || runtime.omp.detachedAt || current.cleanupFence || statusOf(current) !== "working" ||
+      current.holdReason && current.holdReason !== "recovery" || runtime.threadId !== old.target.sessionId || current.pane !== old.target.paneId || current.cwd !== old.target.cwd ||
+      !rotated && (runtime.hostInstanceId !== old.instance || runtime.generation !== old.generation || !sameOmpTarget(runtime.omp.target, old.target)) ||
+      rotated && (!record.freshTarget || !sameOmpTarget(runtime.omp.target, record.freshTarget)) ||
+      !this.config.ingress.some(i => i.id === record.authorization.source && i.owners.includes(record.authorization.owner)) ||
+      !sameJson(this.inbox.get(record.authorization.mail.id), record.authorization.mail)) throw new Error("Restart authorization/attachment epoch changed");
+    if (this.inbox.list().some(mail => mail.target === "lead" && mail.attachmentInstance === old.instance && ["sending", "unknown"].includes(mail.state))) throw new Error("Unknown input fences restart");
+    const saved = readJson<Attachment>(this.attachmentPath());
+    if (!(saved.instance === old.instance && saved.generation === old.generation && saved.omp && sameOmpTarget(saved.omp, old.target)) &&
+      !(saved.instance === record.launch.instance && saved.generation === record.launch.generation && saved.omp && record.freshTarget && sameOmpTarget(saved.omp, record.freshTarget))) throw new Error("Restart attachment capability changed");
+  }
+  private async rotateRestartAttachment(record: RestartRecord): Promise<void> {
+    await withBindingFence(this.config.stateDir, async () => {
+      await this.assertRestartScope(record);
+      if (!record.freshTarget) throw new Error("Fresh restart target missing");
+      const old = record.authorization.scope, target = record.freshTarget;
+      const beforeAttachment = readJson<Attachment>(this.attachmentPath());
+      const excludedInboxIds = [...new Set([...beforeAttachment.excludedInboxIds,
+        ...this.inbox.list().filter(mail => mail.target === "lead" && mail.attachmentInstance !== record.launch.instance).map(mail => mail.id)])];
+      const saved: Attachment = { ...beforeAttachment, omp: target, instance: record.launch.instance, generation: record.launch.generation,
+        token: record.launch.token, bridge: record.launch.bridge, socketPath: target.socketPath, binary: record.config.runtime.binary,
+        binaryVersion: target.runtimeVersion, excludedInboxIds };
+      const clientDir = dirname(record.launch.bridge);
+      mkdirSync(clientDir, { recursive: true, mode: 0o700 });
+      writeFileSync(record.launch.bridge, `#!/bin/sh\nDORI_CONTEXT=${quoteForPane(join(clientDir, "context.json"))} DORI_STATE_DIR=${quoteForPane(this.config.stateDir)} DORI_CONFIG=${quoteForPane(join(clientDir, "config.json"))} DORI_LANE_KEY=lead exec ${quoteForPane(process.execPath)} ${quoteForPane(resolve(import.meta.dir, "cli.ts"))} "$@"\n`, { mode: 0o700 });
+      // Either pinned side repairs after a crash; historical mailbox rows are never rewritten.
+      await this.registry.update("lead", lane => ({ ...lane, dispatchBlocked: true, holdReason: "recovery", leadRestart: { operationId: record.operationId, authorizationHash: record.authorizationHash, phase: "rotating" } }));
+      atomicJson(this.attachmentPath(), saved);
+      await this.registry.update("lead", lane => ({ ...lane, dispatchBlocked: true, holdReason: "recovery",
+        runtimeHistory: lane.runtime?.hostInstanceId === old.instance ? [...(lane.runtimeHistory ?? []), lane.runtime] : lane.runtimeHistory,
+        leadRestart: { operationId: record.operationId, authorizationHash: record.authorizationHash, phase: "held" },
+        runtime: { ...record.before.runtime!, hostInstanceId: saved.instance, generation: saved.generation, state: "idle", held: true, activeTurnId: undefined,
+          omp: { kind: "omp", target, attachmentInstanceId: saved.instance, attachmentGeneration: saved.generation, attachedAt: record.createdAt, excludedInboxIds },
+          external: { socketPath: target.socketPath, binary: record.config.runtime.binary, bridge: saved.bridge } } }));
+    });
+  }
+  private async reconcileRestartContinuation(record: RestartRecord): Promise<boolean> {
+    const staged = await restartNativeStaged(record);
+    if (!staged || !record.continuation || !record.freshTarget) return false;
+    const previous = this.inbox.get(record.continuation.operationId);
+    if (previous && (!sameJson(previous.receipt, staged.receipt) || previous.text !== record.continuation.text || previous.attachmentInstance !== record.launch.instance)) throw new Error("Restart continuation mailbox provenance changed");
+    if (!previous) this.inbox.put({ id: record.continuation.operationId, target: "lead", text: record.continuation.text, state: "sent", at: new Date().toISOString(),
+      source: "lead-restart-continuation", thread: record.authorization.thread, ownerUser: record.authorization.owner,
+      metadata: { operationId: record.operationId, authorizationHash: record.authorizationHash, originalSource: record.authorization.source,
+        originalSourceMessageId: record.authorization.sourceMessageId, originalMailId: record.authorization.mail.id },
+      attachmentInstance: record.launch.instance, receiptKind: "omp-session-entry", receipt: staged.receipt, turnId: staged.receipt.receiptId,
+      ompProvenance: { target: record.freshTarget, attachmentInstanceId: record.launch.instance, attachmentGeneration: record.launch.generation } });
+    return true;
+  }
+  private async finishRestart(record: RestartRecord): Promise<void> {
+    await withBindingFence(this.config.stateDir, async () => {
+      await this.assertRestartScope(record);
+      await this.registry.update("lead", lane => {
+        if (lane.runtime?.hostInstanceId !== record.launch.instance || lane.runtime.generation !== record.launch.generation || lane.leadRestart?.operationId !== record.operationId) throw new Error("Restart release attachment changed");
+        return { ...lane, dispatchBlocked: false, holdReason: undefined, leadRestart: { operationId: record.operationId, authorizationHash: record.authorizationHash, phase: "released" },
+          runtime: { ...lane.runtime, held: false } };
+      });
+    });
+  }
   private attachmentPath(): string { return join(this.config.stateDir, "attachments", "lead.json"); }
   private attachment(lane: Lane): Attachment {
     const saved = readJson<Attachment>(this.attachmentPath());
@@ -513,6 +655,10 @@ export class DoriService {
   }
   private async externalCall(lane: Lane, action: string, args: any): Promise<unknown> {
     if (!["inspect", "input"].includes(action)) throw new Error(`External current-session ${action} is unsupported; use lead-detach`);
+    if (this.leadRestarts.hasActive()) {
+      if (action !== "inspect") throw new DeliveryDeferred("Lead restart fences dispatch");
+      throw new DeliveryDeferred("Restart coordinator owns native observation; use lead-restart-status");
+    }
     const pending = this.pendingHandoff();
     if (pending) {
       if (action !== "inspect") throw new DeliveryDeferred("Recorded lead handoff is incomplete; dispatch held");
@@ -897,6 +1043,8 @@ export class DoriService {
   }
   private async handleScoped(action: string, args: any, caller: Caller): Promise<any> {
     if (!args || typeof args !== "object") throw new Error("Expected args object");
+    if (this.leadRestarts.hasActive() && !["lead-restart", "lead-restart-status", "status", "health", "tick", "mail-list", "can-launch"].includes(action) &&
+      (this.blocksPendingMutation(action, args, caller) || ["lead-handoff", "lead-activate", "approval-respond"].includes(action))) throw new Error("Lead restart incomplete; lead mutation held");
     if (this.stopping) throw new Error("Service stopping");
     if (this.pendingHandoff() && this.blocksPendingMutation(action, args, caller)) throw new Error("Lead handoff incomplete; mutations are held until its recorded operation finishes");
     if (caller.instance) {
@@ -909,6 +1057,24 @@ export class DoriService {
     if (action === "health") {
       if (caller.role !== "admin" && !(caller.role === "lead" && caller.key === "lead" && caller.instance)) throw new Error("Health requires operator or current scoped lead capability");
       return this.health();
+    }
+    if (action === "lead-restart" || action === "lead-restart-status") {
+      if (caller.role !== "admin" && !(caller.role === "lead" && caller.key === "lead" && caller.instance)) throw new Error("Restart requires operator or current attached lead capability");
+      if (typeof args.operationId !== "string" || !args.operationId.trim() || args.operationId.length > 200 ||
+        !exactKeys(args, action === "lead-restart" ? ["operationId", "sourceMessageId"] : ["operationId"])) throw new Error("Exact bounded restart operation/source arguments required");
+      return this.launchQueue.run("lead", () => this.dispatchQueue.run("lead", async () => {
+        if (action === "lead-restart-status") return this.leadRestarts.reconcile(args.operationId);
+        if (typeof args.sourceMessageId !== "string" || !args.sourceMessageId.trim() || args.sourceMessageId.length > 512) throw new Error("Original bounded owner sourceMessageId required");
+        const prior = this.leadRestarts.get(args.operationId);
+        if (prior) {
+          if (prior.authorization.sourceMessageId !== args.sourceMessageId) throw new Error("Restart operationId reused with changed source");
+          const source = this.inbox.get(prior.authorization.mail.id);
+          if (!sameJson(source, prior.authorization.mail) || !this.config.ingress.some(i => i.id === prior.authorization.source && i.owners.includes(prior.authorization.owner))) throw new Error("Restart original owner source changed");
+          return this.leadRestarts.reconcile(args.operationId);
+        }
+        this.assertNoPendingLeadMutation();
+        return this.acceptLeadRestart(args.operationId, args.sourceMessageId);
+      }));
     }
     if (action === "lead-activate") {
       if (caller.role !== "admin") throw new Error("lead-activate requires operator capability");
@@ -1364,6 +1530,10 @@ export class DoriService {
   }
   tick(): Promise<void> { return this.withIntake(() => this.tickScoped()); }
   private async tickScoped(): Promise<void> {
+    if (this.leadRestarts.hasActive()) {
+      await this.launchQueue.run("lead", () => this.dispatchQueue.run("lead", () => this.leadRestarts.tick()));
+      await this.health(); return;
+    }
     if (this.pendingHandoff()) {
       await this.deps.runtime.inspect("lead").catch(() => {}); await this.health(); return;
     }

@@ -269,3 +269,78 @@ work is busy. Only idle admission submits it. This avoids turning a normal
 in-flight task's steering delay into another receipt timeout and automatic hold;
 ordinary owner conversation to the attached lead retains its existing routing.
 
+## Owner-authorized same-session OMP lead restart
+
+`lead-restart --operation-id ID --source-message-id ID` submits one restart to
+the persistent service. `lead-restart-status --operation-id ID` reconciles by
+read-only native observations; neither a retry nor a status lookup repeats an
+uncertain prepare, shutdown, launch, continuation submission or release.
+
+The source must be one original configured-owner ingress message delivered to
+the currently attached native lead with its exact native receipt, original
+thread, attachment instance/generation and controller scope. Quoted text,
+unreceipted input, old epochs, future sources and native-question answers do not
+authorize restart. An operation ID cannot change source or payload. One source
+cannot authorize a second accepted restart.
+
+The service performs authenticated read-only capability negotiation before
+accepting the operation or consuming the source. `capabilities.leadRestart`
+must be explicitly true. An absent capability in an already-running old-loaded
+runtime is a safe refusal: no restart intent or dispatch barrier is created,
+and ordinary owner ingress continues. Deploying new files on disk does not
+upgrade that running process. No authenticated hot-reload/owner endpoint exists
+for the first upgrade; an explicit operator bootstrap is a separate prerequisite.
+After that bootstrap, a new owner message must obtain a real receipt in the new
+epoch. Old unknown requests are never replayed to bootstrap the feature.
+
+The durable coordinator progresses through `authorized`, `prepare-pending`,
+`waiting-idle`, `held`, `exit-pending`, `exited`, `start-pending`, `fresh-held`,
+`rotation-pending`, `rotated`, `continuation-pending`, `continuation-staged`,
+`release-pending`, and `released`. Verified pre-submit prepare refusal uses
+`refused` → `rejected` and frees the source after local intake repair. All
+`*-pending` external-effect phases are write-ahead uncertainty barriers, not
+permission to resend. The service, not the exiting model process, owns progress.
+Busy turns finish normally before native idle latch/shutdown.
+
+Native exit acknowledgment is not exit proof. The service pins an authenticated
+controller's process descriptor before arming, observes actual process exit
+without sending signals, and requires Herdr detachment plus the original
+pane/terminal/cwd before invoking structured `herdr agent start --kind omp`.
+The exact saved session file is resumed; no new UUID, pane, tab, guessed PID,
+shell command typing or `pane run` fallback is allowed. The configured executable
+must match the canonical `omp` launcher. Startup preserves the pinned settings
+home, provider/model/effort, approval mode, cwd, and existing persona/session
+configuration without inspecting or copying persona/auth/session contents.
+
+The authenticated native `inspect().launchMetadata` must expose the actual
+`agentDir`, `settingsHome`, approval mode, provider, model and effective effort.
+These non-secret values are bound into the authorization digest before source
+consumption; managed-worker profile defaults are never substituted. The native
+and settings roots must be identical for the single-directory launch flag.
+Missing metadata, split roots, unsupported approval/effort selectors or later
+profile drift refuse or fence the operation without guessing another account.
+
+Structured startup includes fixed native `--start-held`, pinned `--agent-dir`,
+explicit model/thinking/approval selectors and the private bootstrap flag.
+The constructor-time fence precedes inference; an ordinary idle snapshot or an
+extension-installed late hold is not a substitute. Fresh status must attest the
+same pinned launch metadata before continuation staging and release.
+
+The fresh native controller must attest the restart bootstrap and fresh
+generation while held. Only then does a replayable local transaction rotate
+the attachment capability, retaining old epochs and mailbox provenance. A
+source-bound continuation carries the exact new scoped bridge and is staged
+before controlled release. Old source/receipt rows are never relabeled or
+replayed. New owner messages accepted during the restart are durably queued
+for the reserved fresh attachment, are not excluded during rotation, and
+become deliverable only after release. Generic external reconnection and
+watchdog notification defer to the coordinator through the intentional exit
+and startup gap. Generic borrowed-lead hold/release/stop remains forbidden.
+
+Status schema version 1 returns operation/phase, immutable authorization digest,
+source/owner/thread, pinned UUID/session file/pane/terminal, previous and current
+native instance/generation, attachment instance/generation, fresh bridge when
+known, timestamps, active/uncertain flags and bounded problem category. It never
+returns tokens, bootstrap contents, full owner input or configured credentials.
+Durable coordinator records remain private service persistence.
+

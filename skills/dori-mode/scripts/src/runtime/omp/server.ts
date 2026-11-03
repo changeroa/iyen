@@ -4,6 +4,10 @@ import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { OMP_MAX_FRAME_BYTES, OmpError, assertIdentity, exactKeys, identityOf, markedText, object, parseRequest, payloadHash,
   validInteraction, validInteractionStatus, assertInteractionAnswer,
+  sameIdentity, validRestartIntent, validRestartStatus,
+  validLaunchMetadata, sameLaunchMetadata, type OmpLaunchMetadata,
+  leadRestartContinuationId, type LeadRestartContinuation,
+  type LeadRestartIntent, type LeadRestartBootstrap, type LeadRestartStatus,
   type NativeUserInteractions, type NativeInteractionResponse, type NativeUserInteraction,
   type OmpGoal, type OmpIdentity, type OmpOperation, type OmpRequest, type OmpSnapshot, type OmpTarget } from "./contract.ts";
 import { FailureJournal, failureCategory } from "./failures.ts";
@@ -29,7 +33,12 @@ export type OmpNativeApi = { sendUserMessage(text: string): void; getThinkingLev
 export type OmpExecutionHoldState = { sessionId: string; generation: number; status: "open" | "holding" | "held" };
 export type OmpExecutionHold = {
   getState(): OmpExecutionHoldState;
+  getLaunchMetadata?(): OmpLaunchMetadata;
+  isRestartStartupHeld?(): boolean;
   hold(): Promise<OmpExecutionHoldState>;
+  tryHoldForRestart?(operationId: string, authorizationHash: string): Promise<OmpExecutionHoldState | null>;
+  stageRestartContinuation?(operationId: string, authorizationHash: string, text: string): Promise<{ entryId: string; textHash: string }>;
+  releaseRestartContinuation?(operationId: string, authorizationHash: string, expected: OmpExecutionHoldState): Promise<OmpExecutionHoldState>;
   release(expected: { sessionId: string; generation: number }): Promise<OmpExecutionHoldState>;
 };
 type ControlState = { held: boolean; origin?: "user" | "automatic"; pausedGoal?: OmpGoal; coreHold?: OmpExecutionHoldState; stopping?: boolean; controllerInstanceId?: string };
@@ -84,9 +93,13 @@ export class OmpControlServer {
   private parkedData = false;
   private journal: OperationJournal;
   private readonly controlFile: string;
+  private restart?: { intent: LeadRestartIntent; status: LeadRestartStatus; hold?: OmpExecutionHoldState };
+  private restartTimer?: NodeJS.Timeout;
+  private restartPath(): string { return join(this.sessionDirectory, "lead-restart.json"); }
   constructor(readonly target: OmpTarget, private readonly token: string, readonly sessionDirectory: string,
     private readonly context: () => OmpContext, private readonly api: OmpNativeApi,
-    private readonly options: { timeoutMs?: number; startHeld?: boolean; verifyAssociation?: () => Promise<void> } = {}) {
+    private readonly options: { timeoutMs?: number; startHeld?: boolean; restart?: LeadRestartBootstrap; verifyAssociation?: () => Promise<void> } = {}) {
+    if (options.restart) this.assertLaunchMetadata(options.restart.launchMetadata);
     privateDirectory(sessionDirectory);
     const initial = context();
     this.observedSafeSettle = initial.isIdle() && !initial.hasPendingMessages() && !hasAsyncWork(initial.getAsyncJobSnapshot());
@@ -107,8 +120,239 @@ export class OmpControlServer {
         saved.controllerInstanceId !== target.instanceId && this.core(initial)?.getState().status === "open") delete this.state.stopping;
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new OmpError("invalid-control-state", "OMP saved hold state cannot be verified"); }
     this.save();
+    try {
+      const saved: unknown = readPrivateJson(this.restartPath());
+      if (!object(saved) || !validRestartIntent(saved.intent) || !object(saved.status) ||
+        !validRestartStatus(saved.status, saved.status.target as OmpTarget, saved.intent)) throw new Error("Invalid restart journal");
+      if (this.sameRestartTarget(saved.status.target, target)) {
+        this.restart = saved as unknown as NonNullable<OmpControlServer["restart"]>;
+      } else if (options.restart && saved.status.phase === "exit-requested" &&
+        this.sameRestartIntent(saved.intent, options.restart) && this.sameRestartTarget(saved.status.target, options.restart.previousTarget) &&
+        this.sameRestartSession(options.restart.previousTarget, target)) {
+        this.restart = { intent: options.restart, status: { operationId: options.restart.operationId,
+          authorizationHash: options.restart.authorizationHash, sourceMessageId: options.restart.sourceMessageId,
+          launchMetadata: { ...options.restart.launchMetadata },
+          process: this.restartProcess(), bootstrap: options.restart, phase: "waiting-idle", target } };
+        this.saveRestart();
+      } else if (saved.status.phase !== "released") throw new Error("Unreconciled restart epoch");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new OmpError("restart-journal-invalid", "Native restart journal or bootstrap mismatch");
+      if (options.restart) throw new OmpError("restart-source-missing", "Resume requires the original exit intent", false);
+    }
   }
   private save(): void { durableJson(this.controlFile, { ...this.state, controllerInstanceId: this.target.instanceId }); }
+  private sameRestartIntent(a: LeadRestartIntent, b: LeadRestartIntent): boolean {
+    return a.operationId === b.operationId && a.authorizationHash === b.authorizationHash && a.sourceMessageId === b.sourceMessageId &&
+      sameLaunchMetadata(a.launchMetadata, b.launchMetadata);
+  }
+  private sameRestartTarget(a: OmpTarget, b: OmpTarget): boolean {
+    return sameIdentity(a, b) && a.socketPath === b.socketPath && a.tokenFile === b.tokenFile;
+  }
+  private sameRestartSession(a: OmpTarget, b: OmpTarget): boolean {
+    return a.role === "attached-lead" && b.role === "attached-lead" && a.laneKey === "lead" && b.laneKey === "lead" &&
+      ["sessionId", "sessionFile", "paneId", "terminalId", "cwd", "runtimeVersion"].every(k => a[k as keyof OmpTarget] === b[k as keyof OmpTarget]) &&
+      a.instanceId !== b.instanceId;
+  }
+  private restartProcess(): LeadRestartStatus["process"] {
+    return { pid: process.pid, controllerInstanceId: this.target.instanceId, controllerGeneration: this.target.generation };
+  }
+  private currentLaunchMetadata(): OmpLaunchMetadata | undefined {
+    const ctx = this.live(), core = this.core(ctx);
+    try {
+      const value = core?.getLaunchMetadata?.();
+      if (!validLaunchMetadata(value) || value.provider !== ctx.model?.provider || value.model !== ctx.model?.id ||
+        value.effort !== this.api.getThinkingLevel()) return undefined;
+      return value;
+    } catch { return undefined; }
+  }
+  private assertLaunchMetadata(expected: OmpLaunchMetadata): OmpLaunchMetadata {
+    const current = this.currentLaunchMetadata();
+    if (!current || current.agentDir !== current.settingsHome || !sameLaunchMetadata(current, expected))
+      throw new OmpError("restart-launch-mismatch", "Effective native launch profile does not match pinned restart intent", false);
+    return current;
+  }
+  private restartObservation(intent: LeadRestartIntent): LeadRestartStatus {
+    const metadata = this.currentLaunchMetadata();
+    if (!this.restart || !metadata) throw new OmpError("restart-launch-unavailable", "Native launch metadata cannot be attested", false);
+    return { ...this.restart.status, launchMetadata: metadata, fence: this.core(this.live())?.getState(),
+      continuation: this.restart.status.continuation ?? this.readRestartContinuation(intent) };
+  }
+  private restartAvailable(metadata: OmpLaunchMetadata | undefined): boolean {
+    const ctx = this.live(), core = this.core(ctx);
+    return !!metadata && metadata.agentDir === metadata.settingsHome && this.target.role === "attached-lead" && this.target.laneKey === "lead" &&
+      typeof core?.isRestartStartupHeld === "function" && typeof core.tryHoldForRestart === "function" && typeof core.stageRestartContinuation === "function" &&
+      typeof core.releaseRestartContinuation === "function" && typeof ctx.shutdown === "function";
+  }
+  private saveRestart(): void {
+    if (this.restart) {
+      const metadata = this.currentLaunchMetadata();
+      if (metadata) this.restart.status.launchMetadata = metadata;
+      else { this.restart.status.phase = "failed"; this.restart.status.message = "native-launch-metadata-unavailable"; }
+    }
+    if (this.restart) this.restart.status.fence = this.core(this.live())?.getState();
+    durableJson(this.restartPath(), this.restart);
+  }
+  private async latchRestart(): Promise<void> {
+    const restart = this.restart;
+    if (!restart || restart.status.phase !== "waiting-idle" || this.closed) return;
+    this.assertLaunchMetadata(restart.intent.launchMetadata);
+    const ctx = this.live(), core = this.core(ctx);
+    if (!core?.tryHoldForRestart) throw new OmpError("restart-native-unavailable", "Native non-interrupting restart latch unavailable", false);
+    if (this.tools.size || this.compacting || this.continuing || this.retrying || this.awaitingErrorSettle ||
+      ctx.getPendingPlanReview() || this.approvals.size || this.inputTools.size || this.listInteractions(ctx).length) return;
+    const held = await core.tryHoldForRestart(restart.intent.operationId, restart.intent.authorizationHash);
+    this.live();
+    this.assertLaunchMetadata(restart.intent.launchMetadata);
+    if (!held) return;
+    if (held.status !== "held" || held.sessionId !== this.target.sessionId ||
+      held.generation !== core.getState().generation || core.getState().status !== "held")
+      throw new OmpError("restart-hold-unknown", "Native restart latch unconfirmed", true);
+    restart.hold = held;
+    this.state.held = true;
+    this.state.coreHold = held;
+    this.observedSafeSettle = true;
+    restart.status.phase = "held";
+    this.save(); this.saveRestart();
+  }
+  private armRestart(): void {
+    if (this.restartTimer || this.closed || this.restart?.status.phase !== "waiting-idle") return;
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = undefined;
+      void this.mutation(() => this.latchRestart()).catch(() => {
+        if (this.restart) { this.restart.status.phase = "failed"; this.state.held = true; this.save(); this.saveRestart(); }
+      }).finally(() => this.armRestart());
+    }, 50);
+  }
+  private async leadRestart(method: string, intent: LeadRestartIntent): Promise<LeadRestartStatus> {
+    return this.mutation(async () => {
+      if (this.target.role !== "attached-lead" || this.target.laneKey !== "lead")
+        throw new OmpError("restart-role-forbidden", "Only the attached lead permits owner restart", false);
+      try {
+        const history: unknown = readPrivateJson(join(this.sessionDirectory, `restart-history-${payloadHash(intent.operationId)}.json`));
+        if (!object(history) || !validRestartIntent(history.intent) || !this.sameRestartIntent(history.intent, intent))
+          throw new OmpError("restart-conflict", "Historical restart operation conflict", false);
+        if (method === "restart-inspect" && validRestartStatus(history.status, this.target, intent)) return history.status;
+        throw new OmpError("restart-historical", "Historical restart cannot be executed again", false);
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      if (method === "restart-prepare" && this.restart?.status.phase === "released" &&
+        this.restart.intent.operationId !== intent.operationId) {
+        if (this.snapshot().capabilities.leadRestart !== true || intent.previousTarget || this.state.held || this.state.stopping)
+          throw new OmpError("restart-not-ready", "Native restart preflight unavailable", false);
+        this.assertLaunchMetadata(intent.launchMetadata);
+        durableJson(join(this.sessionDirectory, `restart-history-${payloadHash(this.restart.intent.operationId)}.json`), this.restart);
+        this.restart = undefined;
+      }
+      if (this.restart && !this.sameRestartIntent(this.restart.intent, intent))
+        throw new OmpError("restart-conflict", "Restart operation/source/authorization conflict", false);
+      if (this.restart?.intent.previousTarget && (!intent.previousTarget ||
+        !this.sameRestartTarget(this.restart.intent.previousTarget, intent.previousTarget)))
+        throw new OmpError("restart-bootstrap-mismatch", "Exact recorded previous controller required", false);
+      if (!this.restart) {
+        this.assertLaunchMetadata(intent.launchMetadata);
+        if (method !== "restart-prepare" || intent.previousTarget || this.state.held || this.state.stopping)
+          throw new OmpError("restart-missing", "No matching restart prepared", false);
+        if (this.snapshot().capabilities.leadRestart !== true)
+          throw new OmpError("restart-native-unavailable", "Native restart SDK upgrade required", false);
+        this.restart = { intent, status: { operationId: intent.operationId, authorizationHash: intent.authorizationHash,
+          sourceMessageId: intent.sourceMessageId, launchMetadata: { ...intent.launchMetadata }, process: this.restartProcess(), phase: "waiting-idle", target: this.target } };
+        this.saveRestart();
+      }
+      const restart = this.restart;
+      if (method === "restart-prepare") {
+        try { await this.latchRestart(); }
+        catch (error) { restart.status.phase = "failed"; this.state.held = true; this.save(); this.saveRestart(); throw error; }
+        this.armRestart();
+      }
+      if (method === "restart-commit") {
+        if (restart.status.phase === "exit-requested") return this.restartObservation(intent);
+        const ctx = this.live(), core = this.core(ctx);
+        if ((this.options.restart && this.sameRestartIntent(this.options.restart, intent)) || restart.status.phase !== "held" || !restart.hold ||
+          core?.getState().status !== "held" || core.getState().generation !== restart.hold.generation ||
+          !ctx.isIdle() || this.tools.size || hasActiveAsyncExecution(ctx.getAsyncJobSnapshot()))
+          throw new OmpError("restart-not-held", "Exact idle native restart latch required", false);
+        this.assertLaunchMetadata(intent.launchMetadata);
+        restart.status.phase = "exit-requested";
+        this.state.stopping = true;
+        this.save(); this.saveRestart();
+        // Exactly one graceful request. Unknown ACK needs exit/Herdr evidence.
+        setTimeout(() => {
+          if (this.closed) return;
+          try {
+            this.assertLaunchMetadata(intent.launchMetadata);
+            const current = this.core(this.live())?.getState();
+            if (current?.status !== "held" || current.generation !== restart.hold?.generation) throw new Error("Native restart fence changed");
+            this.live().shutdown();
+          } catch {
+            restart.status.phase = "failed"; restart.status.message = "native-exit-outcome-unknown"; this.saveRestart();
+          }
+        }, 10);
+      }
+      if (method === "restart-release") {
+        if (!this.options.restart || !intent.previousTarget ||
+          !this.sameRestartIntent(this.options.restart, intent) ||
+          !this.sameRestartTarget(this.options.restart.previousTarget, intent.previousTarget) ||
+          !this.sameRestartSession(intent.previousTarget, this.target))
+          throw new OmpError("restart-bootstrap-mismatch", "Fresh exact restart bootstrap required", false);
+        if (restart.status.phase === "released") return this.restartObservation(intent);
+        const core = this.core(this.live());
+        restart.status.continuation ??= this.readRestartContinuation(intent);
+        if (restart.status.phase !== "held" || !restart.hold || !core?.releaseRestartContinuation || !restart.status.continuation ||
+          core.getState().status !== "held" || core.getState().generation !== restart.hold.generation)
+          throw new OmpError("restart-not-held", "Fresh native restart latch required", false);
+        this.assertLaunchMetadata(intent.launchMetadata);
+        restart.status.phase = "failed"; this.saveRestart();
+        await core.releaseRestartContinuation(intent.operationId, intent.authorizationHash, restart.hold); this.live();
+        this.assertLaunchMetadata(intent.launchMetadata);
+        if (core.getState().status !== "open") throw new OmpError("restart-release-unknown", "Native release unconfirmed", true);
+        this.state = { held: false }; this.parkedData = true; this.observedSafeSettle = true;
+        restart.status.phase = "released"; this.save(); this.saveRestart();
+      }
+      return this.restartObservation(intent);
+    });
+  }
+  private readRestartContinuation(intent: LeadRestartIntent): LeadRestartContinuation | undefined {
+    if (!this.options.restart || !this.sameRestartIntent(intent, this.options.restart)) return undefined;
+    const operationId = leadRestartContinuationId(intent.operationId);
+    let payload: unknown;
+    try { payload = readPrivateJson(this.payloadPath(operationId)); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+    if (!object(payload) || !exactKeys(payload, ["operationId", "text", "payloadHash"]) ||
+      payload.operationId !== operationId || typeof payload.text !== "string" || payloadHash(payload.text) !== payload.payloadHash)
+      throw new OmpError("restart-stage-payload-invalid", "Restart continuation payload invalid", true);
+    const receipt = persistedReceipt(this.identity, this.live().sessionManager.getLeafId(), payload.text, operationId);
+    return receipt ? { operationId: intent.operationId, authorizationHash: intent.authorizationHash,
+      target: this.target, textHash: payloadHash(payload.text), receipt } : undefined;
+  }
+  private async stageRestart(intent: LeadRestartIntent, text: string): Promise<LeadRestartContinuation> {
+    return this.mutation(async () => {
+      const restart = this.restart, core = this.core(this.live());
+      if (!this.options.restart || !intent.previousTarget || !restart || !this.sameRestartIntent(restart.intent, intent) ||
+        !this.sameRestartTarget(intent.previousTarget, this.options.restart.previousTarget) || !this.sameRestartSession(intent.previousTarget, this.target) ||
+        restart.status.phase !== "held" || !restart.hold || core?.getState().status !== "held" ||
+        core.getState().generation !== restart.hold.generation || !core.stageRestartContinuation)
+        throw new OmpError("restart-stage-forbidden", "Exact fresh held restart bootstrap required", false);
+      this.assertLaunchMetadata(intent.launchMetadata);
+      const operationId = leadRestartContinuationId(intent.operationId), digest = payloadHash(text);
+      const previous = this.journal.get(operationId, digest);
+      if (previous.status === "absent") {
+        durableJson(this.payloadPath(operationId), { operationId, text, payloadHash: digest });
+        this.journal.reserve(operationId, digest);
+        this.journal.attempted(operationId, digest);
+        // The native API appends/fsyncs without inference. A thrown/unknown call
+        // is permanently fenced by the attempted journal; never append again.
+        const staged = await core.stageRestartContinuation(intent.operationId, intent.authorizationHash, markedText(text, operationId));
+        this.live();
+        this.assertLaunchMetadata(intent.launchMetadata);
+        if (staged.textHash !== payloadHash(markedText(text, operationId))) throw new OmpError("restart-stage-hash", "Native staged text hash mismatch", true);
+      }
+      const reconciled = this.reconcile(operationId, digest);
+      if (reconciled.status !== "received") throw new OmpError("restart-stage-unknown", "Native staged continuation receipt unknown", true);
+      const continuation: LeadRestartContinuation = { operationId: intent.operationId, authorizationHash: intent.authorizationHash,
+        target: this.target, textHash: digest, receipt: reconciled.receipt };
+      restart.status.continuation = continuation; this.saveRestart();
+      return continuation;
+    });
+  }
   private core(ctx: OmpContext): OmpExecutionHold | undefined {
     const core = ctx.executionHold;
     if (!core || typeof core.getState !== "function" || typeof core.hold !== "function" || typeof core.release !== "function") return undefined;
@@ -151,11 +395,12 @@ export class OmpControlServer {
     try { persistedReceipt(this.identity, ctx.sessionManager.getLeafId(), "", "capability-probe"); }
     catch { durable = false; }
     const managed = this.target.role === "managed-lane", modes = ctx.sessionModes, core = this.core(ctx), barrier = !!core;
+    const launchMetadata = this.currentLaunchMetadata();
     let interactionReady = false;
     let dialogs: NativeUserInteraction[] = [];
     try { dialogs = this.listInteractions(ctx); interactionReady = true; } catch { /* Never advertise unavailable/malformed native capability. */ }
     const waiting = dialogs.some(r => r.kind === "approval" || r.kind === "plan-review") || this.approvals.size > 0 || !!ctx.getPendingPlanReview();
-    const nativeHeld = managed && core?.getState().status === "held";
+    const nativeHeld = (managed || !!this.restart?.hold) && core?.getState().status === "held";
     const pending = (nativeHeld || this.parkedData ? hasActiveAsyncExecution(ctx.getAsyncJobSnapshot()) : ctx.hasPendingMessages() || hasAsyncWork(ctx.getAsyncJobSnapshot())) || this.continuing || this.compacting || this.retrying || this.awaitingErrorSettle;
     const idle = ctx.isIdle() && this.tools.size === 0 && !pending;
     const failureHealthy = !managed || (!!this.failures?.available && !this.failureGap);
@@ -163,7 +408,8 @@ export class OmpControlServer {
     return { identity: this.identity, state: waiting ? "waiting_approval" : dialogs.length || this.inputTools.size ? "waiting_input" : managed && core?.getState().status === "holding" ? "pausing" : failed ? "failed" : !this.observedSafeSettle || this.retrying || this.awaitingErrorSettle ? "recovering" : idle ? "idle" : this.state.held ? "pausing" : "running",
       held: this.state.held || (managed && !!core && core.getState().status !== "open"), activeRunId: idle ? undefined : this.runId,
       goal: this.goal(ctx), model: ctx.model?.id ?? "", provider: ctx.model?.provider ?? "", effort: this.api.getThinkingLevel(), eventSequence: this.sequence,
-      capabilities: { inspect: true, interactions: interactionReady, input: durable && !failed && !this.compacting && !this.retrying && !this.awaitingErrorSettle && this.observedSafeSettle && (!managed || barrier), durableReceipts: durable, durableFailures: managed && failureHealthy, hold: managed && !!modes && barrier, release: managed && !!modes && barrier, stop: managed && !!modes && barrier, goals: !!modes } };
+      launchMetadata,
+      capabilities: { inspect: true, interactions: interactionReady, leadRestart: durable && interactionReady && this.restartAvailable(launchMetadata), input: (!this.restart || this.restart.status.phase === "released") && durable && !failed && !this.compacting && !this.retrying && !this.awaitingErrorSettle && this.observedSafeSettle && (!managed || barrier), durableReceipts: durable, durableFailures: managed && failureHealthy, hold: managed && !!modes && barrier, release: managed && !!modes && barrier, stop: managed && !!modes && barrier, goals: !!modes } };
   }
   get identity(): OmpIdentity { return identityOf(this.target); }
   private recordFailure(executionId: string | undefined, phase: "model" | "compaction", error: unknown): void {
@@ -247,6 +493,11 @@ export class OmpControlServer {
   async dispatch(request: OmpRequest): Promise<unknown> {
     assertIdentity(request.target, this.identity); this.live(); await this.options.verifyAssociation?.(); this.live();
     const p = request.params, id = p.operationId as string, digest = p.payloadHash as string;
+    if (request.method === "restart-stage") {
+      const { text, payloadHash: _digest, ...intent } = p;
+      return this.stageRestart(intent as LeadRestartIntent, text as string);
+    }
+    if (request.method.startsWith("restart-")) return this.leadRestart(request.method, p as LeadRestartIntent);
     if (request.method === "inspect") return this.snapshot();
     if (request.method === "interactions") return this.listInteractions(this.live());
     if (request.method === "interaction-response-status") {
@@ -283,6 +534,7 @@ export class OmpControlServer {
       await this.mutation(() => {
         const ctx = this.live(), existing = this.journal.get(id, digest);
         if (existing.status !== "absent") return;
+        if (this.restart && this.restart.status.phase !== "released") throw new OmpError("restart-input-fenced", "Native input fenced by owner restart", false);
         const snap = this.snapshot();
         if (snap.held || !["idle", "running"].includes(snap.state) || !snap.capabilities.input || !ctx.model || ctx.sessionModes?.getState().loop.status === "active") throw new OmpError("dispatch-blocked", "OMP dispatch blocked before submission", false);
         durableJson(this.payloadPath(id), { operationId: id, text: p.text, payloadHash: digest });
@@ -363,6 +615,11 @@ export class OmpControlServer {
   }
   async listen(): Promise<void> {
     if (this.state.held && this.target.role === "managed-lane" && this.core(this.live())) await this.hold(this.state.origin ?? "automatic");
+    if (this.options.restart) {
+      await this.latchRestart();
+      if (this.restart?.status.phase !== "held") throw new OmpError("restart-startup-unheld", "Restart startup must be latched before publication", false);
+      this.state.stopping = false; this.save();
+    } else this.armRestart();
     this.server = createServer(socket => {
       this.sockets.add(socket); socket.on("error", () => {}); socket.once("close", () => this.sockets.delete(socket));
       socket.setTimeout(this.options.timeoutMs ?? 15000, () => socket.destroy());
@@ -400,6 +657,7 @@ export class OmpControlServer {
   }
   close(): void {
     this.closed = true; this.server?.close(); for (const socket of this.sockets) socket.destroy();
+    if (this.restartTimer) clearTimeout(this.restartTimer);
     try { unlinkSync(this.target.socketPath); } catch { /* Already removed. */ }
   }
 }

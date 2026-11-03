@@ -22,6 +22,8 @@ export type Lane = {
   readonly revision?: number;
   readonly runtime?: RuntimeRef;
   readonly runtimeHistory?: readonly RuntimeRef[];
+  /** Durable restart-only capability rotation; generic borrowed-lead controls remain forbidden. */
+  readonly leadRestart?: { operationId: string; authorizationHash: string; phase: "rotating" | "held" | "released" };
   readonly dispatchBlocked?: boolean;
   readonly holdReason?: "owner-pause" | "done-review" | "recovery";
   readonly cycle?: number;

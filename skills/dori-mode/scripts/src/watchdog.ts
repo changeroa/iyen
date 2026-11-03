@@ -43,6 +43,8 @@ const deliberateLane = (lane: Lane | null): boolean => Boolean(lane && (
   ["owner-pause", "done-review"].includes(lane.holdReason ?? "") ||
   ["paused", "done-claimed", "verified-done", "closed"].includes(statusOf(lane))));
 const generationKey = (binding: TargetBinding) => hash([binding.instance, binding.generation]);
+// Service-owned restart deliberately spans a detached old controller and held fresh one.
+const restartPending = (dir: string): boolean => Boolean(read<{ active?: string }>(join(dir, "attachments/lead-restarts.json"))?.active);
 export const readWatchTarget = (dir: string): WatchTarget | null => {
   try {
     const a = read<Attachment>(join(dir, "attachments/lead.json")), lane = readWatchLane(dir);
@@ -54,7 +56,7 @@ export const readWatchTarget = (dir: string): WatchTarget | null => {
       a.binary !== ext.binary || a.binaryVersion !== r.binaryVersion || ext.rebind || !Array.isArray(a.excludedInboxIds)) return null;
     if (r.kind === "omp" && (!a.omp || !r.omp || !sameIdentity(a.omp, r.omp.target) || r.omp.attachmentInstanceId !== a.instance || r.omp.attachmentGeneration !== a.generation)) return null;
     return { attachment: a, lane, binding: { instance: a.instance, generation: a.generation, pane: a.pane, threadId: a.threadId, cwd: a.cwd, socketPath: a.socketPath, ...(a.omp ? { native: identityOf(a.omp) } : {}) },
-      deliberateHold: Boolean((lane.dispatchBlocked || r.held) && lane.holdReason !== "recovery") || ["owner-pause", "done-review"].includes(lane.holdReason ?? "") || ["paused", "done-claimed", "verified-done", "closed"].includes(statusOf(lane)),
+      deliberateHold: restartPending(dir) || Boolean((lane.dispatchBlocked || r.held) && lane.holdReason !== "recovery") || ["owner-pause", "done-review"].includes(lane.holdReason ?? "") || ["paused", "done-claimed", "verified-done", "closed"].includes(statusOf(lane)),
       handoffPending: existsSync(join(dir, "attachments/handoff.json")) };
   } catch { return null; }
 };
@@ -98,7 +100,7 @@ export class DeliveryWatchdog {
     } catch { health = readStartupHealth(dir); }
     finally { clearTimeout(timer); }
     const target = readWatchTarget(dir), authority = target?.lane ?? readWatchLane(dir);
-    const deliberate = target?.deliberateHold || deliberateLane(authority) || existsSync(join(dir, "attachments/handoff.json"));
+    const deliberate = restartPending(dir) || target?.deliberateHold || deliberateLane(authority) || existsSync(join(dir, "attachments/handoff.json"));
     // Health is fault evidence only. It can never authorize notification when
     // attachment records cannot establish the exact current target.
     const invalidActiveBinding = reachable && !target && !deliberate && ["held", "ready", "busy"].includes(health?.delivery?.state);

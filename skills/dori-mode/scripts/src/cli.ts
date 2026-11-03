@@ -22,6 +22,8 @@ const help = `dori — messenger lead and lanes (Codex default, explicit OMP pro
   lead-detach --thread-id UUID
   lead-handoff-preview --from-thread-id UUID --thread-id UUID --pane ID --cwd DIR
   lead-handoff --from-thread-id UUID --thread-id UUID --pane ID --cwd DIR --operation-id ID (--mail-id ID ... | --no-mail)
+  lead-restart --operation-id ID --source-message-id ID
+  lead-restart-status --operation-id ID
   launch KEY --title T --brief FILE --done SIGNALS [--thread REF] [--cwd DIR] [--model M] [--worktree]
   input KEY --text-file FILE [--operation-id ID]
   input-status KEY --operation-id ID [--text-file FILE]
@@ -54,11 +56,13 @@ const scopedInvocation = ["DORI_CONTEXT", "DORI_LANE_KEY", "DORI_LANE_TOKEN"].so
 // Scoped executables are service clients, never entrypoints to local lifecycle,
 // migration or messenger utilities. Apply this gate before any local handler,
 // even when the context is missing, malformed or already revoked.
-const scopedCommands = new Set(["", "help", "status", "health", "can-launch", "launch", "adopt", "input", "input-status", "reply", "report", "claim-done", "object-done", "pause", "resume", "close", "reopen", "recover", "sync", "approval", "mail", "work", "lead-detach", "watch", "freshness", "dead-panes", "guard", "mcp-server"]);
+const scopedCommands = new Set(["", "help", "status", "health", "can-launch", "launch", "adopt", "input", "input-status", "reply", "report", "claim-done", "object-done", "pause", "resume", "close", "reopen", "recover", "sync", "approval", "mail", "work", "lead-detach", "lead-restart", "lead-restart-status", "watch", "freshness", "dead-panes", "guard", "mcp-server"]);
 const scopedHelp = `iyen — scoped service commands
 
   help | status [key] | health | can-launch
   lead-detach --thread-id UUID
+  lead-restart --operation-id ID --source-message-id ID
+  lead-restart-status --operation-id ID
   launch KEY --title T --brief FILE --done SIGNALS [--thread REF] [--cwd DIR] [--model M] [--worktree]
   input KEY --text-file FILE [--operation-id ID]
   input-status KEY --operation-id ID [--text-file FILE]
@@ -129,6 +133,8 @@ try {
   const operationId = opt("operation-id") ?? crypto.randomUUID();
   let result: any;
   switch (command) {
+    case "lead-restart": result = await call(command, { operationId: need("operation-id"), sourceMessageId: need("source-message-id") }); break;
+    case "lead-restart-status": result = await call(command, { operationId: need("operation-id") }); break;
     case "lead-activate": result = await call(command, { threadId: need("thread-id"), pane: need("pane"), cwd: need("cwd"), sessionFile: opt("session-file"), terminalId: opt("terminal-id") }); break;
     case "lead": case "lead-attach": result = await call("lead-attach", { threadId: need("thread-id"), pane: need("pane"), cwd: need("cwd"), sessionFile: opt("session-file"), terminalId: opt("terminal-id") }); break;
     case "lead-detach": result = await call(command, { threadId: need("thread-id") }); break;
