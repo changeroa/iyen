@@ -554,3 +554,45 @@ test("public host-only recover retains the exact live OMP pane without creating 
     expect(await s.handle("recover", { key: "worker" }, { role: "admin" })).toMatchObject({ recovering: true }); expect(boots).toBe(1);
   } finally { f.cleanup(); }
 });
+
+for (const uncertain of ["unknown", "sending"] as const) test(`explicit recovery stop cannot bypass ${uncertain} input`, async () => {
+  const x = await setup();
+  try {
+    const attached = await x.s.handle("lead-activate", x.args, { role: "admin" });
+    const target = { ...x.f.target, role: "managed-lane" as const, laneKey: "recover-worker" };
+    await x.s.registry.write({ key: "recover-worker", role: "lane", title: "worker", thread: "none", brief: "/fixture", done: "fixture", openedAt: "now",
+      runtime: { kind: "omp", backend: "herdr-tui", threadId: target.sessionId, state: "idle", hostInstanceId: "worker-host", generation: 1, binaryVersion: "18.15.0",
+        omp: { kind: "omp", target, attachmentInstanceId: "worker-host", attachmentGeneration: 1, attachedAt: "now", excludedInboxIds: [] } } });
+    x.s.inbox.put({ id: "uncertain-original", target: "recover-worker", text: "original", state: uncertain, at: "now" });
+    let stops = 0;
+    x.s.deps.runtime.stop = async () => { stops++; };
+    await expect(x.s.handle("recover", { key: "recover-worker", stopCurrent: true, operationId: "recover-1" },
+      { role: "lead", key: "lead", instance: attached.lead.runtime.hostInstanceId })).rejects.toThrow("uncertain worker input");
+    expect(stops).toBe(0);
+    expect(x.s.inbox.get("uncertain-original")?.state).toBe(uncertain);
+    expect(x.s.operations.get("recovery-stop:recover-worker:recover-1")).toBeUndefined();
+  } finally { x.f.cleanup(); }
+});
+
+for (const changedEpoch of [false, true]) test(`recovery stop uncertainty is durable and cannot resend (changed epoch=${changedEpoch})`, async () => {
+  const x = await setup();
+  try {
+    const attached = await x.s.handle("lead-activate", x.args, { role: "admin" });
+    const target = { ...x.f.target, role: "managed-lane" as const, laneKey: "recover-worker" };
+    await x.s.registry.write({ key: "recover-worker", role: "lane", title: "worker", thread: "none", brief: "/fixture", done: "fixture", openedAt: "now",
+      runtime: { kind: "omp", backend: "herdr-tui", threadId: target.sessionId, state: "idle", hostInstanceId: "worker-host", generation: 1, binaryVersion: "18.15.0",
+        omp: { kind: "omp", target, attachmentInstanceId: "worker-host", attachmentGeneration: 1, attachedAt: "now", excludedInboxIds: [] } } });
+    let stops = 0;
+    x.s.deps.runtime.stop = async key => {
+      stops++;
+      if (changedEpoch) await x.s.registry.update(key, lane => ({ ...lane, runtime: { ...lane.runtime!, generation: 2 } }));
+      else throw new Error("Native exit unconfirmed");
+    };
+    const args = { key: "recover-worker", stopCurrent: true, operationId: "recover-1" }, caller = { role: "lead" as const, key: "lead", instance: attached.lead.runtime.hostInstanceId };
+    await expect(x.s.handle("recover", args, caller)).rejects.toThrow(changedEpoch ? "epoch changed" : "exit unconfirmed");
+    expect(x.s.operations.get("recovery-stop:recover-worker:recover-1")?.state).toBe("unknown");
+    await expect(x.s.handle("recover", args, caller)).rejects.toThrow();
+    expect(stops).toBe(1);
+    expect((await x.s.registry.read("recover-worker"))?.runtime?.threadId).toBe(target.sessionId);
+  } finally { x.f.cleanup(); }
+});

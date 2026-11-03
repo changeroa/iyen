@@ -32,7 +32,7 @@ export type OmpExecutionHold = {
   hold(): Promise<OmpExecutionHoldState>;
   release(expected: { sessionId: string; generation: number }): Promise<OmpExecutionHoldState>;
 };
-type ControlState = { held: boolean; origin?: "user" | "automatic"; pausedGoal?: OmpGoal; coreHold?: OmpExecutionHoldState; stopping?: boolean };
+type ControlState = { held: boolean; origin?: "user" | "automatic"; pausedGoal?: OmpGoal; coreHold?: OmpExecutionHoldState; stopping?: boolean; controllerInstanceId?: string };
 export function hasAsyncWork(snapshot: unknown): boolean {
   if (snapshot === null) return false;
   if (!object(snapshot) || !Array.isArray(snapshot.running) || !Array.isArray(snapshot.recent) || !object(snapshot.delivery)) return true;
@@ -99,10 +99,16 @@ export class OmpControlServer {
       if (!object(saved) || typeof saved.held !== "boolean" || (saved.origin !== undefined && saved.origin !== "user" && saved.origin !== "automatic") ||
         (saved.pausedGoal !== undefined && saved.pausedGoal !== null && (!object(saved.pausedGoal) || !["active", "paused"].includes(saved.pausedGoal.status as string) || typeof saved.pausedGoal.objective !== "string"))) throw new Error("Invalid control state");
       this.state = { ...(saved as ControlState), held: !!options.startHeld || saved.held };
+      // Stop intent belongs to the native execution epoch, not the saved chat.
+      // A managed resume is published only after its parent proves old-process
+      // exit. Require a fresh open native barrier too: reloading an extension in
+      // the still-held stopping process must never make that process releasable.
+      if (this.state.stopping && target.role === "managed-lane" && options.startHeld &&
+        saved.controllerInstanceId !== target.instanceId && this.core(initial)?.getState().status === "open") delete this.state.stopping;
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new OmpError("invalid-control-state", "OMP saved hold state cannot be verified"); }
     this.save();
   }
-  private save(): void { durableJson(this.controlFile, this.state); }
+  private save(): void { durableJson(this.controlFile, { ...this.state, controllerInstanceId: this.target.instanceId }); }
   private core(ctx: OmpContext): OmpExecutionHold | undefined {
     const core = ctx.executionHold;
     if (!core || typeof core.getState !== "function" || typeof core.hold !== "function" || typeof core.release !== "function") return undefined;

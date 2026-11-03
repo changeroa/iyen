@@ -1153,10 +1153,39 @@ export class DoriService {
     }
     if (action === "reopen" || action === "recover") {
       if (key === "lead" || (await this.registry.read(key))?.role === "lead") throw new Error("Managed lead recovery is unsupported; use lead-attach for the current session");
-      return this.launchQueue.run(key, async () => {
+      return this.launchQueue.run(key, () => this.dispatchQueue.run(key, async () => {
         let lane = await this.lane(key);
         if (action === "reopen" && statusOf(lane) !== "closed") throw new Error("Lane is not closed");
         if (action === "recover" && statusOf(lane) === "closed") throw new Error("Use reopen for closed lanes");
+        if (args.stopCurrent) {
+          const runtime = lane.runtime;
+          if (action !== "recover" || args.newSession || runtime?.kind !== "omp" || runtime.backend !== "herdr-tui" ||
+            !runtime.omp || runtime.omp.target.role !== "managed-lane" || !args.operationId) throw new Error("Explicit same-session managed OMP recovery required");
+          if (this.inbox.list().some(row => row.target === key && (["unknown", "sending"].includes(row.state) || row.abandonment?.outcome === "pending"))) throw new Error("Retire or reconcile uncertain worker input before recovery stop");
+          const scope = this.attachment(await this.lane("lead"));
+          await withBindingFence(this.config.stateDir, async () => {
+            const assertCurrent = async () => {
+              this.assertNoPendingLeadMutation();
+              const lead = await this.lane("lead"), currentScope = this.attachment(lead), current = (await this.lane(key)).runtime;
+              if (scope.instance !== currentScope.instance || scope.generation !== currentScope.generation ||
+                lead.dispatchBlocked || lead.runtime?.held || lead.runtime?.external?.detachedAt ||
+                current?.hostInstanceId !== runtime.hostInstanceId || current.generation !== runtime.generation ||
+                !current.omp || !sameOmpTarget(current.omp.target, runtime.omp!.target)) throw new Error("Recovery stop scope or worker epoch changed");
+            };
+            await assertCurrent();
+            const id = `recovery-stop:${key}:${args.operationId}`;
+            this.operations.put({ id, target: key, source: "managed-recovery-stop", state: "queued", at: new Date().toISOString(),
+              text: JSON.stringify({ instance: runtime.hostInstanceId, generation: runtime.generation, target: runtime.omp!.target, scope: [scope.instance, scope.generation], text: args.text ?? null }) });
+            await this.operations.deliver(id, async () => {
+              await assertCurrent();
+              await this.deps.runtime.stop(key);
+              await assertCurrent();
+              if ((await this.lane(key)).runtime?.state !== "stopped") throw new Error("Managed native exit not durably confirmed");
+              return {};
+            });
+          });
+          lane = await this.lane(key);
+        }
         await this.assertHostStopped(lane);
         if (args.newSession) {
           if (caller.role !== "admin" || typeof args.handoff !== "string" || !args.handoff.trim() || !lane.runtime?.threadId) throw new Error("New-session migration requires operator, known old thread and explicit handoff");
@@ -1204,7 +1233,7 @@ export class DoriService {
         const text = args.text ?? (!lane.runtime?.threadId ? await Bun.file(lane.brief).text() : undefined);
         if (text) this.putInbox({ id: args.operationId ?? `handoff:${key}:${lane.cycle ?? 1}`, target: key, text, state: "queued", at: new Date().toISOString() });
         return { recovering: true, key };
-      });
+      }));
     }
     if (action === "tick") { await this.tick(); return { accepted: true }; }
     throw new Error(`Unknown service action: ${action}`);
