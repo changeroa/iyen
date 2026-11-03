@@ -569,7 +569,7 @@ export class DoriService {
         const snap = result as RuntimeSnapshot;
         const uncertain = this.inbox.list().find(row => row.target === "lead" && row.attachmentInstance === saved.instance &&
           row.state === "unknown" && !saved.excludedInboxIds.includes(row.id));
-        if (uncertain) await this.reconcileOmpLeadInput(uncertain.text, uncertain.id, saved.instance).catch(() => {});
+        if (uncertain) await this.reconcileOmpInput("lead", uncertain.text, uncertain.id, saved.instance).catch(() => {});
         await this.registry.update("lead", l => {
           if (l.runtime?.hostInstanceId !== saved.instance || l.runtime.generation !== saved.generation) return l;
           const recover = l.holdReason === "recovery" && !["paused", "done-claimed", "verified-done", "closed"].includes(statusOf(l)) && ["idle", "running"].includes(snap.state) && !this.inbox.list().some(row => row.target === "lead" && row.attachmentInstance === saved.instance && ["sending", "unknown"].includes(row.state));
@@ -583,10 +583,11 @@ export class DoriService {
       throw error;
     }
   }
-  private async reconcileOmpLeadInput(text: string, operationId: string, instance: string): Promise<unknown> {
-    const lane = await this.lane("lead"), runtime = lane.runtime;
+  private async reconcileOmpInput(key: string, text: string | undefined, operationId: string, instance: string): Promise<unknown> {
+    const lane = await this.lane(key), runtime = lane.runtime;
     const assertCurrent = (current: Lane) => {
-      if (!runtime?.omp || current.runtime?.kind !== "omp" || current.runtime.backend !== "external-current-session" ||
+      if (!runtime?.omp || current.runtime?.kind !== "omp" || current.runtime.backend !== runtime.backend ||
+        (key === "lead" ? runtime.backend !== "external-current-session" : runtime.backend !== "herdr-tui" || runtime.omp.target.role !== "managed-lane" || runtime.omp.target.laneKey !== key) ||
         current.runtime.hostInstanceId !== instance || current.runtime.hostInstanceId !== runtime.hostInstanceId || current.runtime.generation !== runtime.generation ||
         current.runtime.state === "stopped" || current.runtime.external?.detachedAt || current.runtime.omp?.detachedAt || !current.runtime.omp ||
         !sameOmpTarget(current.runtime.omp.target, runtime.omp.target) || current.cleanupFence || this.pendingHandoff()) throw new Error("OMP receipt attachment changed or unavailable");
@@ -594,7 +595,9 @@ export class DoriService {
     assertCurrent(lane);
     const row = this.inbox.get(operationId);
     if (!row) return { status: "missing", operationId };
-    if (row.target !== "lead" || row.text !== text || row.attachmentInstance !== instance || this.attachment(lane).excludedInboxIds.includes(row.id)) throw new Error("Input receipt payload or attachment mismatch");
+    if (row.target !== key || text !== undefined && row.text !== text || row.attachmentInstance !== instance ||
+      lane.runtime?.backend === "external-current-session" && this.attachment(lane).excludedInboxIds.includes(row.id)) throw new Error("Input receipt payload or attachment mismatch");
+    if (row.state === "abandoned" || row.abandonment) throw new Error("Input abandonment requires its original lifecycle reconciliation");
     const provenance = row.ompProvenance;
     if (provenance && (provenance.attachmentInstanceId !== instance || provenance.attachmentGeneration !== runtime!.generation || !sameOmpTarget(provenance.target, runtime!.omp!.target))) throw new Error("Input receipt provenance mismatch");
     if (row.state === "queued") return { status: "queued", operationId: row.id };
@@ -602,7 +605,7 @@ export class DoriService {
     const captured = JSON.stringify(row);
     const result = await callOmp(provenance.target, "operation", { operationId: row.id, text: row.text }, this.config, this.runner);
     return withBindingFence(this.config.stateDir, async () => {
-      assertCurrent(await this.lane("lead"));
+      assertCurrent(await this.lane(key));
       if (JSON.stringify(this.inbox.get(row.id)) !== captured) throw new Error("Input receipt changed during reconciliation");
       if (result.status !== "received" || !validReceipt(result.receipt, provenance.target, row.id, payloadHash(row.text))) return { status: "unknown", operationId: row.id };
       const receipt = { turnId: result.receipt.receiptId, receiptKind: "omp-session-entry" as const, receipt: result.receipt };
@@ -1007,9 +1010,12 @@ export class DoriService {
     }
     if (action === "status") return key ? this.publicLane(await this.lane(key)) : Promise.all((await this.registry.list()).map(lane => this.publicLane(lane)));
     if (action === "input-status") {
-      if (caller.role !== "lead" || caller.key !== "lead" || !caller.instance || key !== "lead") throw new Error("Input receipt lookup requires the current scoped lead capability");
-      if (typeof args.text !== "string" || !args.text || typeof args.operationId !== "string" || !args.operationId) throw new Error("text and operationId required");
-      return this.dispatchQueue.run(key, () => this.reconcileOmpLeadInput(args.text, args.operationId, caller.instance!));
+      if (caller.role !== "lead" || caller.key !== "lead" || !caller.instance || typeof key !== "string" || !key) throw new Error("Input receipt lookup requires the current scoped lead capability");
+      if (args.text !== undefined && (typeof args.text !== "string" || !args.text) || typeof args.operationId !== "string" || !args.operationId) throw new Error("operationId and optional exact text required");
+      const lane = await this.lane(key);
+      const instance = key === "lead" ? caller.instance : lane.runtime?.hostInstanceId;
+      if (!instance) throw new Error("Input receipt native attachment missing");
+      return this.dispatchQueue.run(key, () => this.reconcileOmpInput(key, args.text, args.operationId, instance));
     }
     if (action === "can-launch") return canLaunch(await sampleHost(this.runner), this.config.guard);
     if (action === "launch") {

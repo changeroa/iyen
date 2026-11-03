@@ -170,6 +170,14 @@ read-only per inspection, with exact payload, controller and attachment fences.
 Only a real durable native receipt marks it sent; absence remains held. This clears
 lost-ACK delivery barriers without resubmitting owner input or report messages.
 
+The current scoped lead can also use `input-status KEY --operation-id ID`
+for a managed OMP lane. The query derives the immutable payload from its inbox;
+optional `--text-file FILE` must match it exactly. Only the originally recorded
+native controller and attachment epoch can supply the receipt. A real matching
+receipt marks the row sent, but does not release execution or clear dispatch
+holds. Missing evidence remains unknown. The query never submits input, retries
+an operation, changes native execution, or overrides pending abandonment.
+
 Integration must run the behavioral suite, including
 `test/native-interactions.test.ts`, against the merged implementation, then
 verify a real owner Slack/native roundtrip. Native SDK deployment, extension

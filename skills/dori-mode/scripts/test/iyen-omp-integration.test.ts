@@ -171,6 +171,51 @@ test("scoped receipt lookup reconciles a lost native ACK while busy without subm
     await expect(restarted.handle("input-status", args, caller)).rejects.toThrow();
   } finally { x.f.cleanup(); }
 });
+test("current lead reconciles a held managed lane's real receipt without releasing or resubmitting it", async () => {
+  const x = await setup(), worker = ompFixture();
+  worker.transcript([]);
+  Object.assign(worker.identity, { role: "managed-lane", laneKey: "worker", paneId: "w:worker", terminalId: "term-worker" });
+  Object.assign(worker.target, worker.identity);
+  let received = false, mutations = 0;
+  await worker.serve(async request => {
+    if (request.method !== "inspect" && request.method !== "operation") { mutations++; throw new Error("No execution authorized"); }
+    return { protocol: 1, id: request.id, identity: worker.identity, result: request.method === "inspect" ? worker.snapshot :
+      received ? { status: "received", receipt: receipt(worker, request.params.operationId, "original") } : { status: "absent" } };
+  });
+  try {
+    const attached = await x.s.handle("lead-activate", x.args, { role: "admin" });
+    const runner: Runner = async argv => {
+      const result = await x.runner(argv);
+      const body = JSON.parse(result.out);
+      body.result.agents.push({ agent: "omp", cwd: worker.identity.cwd, pane_id: worker.identity.paneId, terminal_id: worker.identity.terminalId,
+        agent_session: { agent: "omp", kind: "path", source: "herdr:omp", value: worker.identity.sessionFile } });
+      return { ...result, out: JSON.stringify(body) };
+    };
+    const service = new DoriService(x.config, runner), caller = { role: "lead" as const, key: "lead", instance: attached.lead.runtime.hostInstanceId };
+    const lane = { ...attached.lead, key: "worker", revision: 0, role: "lane" as const, pane: worker.identity.paneId, cwd: worker.identity.cwd, dispatchBlocked: true,
+      runtime: { kind: "omp" as const, backend: "herdr-tui" as const, threadId: worker.identity.sessionId, state: "idle" as const, held: true,
+        hostInstanceId: "worker-host", generation: 2, binaryVersion: "18.15.0", omp: { kind: "omp" as const, target: worker.target,
+          attachmentInstanceId: "worker-host", attachmentGeneration: 2, attachedAt: new Date().toISOString(), excludedInboxIds: [] } } };
+    await service.registry.write(lane);
+    const provenance = { target: worker.target, attachmentInstanceId: "worker-host", attachmentGeneration: 2 };
+    service.inbox.put({ id: "managed-lost", target: "worker", text: "original", state: "unknown", at: new Date().toISOString(),
+      attachmentInstance: "worker-host", ompProvenance: provenance });
+    const args = { key: "worker", operationId: "managed-lost" };
+    expect(await service.handle("input-status", args, caller)).toMatchObject({ status: "unknown" });
+    expect(service.inbox.get(args.operationId)?.state).toBe("unknown");
+    received = true;
+    expect(await service.handle("input-status", args, caller)).toMatchObject({ status: "received", receipt: receipt(worker, args.operationId, "original") });
+    expect(service.inbox.get(args.operationId)?.state).toBe("sent");
+    expect((await service.registry.read("worker"))?.runtime?.held).toBe(true);
+    expect((await service.registry.read("worker"))?.dispatchBlocked).toBe(true);
+    service.inbox.put({ id: "stale-managed", target: "worker", text: "original", state: "unknown", at: new Date().toISOString(),
+      attachmentInstance: "worker-host", ompProvenance: provenance });
+    await service.registry.update("worker", current => ({ ...current, runtime: { ...current.runtime!, generation: 3 } }));
+    await expect(service.handle("input-status", { key: "worker", operationId: "stale-managed" }, caller)).rejects.toThrow("provenance");
+    expect(service.inbox.get("stale-managed")?.state).toBe("unknown");
+    expect(mutations).toBe(0);
+  } finally { worker.cleanup(); x.f.cleanup(); }
+});
 test("scoped queued receipt lookup does not start input and native held or unavailable input is not ready", async () => {
   let mutations = 0;
   const x = await setup(() => { mutations++; throw new Error("No native input permitted"); });
