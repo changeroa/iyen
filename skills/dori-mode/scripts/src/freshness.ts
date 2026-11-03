@@ -11,7 +11,7 @@ export const freshnessTick = async (deps: FlowDeps, home: string): Promise<Sweep
     const minutes = (now - heard) / 60000;
     const runtime = await deps.runtime.inspect(lane.key).catch(() => null);
     if (!runtime || !["idle", "running"].includes(runtime.state)) continue;
-    if (minutes >= deps.config.nudgeAfterMin && (lane.lastNudgeAt ?? 0) < heard) {
+    if (lane.runtime?.kind !== "omp" && minutes >= deps.config.nudgeAfterMin && (lane.lastNudgeAt ?? 0) < heard) {
       // Record before sending: unknown dispatch is never automatically duplicated.
       await deps.registry.update(lane.key, l => ({ ...l, lastNudgeAt: now }));
       const latest = await deps.registry.read(lane.key);
