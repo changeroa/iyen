@@ -582,3 +582,72 @@ for (const received of [true, false]) test(`native ACK loss reconciles read-only
     expect(h.sends()).toBe(received ? 1 : 0);
   } finally { h.cleanup(); }
 });
+
+for (const binding of ["current", "old-generation", "other-thread", "missing-receipt", "ambiguous-owner"] as const)
+test(`shared ingress binds worker report thread only to an exact authenticated lead receipt: ${binding}`, async () => {
+  const h = await fixture(true);
+  try {
+    h.config.ingress[0]!.owners.push("second-owner");
+    const target = { ...h.f.target, sessionId: "019a4190-0000-7000-8000-000000000002", instanceId: "lead-controller", role: "attached-lead" as const, laneKey: "lead" };
+    await h.service().registry.write({ ...h.lane, key: "lead", role: "lead", revision: 0, thread: "none", runtime: {
+      ...h.lane.runtime!, backend: "external-current-session", threadId: target.sessionId, hostInstanceId: "lead-host", generation: 3,
+      omp: { kind: "omp", target, attachmentInstanceId: "lead-host", attachmentGeneration: 3, attachedAt: new Date().toISOString(), excludedInboxIds: [] },
+    } });
+    const text = "authenticated task";
+    const receipt = { operationId: "authenticated-source", payloadHash: payloadHash(text), sessionId: target.sessionId, sessionFile: target.sessionFile,
+      entryId: "owner-entry", receiptId: `omp-entry:${target.sessionId}:owner-entry` };
+    h.service().inbox.put({ id: receipt.operationId, target: "lead", text, source: "owner-slack", ownerUser: "owner",
+      thread: binding === "other-thread" ? "slack:other/200" : thread, attachmentInstance: "lead-host", state: "sent", at: new Date().toISOString(),
+      ompProvenance: { target, attachmentInstanceId: "lead-host", attachmentGeneration: binding === "old-generation" ? 2 : 3 },
+      ...(binding === "missing-receipt" ? {} : { receipt }),
+    });
+    if (binding === "ambiguous-owner") {
+      h.service().inbox.put({ id: "second-owner-source", target: "lead", text, source: "owner-slack", ownerUser: "second-owner", thread,
+        attachmentInstance: "lead-host", state: "sent", at: new Date().toISOString(),
+        ompProvenance: { target, attachmentInstanceId: "lead-host", attachmentGeneration: 3 },
+        receipt: { ...receipt, operationId: "second-owner-source", entryId: "other-owner", receiptId: `omp-entry:${target.sessionId}:other-owner` },
+      });
+    }
+    const rows = await h.publish([h.ask("launch-owned", { sourceEntryId: "launch-entry", sourceOperationHash: payloadHash("launch-operation") })]);
+    if (binding === "current") {
+      expect(rows[0]).toMatchObject({ thread, owner: "owner", source: "owner-slack" });
+      await h.answer(rows[0]!.token, "1");
+      expect(h.results.get("launch-owned")).toEqual({ kind: "submit", answers: [{ id: "strategy", selectedOptions: ["단순 구현"] }] });
+    } else {
+      expect(rows).toEqual([]);
+      expect(h.notifications).toEqual([]);
+      expect(h.attempts()).toBe(0);
+    }
+  } finally { h.cleanup(); }
+});
+
+test("owner and operator answers cannot cross a native execution hold and a fresh answer works after resume", async () => {
+  const h = await fixture(true);
+  try {
+    const [row] = await h.publish([h.ask()]);
+    await h.service().registry.update(h.key, lane => ({ ...lane, status: "paused", dispatchBlocked: true, runtime: { ...lane.runtime!, held: true } }));
+    await h.answer(row!.token, "1", "while-held");
+    await expect(h.service().nativeInteractions.respondOperator(row!.token,
+      { kind: "submit", answers: [{ id: "strategy", selectedOptions: ["단순 구현"] }] }, "operator-held")).rejects.toThrow();
+    expect(h.attempts()).toBe(0);
+    await h.service().registry.update(h.key, lane => ({ ...lane, status: "working", dispatchBlocked: false, runtime: { ...lane.runtime!, held: false } }));
+    await h.answer(row!.token, "1", "after-resume");
+    expect(h.results.get("ask-1")).toEqual({ kind: "submit", answers: [{ id: "strategy", selectedOptions: ["단순 구현"] }] });
+  } finally { h.cleanup(); }
+});
+
+test("unrouted native questions remain visible to scoped approval inspection but are not answerable tokens", async () => {
+  const h = await fixture(true);
+  try {
+    h.config.ingress[0]!.owners.push("second-owner");
+    const request = h.ask("unrouted-question", { sourceEntryId: "launch-entry", sourceOperationHash: payloadHash("launch") });
+    await h.publish([request]);
+    const pending = await h.service().approvals();
+    expect(pending).toEqual([{ id: "native-blocked:worker:unrouted-question", key: "worker", requestId: request.id,
+      request, relayBlocked: "authenticated-owner-thread-unresolved" }]);
+    expect(h.notifications).toEqual([]);
+    await expect(h.service().handle("approval-respond", { id: pending[0]!.id, response: { kind: "submit", choice: "once" },
+      operationId: "not-a-real-answer-token" }, { role: "admin" })).rejects.toThrow();
+    expect(h.attempts()).toBe(0);
+  } finally { h.cleanup(); }
+});

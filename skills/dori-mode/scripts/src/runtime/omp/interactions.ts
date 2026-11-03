@@ -5,7 +5,7 @@ import { atomicJson, SerialQueue } from "../../journal.ts";
 import { readJson } from "../../ipc.ts";
 import type { Mailbox } from "../../mailbox.ts";
 import { statusOf, type Lane } from "../../registry.ts";
-import { OmpError, assertInteractionAnswer, identityOf, payloadHash, sameIdentity, validInteraction, validInteractionResponse, validInteractionStatus,
+import { OmpError, assertInteractionAnswer, identityOf, payloadHash, sameIdentity, validReceipt, validInteraction, validInteractionResponse, validInteractionStatus,
   type NativeUserInteraction, type NativeInteractionResponse, type NativeInteractionStatus, type OmpIdentity } from "./contract.ts";
 
 export type InteractionOwnerEvent = { id: string; thread: string; user: string; text: string; metadata?: unknown };
@@ -31,6 +31,7 @@ export class NativeInteractionRelay {
   private readonly path: string;
   private readonly queue = new SerialQueue();
   private state: RelayState;
+  private blocked: { key: string; request: NativeUserInteraction; reason: string }[] = [];
   constructor(private readonly deps: InteractionRelayDeps) {
     this.path = join(deps.stateDir, "native-interactions.json");
     this.state = existsSync(this.path) ? readJson<RelayState>(this.path) : { version: 1, requests: {}, responses: {} };
@@ -48,7 +49,7 @@ export class NativeInteractionRelay {
       runtime.hostInstanceId === row.attachment && runtime.generation === row.generation && runtime.threadId === row.target.sessionId &&
       runtime.omp.attachmentInstanceId === row.attachment && runtime.omp.attachmentGeneration === row.generation && sameIdentity(runtime.omp.target, row.target);
   }
-  private owner(lane: Lane, request: NativeUserInteraction): { thread: string; source: string; owner: string; sourceMessageId?: string } | undefined {
+  private owner(lane: Lane, request: NativeUserInteraction, lanes: Lane[]): { thread: string; source: string; owner: string; sourceMessageId?: string } | undefined {
     const epoch = lane.runtime!;
     const receipts = this.deps.inbox.list().filter(mail => mail.target === lane.key && mail.state === "sent" && mail.thread && mail.thread !== "none" &&
       mail.attachmentInstance === epoch.hostInstanceId && mail.ownerUser && mail.source && this.deps.ingress.some(i => i.id === mail.source && i.owners.includes(mail.ownerUser!)) &&
@@ -66,6 +67,21 @@ export class NativeInteractionRelay {
     }
     // Multiple current owner threads are never a fallback for an unmapped lead source.
     if (lane.key === "lead" || lane.role === "lead" || owners.size > 1 || lane.thread === "none") return undefined;
+    // Shared messenger ingress may configure several owner identities. The
+    // registered report thread needs its own current authenticated receipt.
+    const lead = lanes.find(candidate => candidate.key === "lead" && candidate.runtime?.kind === "omp" && candidate.runtime.omp &&
+      candidate.runtime.omp.attachmentInstanceId === candidate.runtime.hostInstanceId &&
+      candidate.runtime.omp.attachmentGeneration === candidate.runtime.generation &&
+      !candidate.runtime.external?.detachedAt && candidate.runtime.state !== "stopped" && !candidate.cleanupFence);
+    const originOwners = new Map(this.deps.inbox.list().filter(mail => lead && mail.target === "lead" && mail.state === "sent" &&
+      mail.thread === lane.thread && mail.attachmentInstance === lead.runtime!.hostInstanceId && mail.ownerUser && mail.source &&
+      mail.ompProvenance?.attachmentInstanceId === lead.runtime!.hostInstanceId &&
+      validReceipt(mail.receipt, lead.runtime!.omp!.target, mail.id, payloadHash(mail.text)) &&
+      mail.ompProvenance.attachmentGeneration === lead.runtime!.generation && sameIdentity(mail.ompProvenance.target, lead.runtime!.omp!.target) &&
+      this.deps.ingress.some(i => i.id === mail.source && i.owners.includes(mail.ownerUser!)))
+      .map(mail => [JSON.stringify([mail.source, mail.ownerUser]), { thread: lane.thread, source: mail.source!, owner: mail.ownerUser! }]));
+    if (originOwners.size === 1) return originOwners.values().next().value;
+    if (originOwners.size > 1) return undefined;
     // Managed lanes may use their registered report thread, but only one ingress/owner can own it.
     const registered = this.deps.ingress.flatMap(i => i.owners.map(owner => ({ thread: lane.thread, source: i.id, owner })));
     return registered.length === 1 ? registered[0] : undefined;
@@ -117,6 +133,7 @@ export class NativeInteractionRelay {
   private async pollScoped(): Promise<void> {
     const lanes = await this.deps.lanes();
     await this.reconcile(lanes);
+    const blocked: typeof this.blocked = [];
     for (const row of Object.values(this.state.requests)) {
       if (row.state === "open" && (row.request.expiresAt && Date.parse(row.request.expiresAt) <= Date.now() ||
         !lanes.some(lane => lane.key === row.key && this.matches(row, lane)))) this.request({ ...row, state: "stale" });
@@ -144,8 +161,9 @@ export class NativeInteractionRelay {
           if (prior.state === "open") this.request({ ...prior, state: "stale" });
           continue;
         }
-        const owner = this.owner(lane, request);
+        const owner = this.owner(lane, request, lanes);
         if (!owner) {
+          blocked.push({ key: lane.key, request, reason: "authenticated-owner-thread-unresolved" });
           if (prior?.state === "open") this.request({ ...prior, state: "stale" });
           continue;
         }
@@ -155,8 +173,10 @@ export class NativeInteractionRelay {
         await this.deps.post(`native-interaction:${token}`, row.thread, this.render(row), row.key).catch(() => {});
       }
     }
+    this.blocked = blocked;
   }
   list(): RelayedInteraction[] { return Object.values(this.state.requests).filter(r => r.state === "open"); }
+  unrouted(): readonly { key: string; request: NativeUserInteraction; reason: string }[] { return this.blocked; }
   private parse(request: NativeUserInteraction, text: string): NativeInteractionResponse {
     let response: unknown;
     const freeText = request.kind === "input" || request.kind === "editor";
@@ -212,7 +232,8 @@ export class NativeInteractionRelay {
         row.request.expiresAt && Date.parse(row.request.expiresAt) <= Date.now()) throw new Error("Native request is stale, local-only or belongs to another owner/thread");
       const lanes = await this.deps.lanes(), lane = lanes.find(l => l.key === row.key);
       if (!lane || !this.matches(row, lane)) { this.request({ ...row, state: "stale" }); throw new Error("Native request epoch expired"); }
-      const owner = this.owner(lane, row.request);
+      if (lane.dispatchBlocked || lane.runtime?.held || statusOf(lane) === "paused") throw new Error("Native response held until lane reconciliation or resume");
+      const owner = this.owner(lane, row.request, lanes);
       if (!owner || owner.thread !== row.thread || owner.source !== row.source || owner.owner !== row.owner) {
         this.request({ ...row, state: "stale" }); throw new Error("Native request owner/thread binding changed");
       }
@@ -238,6 +259,7 @@ export class NativeInteractionRelay {
       const row = this.state.requests[token], lane = row && (await this.deps.lanes()).find(l => l.key === row.key);
       if (!operationId || !row || row.state !== "open" || !lane || !this.matches(row, lane) ||
         row.request.expiresAt && Date.parse(row.request.expiresAt) <= Date.now()) throw new Error("Expired native request");
+      if (lane.dispatchBlocked || lane.runtime?.held || statusOf(lane) === "paused") throw new Error("Native response held until lane reconciliation or resume");
       assertInteractionAnswer(row.request, response);
       return this.respond(row, lane, response, "operator", { id: operationId, user: row.owner, thread: row.thread, text: "" });
     });
