@@ -7,6 +7,7 @@ import { atomicJson, SerialQueue } from "./journal.ts";
 import { ipc, serviceSocket, hostSocket, readJson } from "./ipc.ts";
 import { Registry, statusOf, withStatus, type Lane, LANE_KEY } from "./registry.ts";
 import { claimDone, closeLane, objectDone, watchTick, type FlowDeps } from "./done-flow.ts";
+import { abandonManagedInput } from "./mail-abandon.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
 import { launchLane, quoteForPane, validateLaunch, LaunchError, type LaunchInput } from "./launch.ts";
 import { freshnessTick } from "./freshness.ts";
@@ -1049,6 +1050,7 @@ export class DoriService {
       const mail = this.putInbox({ id: args.operationId, target: key, text: args.text, thread: args.thread ?? lane.thread, state: "queued", at: new Date().toISOString(),
         attachmentInstance: lane.runtime?.backend === "external-current-session" ? caller.instance ?? this.intakeInstance(lane) : undefined });
       if (mail.state === "unknown" || mail.state === "sending") throw new Error("Delivery unknown; reconcile before retry");
+      if (mail.state === "abandoned" || mail.abandonment) throw new Error("Input abandonment fences delivery; never replay");
       if (mail.state === "sent") {
         if (!mail.turnId) throw new Error("Missing turn receipt");
         return { turnId: mail.turnId, ...(mail.receiptKind ? { receiptKind: mail.receiptKind, receipt: mail.receipt } : {}) };
@@ -1091,6 +1093,22 @@ export class DoriService {
       return ipc(hostSocket(this.config.stateDir, selected.key), boot.hostToken, "approval", { id: selected.requestId, response: args.response });
     }
     if (action === "mail-list") return { inbox: this.inbox.list(), outbox: this.outbox.list(), operations: this.operations.list(), failures: this.failures.list() };
+    if (action === "mail-abandon") {
+      if (caller.role !== "admin" && !(caller.role === "lead" && caller.key === "lead" && caller.instance)) throw new Error("Input abandonment requires current attached lead or operator");
+      const leadScope = this.attachment(await this.lane("lead"));
+      const assertScope = async (): Promise<void> => {
+        this.assertNoPendingLeadMutation();
+        const lead = await this.lane("lead"), current = this.attachment(lead);
+        if (current.instance !== leadScope.instance || current.generation !== leadScope.generation ||
+          caller.instance && caller.instance !== current.instance || lead.runtime?.external?.detachedAt ||
+          lead.runtime?.state === "stopped" || lead.dispatchBlocked || lead.runtime?.held) throw new Error("Lead scope changed or held during input abandonment");
+      };
+      await assertScope();
+      const row = this.inbox.get(args.id);
+      if (!row) throw new Error("Unknown mail");
+      return this.launchQueue.run(row.target, () => this.dispatchQueue.run(row.target, () =>
+        abandonManagedInput({ ...this.deps, inbox: this.inbox, assertScope }, args)));
+    }
     if (action === "mail-resolve") {
       const scopedLead = caller.role === "lead" && caller.key === "lead" && !!caller.instance && args.box === "inbox" && args.state === "sent";
       if ((caller.role !== "admin" && !scopedLead) || !["sent", "queued"].includes(args.state) || !args.evidence) throw new Error("Explicit reconciliation evidence required");
@@ -1337,7 +1355,7 @@ export class DoriService {
         }
       }),
       once("inbox", async () => {
-        for (const row of this.inbox.list().filter(r => r.state === "queued")) {
+        for (const row of this.inbox.list().filter(r => r.state === "queued" && !r.abandonment)) {
           const lane = await this.registry.read(row.target);
           if (!lane || lane.dispatchBlocked || statusOf(lane) === "closed") continue;
           if (lane.runtime?.backend === "external-current-session" && row.attachmentInstance && row.attachmentInstance !== lane.runtime.hostInstanceId) continue;

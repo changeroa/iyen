@@ -166,3 +166,35 @@ Integration must run the behavioral suite, including
 `test/native-interactions.test.ts`, against the merged implementation, then
 verify a real owner Slack/native roundtrip. Native SDK deployment, extension
 reload and explicit activation/reconciliation belong to the integrator.
+
+## Deliberate retirement of managed OMP input
+
+An authorized current attached lead or operator may retire a historical managed
+worker inbox entry with:
+
+```text
+iyen mail abandon MAIL_ID --operation-id STABLE_ID --evidence "Explicit reason"
+```
+
+This is not a resend or a messenger completion receipt. Never-attempted queued
+input becomes terminal `abandoned` without native submission. Unknown input is
+first reconciled against its originally recorded native controller and payload.
+A real receipt means `sent`; otherwise retirement requires confirmed exit of the
+exact managed native process and its Herdr detach. Hold, idle, or a stop request
+acknowledgment alone are insufficient. Original content, source, provenance and
+delivery uncertainty remain in the durable abandonment audit; `abandoned` does
+not assert that the old input never executed.
+
+The stable operation and evidence must be retained across retries. A pending
+intent fences dispatch even after service restart. Changed lead/worker epochs,
+uncertain process exit or persistence failure leave the intent pending rather
+than replaying input. Completed retirement is immutable. Outbox and borrowed-lead
+input cannot use this command. Retire any misrouted queued input before recovering
+the original managed session; recovery must not silently create a replacement
+native session or requeue retired messages.
+
+Borrowed-lead native `hold`, `release` and `stop` remain forbidden. This managed
+recovery command does not grant attached-lead self-restart. A safe same-session
+lead restart requires a separately authenticated, idle-fenced native shutdown
+and controlled startup/activation primitive; a PID lookup or pane typing is not
+such a primitive.
