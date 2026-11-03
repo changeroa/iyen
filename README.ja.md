@@ -20,6 +20,8 @@ python3 /path/to/iyen/skills/iyen/scripts/activate.py start --session UUID --pan
 
 既存設定を上書きせず、旧ワーカーを停止してから migrate を実行してください。進行中のレーンには停止確認と引き継ぎ文書が必要です。旧セッション ID は Codex thread ID に変換しません。実際のメッセンジャーには ACK 後にカーソルを進める ingress アダプターが必要です。
 
+OMP のネイティブ `ask` を禁止するものではありません。対応するネイティブ SDK では、実際に待機している質問・選択・入力・承認を元の所有者スレッドへ送り、回答を同じネイティブ UI 要求に返します。通常の会話はリードだけが受信し、UI 回答は要求 ID・セッション・コントローラー世代・所有者・スレッドを検証します。曖昧な回答、期限切れ、ローカルで完了した要求は承認しません。既存プロセスにはサービス再起動だけでは追加されず、ネイティブ更新で世代が変わる場合は明示的な再接続検証が必要です。
+
 ```sh
 dori migrate --dry-run
 dori migrate --apply --handoff-file /path/to/handoff.json

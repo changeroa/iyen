@@ -27,8 +27,9 @@ export const doctor = async (config: DoriConfig): Promise<{ ok: boolean; checks:
           const selected = config.runtime.roles[managed ? "lane" : "lead"];
           checks.push({ name: `${target.laneKey}:identity`, ok: target.runtimeVersion === config.runtime.requiredVersion, detail: "authenticated native session/file/pane/terminal/generation" });
           checks.push({ name: `${target.laneKey}:receipts`, ok: snap.capabilities.durableReceipts && snap.capabilities.input, detail: "durable transcript receipt storage" });
+          checks.push({ name: `${target.laneKey}:interactions`, ok: snap.capabilities.interactions === true, detail: "native userInteractions list/respond/responseStatus capability required; local-only SDK is not relay-ready" });
           checks.push({ name: `${target.laneKey}:model`, ok: !managed || snap.provider === omp!.provider && snap.model === selected.model && snap.effort === selected.effort, detail: `${snap.provider}/${snap.model}; effort ${snap.effort ?? "unavailable"}` });
-          checks.push({ name: `${target.laneKey}:control`, ok: !managed || snap.capabilities.hold && snap.capabilities.release && snap.capabilities.stop, detail: managed ? "managed hold/release/stop capability" : "borrowed lead inspect/input only; detach does not stop TUI" });
+          checks.push({ name: `${target.laneKey}:control`, ok: !managed || snap.capabilities.hold && snap.capabilities.release && snap.capabilities.stop, detail: managed ? "managed hold/release/stop capability" : "borrowed lead inspect/input/interactions; detach does not stop TUI" });
         } catch { checks.push({ name: `${target.laneKey}:controller`, ok: false, detail: "Exact live OMP identity/capabilities unavailable" }); }
         finally { c?.close(); }
       }

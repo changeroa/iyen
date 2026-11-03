@@ -3,7 +3,8 @@ import { constants, closeSync, fstatSync, openSync, readFileSync } from "node:fs
 import { createConnection, type Socket } from "node:net";
 import { isAbsolute } from "node:path";
 import { OMP_MAX_FRAME_BYTES, OmpError, assertIdentity, exactKeys, identityOf, nonempty, object, payloadHash, validReceipt, validSnapshot, validFailureRequest, validateFailurePage,
-  type OmpController, type OmpMethod, type OmpOperation, type OmpReceipt, type OmpSnapshot, type OmpTarget } from "./contract.ts";
+  validInteraction, validInteractionResponse, validInteractionStatus,
+  type NativeInteractionReceipt, type OmpController, type OmpMethod, type OmpOperation, type OmpReceipt, type OmpSnapshot, type OmpTarget } from "./contract.ts";
 
 export async function connectOmp(target: OmpTarget, options: { timeoutMs?: number } = {}): Promise<OmpController> {
   const identity = identityOf(target); assertIdentity(identity);
@@ -63,6 +64,22 @@ export async function connectOmp(target: OmpTarget, options: { timeoutMs?: numbe
     object(result) && exactKeys(result, ["receipt"]) && validReceipt(result.receipt, identity, operationId, digest) ? { receipt: result.receipt } : invalid();
   const controller: OmpController = {
     inspect: async () => snapshot(await request("inspect", {})),
+    interactions: async () => {
+      const result = await request("interactions", {});
+      if (!Array.isArray(result) || !result.every(r => validInteraction(r, identity.sessionId)) || new Set(result.map(r => r.id)).size !== result.length) return invalid();
+      return result;
+    },
+    interactionRespond: async (requestId, response, operationId) => {
+      if (!nonempty(requestId) || !nonempty(operationId) || !validInteractionResponse(response)) throw new OmpError("invalid-params", "Invalid native answer", false);
+      const result = await request("interaction-respond", { requestId, response, operationId });
+      if (!validInteractionStatus(result, operationId) || !["applied", "stale"].includes(result.status) || result.requestId !== requestId || result.responseHash !== payloadHash(JSON.stringify(response))) return invalid();
+      return result as NativeInteractionReceipt;
+    },
+    interactionResponseStatus: async operationId => {
+      if (!nonempty(operationId)) throw new OmpError("invalid-params", "Invalid native response operation", false);
+      const result = await request("interaction-response-status", { operationId });
+      return validInteractionStatus(result, operationId) ? result : invalid();
+    },
     failures: async (after, limit = 100) => {
       if (!validFailureRequest(after, limit)) throw new OmpError("invalid-params", "Invalid OMP failure cursor", false);
       const result = await request("failures", { after, limit });

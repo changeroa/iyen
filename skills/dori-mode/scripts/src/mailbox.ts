@@ -6,7 +6,7 @@ import { fill, type ArgvTemplate } from "./config.ts";
 import type { Runner } from "./run.ts";
 import type { OmpReceipt, OmpTarget } from "./runtime/omp/contract.ts";
 export type OmpMailProvenance = { target: OmpTarget; attachmentInstanceId: string; attachmentGeneration: number };
-export type Mail = { id: string; target: string; text: string; state: "queued" | "sending" | "sent" | "unknown"; turnId?: string; receiptKind?: "omp-session-entry"; receipt?: OmpReceipt; ompProvenance?: OmpMailProvenance; thread?: string; source?: string; at: string; attachmentInstance?: string };
+export type Mail = { id: string; target: string; text: string; state: "queued" | "sending" | "sent" | "unknown"; turnId?: string; receiptKind?: "omp-session-entry"; receipt?: OmpReceipt; ompProvenance?: OmpMailProvenance; thread?: string; source?: string; sourceMessageId?: string; ownerUser?: string; metadata?: unknown; at: string; attachmentInstance?: string };
 // Only a pre-submission refusal can return mail to queued. Any attempted send
 // remains unknown until reconciled, even if the transport reports failure.
 export class DeliveryDeferred extends Error {}
