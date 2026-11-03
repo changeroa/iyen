@@ -312,6 +312,20 @@ must match the canonical `omp` launcher. Startup preserves the pinned settings
 home, provider/model/effort, approval mode, cwd, and existing persona/session
 configuration without inspecting or copying persona/auth/session contents.
 
+The authenticated native `inspect().launchMetadata` must expose the actual
+`agentDir`, `settingsHome`, approval mode, provider, model and effective effort.
+These non-secret values are bound into the authorization digest before source
+consumption; managed-worker profile defaults are never substituted. The native
+and settings roots must be identical for the single-directory launch flag.
+Missing metadata, split roots, unsupported approval/effort selectors or later
+profile drift refuse or fence the operation without guessing another account.
+
+Structured startup includes fixed native `--start-held`, pinned `--agent-dir`,
+explicit model/thinking/approval selectors and the private bootstrap flag.
+The constructor-time fence precedes inference; an ordinary idle snapshot or an
+extension-installed late hold is not a substitute. Fresh status must attest the
+same pinned launch metadata before continuation staging and release.
+
 The fresh native controller must attest the restart bootstrap and fresh
 generation while held. Only then does a replayable local transaction rotate
 the attachment capability, retaining old epochs and mailbox provenance. A

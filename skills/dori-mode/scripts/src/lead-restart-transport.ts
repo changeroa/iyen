@@ -2,19 +2,21 @@ import type { Runner } from "./run.ts";
 import type { RestartObservation, RestartRecord } from "./lead-restart-coordinator.ts";
 import { launchRestartNative, restartBootstrap } from "./lead-restart-launcher.ts";
 import { connectOmp } from "./runtime/omp/client.ts";
-import { payloadHash, validReceipt } from "./runtime/omp/contract.ts";
+import { payloadHash, validReceipt, sameLaunchMetadata, validLaunchMetadata } from "./runtime/omp/contract.ts";
 import { sameOmpTarget, verifyOmpHerdr } from "./runtime/omp-integration.ts";
 import { prepareLeadRestart, inspectLeadRestart, commitLeadRestart, releaseLeadRestart, stageLeadRestartContinuation,
   type LeadRestartIntent, type LeadRestartStatus, type LeadRestartBootstrap, type LeadRestartContinuation } from "./runtime/omp/lead-restart.ts";
 
+function intent(record: RestartRecord, fresh: true): LeadRestartBootstrap;
+function intent(record: RestartRecord, fresh?: boolean): LeadRestartIntent;
 function intent(record: RestartRecord, fresh = false): LeadRestartIntent {
-  return { operationId: record.operationId, authorizationHash: record.authorizationHash, sourceMessageId: record.authorization.sourceMessageId,
+  return { operationId: record.operationId, authorizationHash: record.authorizationHash, sourceMessageId: record.authorization.sourceMessageId, launchMetadata: record.launchMetadata,
     ...(fresh ? { previousTarget: record.authorization.scope.target } : {}) };
 }
 function validateStatus(record: RestartRecord, status: LeadRestartStatus, fresh = false): RestartObservation {
   const target = fresh ? record.freshTarget : record.authorization.scope.target;
   if (!target || !sameOmpTarget(status.target, target) || status.operationId !== record.operationId || status.authorizationHash !== record.authorizationHash ||
-    status.sourceMessageId !== record.authorization.sourceMessageId || status.process.controllerInstanceId !== target.instanceId ||
+    status.sourceMessageId !== record.authorization.sourceMessageId || !validLaunchMetadata(status.launchMetadata) || !sameLaunchMetadata(status.launchMetadata, record.launchMetadata) || status.process.controllerInstanceId !== target.instanceId ||
     status.process.controllerGeneration !== target.generation || !Number.isSafeInteger(status.process.pid) || status.process.pid <= 0 ||
     !fresh && status.process.pid !== record.process?.pid || status.phase === "failed") throw new Error("Native restart operation/epoch unverified");
   return status.phase;
@@ -44,7 +46,7 @@ export async function restartNativeCommit(record: RestartRecord): Promise<void> 
 function validateBootstrap(record: RestartRecord, status: LeadRestartStatus): void {
   const boot = status.bootstrap, old = record.authorization.scope.target;
   if (!boot || boot.operationId !== record.operationId || boot.authorizationHash !== record.authorizationHash || boot.sourceMessageId !== record.authorization.sourceMessageId ||
-    !sameOmpTarget(boot.previousTarget, old) || !status.fence || status.fence.sessionId !== old.sessionId || !Number.isSafeInteger(status.fence.generation) ||
+    !validLaunchMetadata(boot.launchMetadata) || !sameLaunchMetadata(boot.launchMetadata, record.launchMetadata) || !sameOmpTarget(boot.previousTarget, old) || !status.fence || status.fence.sessionId !== old.sessionId || !Number.isSafeInteger(status.fence.generation) ||
     status.fence.generation < 1 || record.freshFence !== undefined && status.fence.generation !== record.freshFence ||
     status.phase === "held" && status.fence.status !== "held" || status.phase === "released" && status.fence.status !== "open") throw new Error("Fresh restart bootstrap/execution generation unverified");
 }
@@ -63,7 +65,8 @@ export async function restartNativeAttest(record: RestartRecord, runner: Runner)
   try {
     const snapshot = await client.inspect(), role = record.config.runtime.roles.lead;
     if (!snapshot.held || snapshot.state !== "idle" || snapshot.activeRunId || snapshot.goal || snapshot.capabilities.leadRestart !== true ||
-      snapshot.provider !== record.config.runtime.omp!.provider || snapshot.model !== role.model || snapshot.effort !== role.effort ||
+      !validLaunchMetadata(snapshot.launchMetadata) || !sameLaunchMetadata(snapshot.launchMetadata, record.launchMetadata) ||
+      snapshot.provider !== record.launchMetadata.provider || snapshot.model !== role.model || snapshot.effort !== role.effort ||
       (await client.interactions()).length) throw new Error("Fresh native bootstrap/profile/idle hold not attested");
   } finally { client.close(); }
   return status.fence!.generation;

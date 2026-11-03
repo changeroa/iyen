@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultConfig, type DoriConfig } from "../src/config.ts";
 import { atomicJson } from "../src/journal.ts";
@@ -69,6 +70,69 @@ test("old-loaded native refusal leaves source unused, attachment open and new ow
   } finally { await server.close(); f.cleanup(); }
 });
 
+test("actual borrowed profile overrides worker defaults and later approval drift fences native restart", async () => {
+  const f = ompFixture(); f.transcript([]);
+  Object.assign(f.identity, { role: "attached-lead", laneKey: "lead" }); Object.assign(f.target, f.identity);
+  const metadata = { agentDir: join(f.directory, "owner-profile"), settingsHome: join(f.directory, "owner-profile"),
+    approvalMode: "yolo" as "yolo" | "always-ask", provider: "fixture", model: "test", effort: "medium" };
+  let leaf: string | null = null;
+  let idle = true;
+  const entries: unknown[] = [];
+  const state = () => ({ sessionId: f.identity.sessionId, generation: 1, status: "open" as const });
+  const forbidden = () => { throw new Error("Busy profile scenario must not interrupt, stage or release native execution"); };
+  const ctx: OmpContext = { mode: "tui", agent: { kind: "main" }, cwd: f.directory, model: { id: "test", provider: "fixture" },
+    sessionManager: { getSessionId: () => f.identity.sessionId, getSessionFile: () => f.identity.sessionFile, getLeafId: () => leaf, ensureOnDisk: async () => {} },
+    isIdle: () => idle, hasPendingMessages: () => false, getPendingPlanReview: () => undefined, getAsyncJobSnapshot: () => null,
+    abort: forbidden, shutdown: forbidden,
+    executionHold: { getState: state, getLaunchMetadata: () => ({ ...metadata }), isRestartStartupHeld: () => false,
+      hold: async () => forbidden(), release: async () => forbidden(), tryHoldForRestart: async () => null,
+      stageRestartContinuation: async () => forbidden(), releaseRestartContinuation: async () => forbidden() },
+    userInteractions: { list: () => [], respond: async () => forbidden(), responseStatus: operationId => ({ status: "missing", operationId }) } };
+  const server = new OmpControlServer(f.target, "fixture-bearer", join(f.directory, "native"), () => ctx,
+    { getThinkingLevel: () => "medium", sendUserMessage: text => {
+      leaf = `input-${entries.length + 1}`;
+      entries.push({ type: "message", id: leaf, parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: [{ type: "text", text }], timestamp: Date.now() } });
+      f.transcript(entries);
+    } });
+  const runner: Runner = async argv => {
+    if (argv.join(" ") !== "herdr agent list") throw new Error("Busy lead must not start a process");
+    return { code: 0, err: "", out: JSON.stringify({ result: { agents: [{ agent: "omp", cwd: f.directory, pane_id: f.identity.paneId, terminal_id: f.identity.terminalId,
+      agent_session: { agent: "omp", kind: "path", source: "herdr:omp", value: f.identity.sessionFile } }] } }) };
+  };
+  const oldPath = process.env.PATH, bin = join(f.directory, "bin"), binary = join(bin, "omp");
+  mkdirSync(bin); writeFileSync(binary, "#!/bin/sh\nexit 99\n", { mode: 0o700 });
+  process.env.PATH = `${bin}:${oldPath ?? ""}`;
+  const defaults = defaultConfig(f.directory);
+  const config: DoriConfig = { ...defaults, stateDir: join(f.directory, "state"), ingress: [{ id: "slack", command: ["fixture-only"], owners: ["owner"] }],
+    runtime: { ...defaults.runtime, kind: "omp", binary, requiredVersion: "18.15.0", rpcTimeoutMs: 200,
+      settingsHome: join(f.directory, "worker-profile"), roles: { lead: { model: "test", effort: "medium" }, lane: { model: "test", effort: "medium" } },
+      omp: { registryDir: f.directory, extensionPath: "/fixture/extension.ts", provider: "fixture", approvalMode: "always-ask" } } };
+  await server.listen();
+  try {
+    atomicJson(join(f.directory, `${createHash("sha256").update("instance:1").digest("hex")}.json`), { ...f.target, pid: process.pid, startedAt: new Date().toISOString() });
+    const service = new DoriService(config, runner);
+    await service.handle("lead-attach", { threadId: f.identity.sessionId, sessionFile: f.identity.sessionFile, pane: f.identity.paneId, terminalId: f.identity.terminalId, cwd: f.directory }, { role: "admin" });
+    await service.receive("slack", { user: "owner", id: "profile-source", thread: "slack:original-owner-thread", text: "Restart this lead" });
+    const source = service.inbox.list().find(m => m.sourceMessageId === "profile-source")!;
+    await service.deps.runtime.input("lead", source.text, source.id);
+    const original = structuredClone(service.inbox.get(source.id));
+    idle = false;
+    const lead = (await service.registry.read("lead"))!;
+    await service.handle("lead-restart", { operationId: "actual-profile", sourceMessageId: "profile-source" },
+      { role: "lead", key: "lead", instance: lead.runtime!.hostInstanceId });
+    await service.leadRestarts.tick();
+    expect(service.leadRestarts.status("actual-profile").phase).toBe("waiting-idle");
+    metadata.approvalMode = "always-ask";
+    const drift = await service.leadRestarts.reconcile("actual-profile");
+    expect(drift.phase).toBe("waiting-idle");
+    expect(drift.problem).toBe("observation-unavailable");
+    expect(service.inbox.get(source.id)).toEqual(original);
+  } finally {
+    if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+    await server.close(); f.cleanup();
+  }
+});
+
 test("watchdog treats coordinator-owned detached startup gap as deliberate and never notifies vanished controller", async () => {
   const f = ompFixture();
   try {
@@ -108,7 +172,8 @@ test("queued owner ingress crosses only the reserved fresh epoch and old capabil
       receipt: { operationId: "original-source", payloadHash: payloadHash("restart"), sessionId: f.target.sessionId, sessionFile: f.target.sessionFile, entryId: "owner-entry", receiptId: `omp-entry:${f.target.sessionId}:owner-entry` } };
     service.inbox.put(mail);
     const authorization = restartAuthorization(config, lane, [mail], "restart-source");
-    const record: RestartRecord = { version: 1, operationId: "rotation-window", authorization, authorizationHash: payloadHash(JSON.stringify(authorization)), before: lane, config,
+    const launchMetadata = { agentDir: join(f.directory, "owner-profile"), settingsHome: join(f.directory, "owner-profile"), approvalMode: "yolo" as const, provider: "fixture", model: "lead-model", effort: "medium" };
+    const record: RestartRecord = { version: 1, operationId: "rotation-window", authorization, launchMetadata, authorizationHash: payloadHash(JSON.stringify({ authorization, launchMetadata })), before: lane, config,
       phase: "rotation-pending", createdAt: at, updatedAt: at, freshFence: 1,
       launch: { instance: nextInstance, generation: 3, token: nextToken, bridge, bootstrapFile: join(config.stateDir, "bootstrap.json") },
       freshTarget: { ...f.target, instanceId: "fresh-native", generation: 1, socketPath: join(f.directory, "fresh.sock"), tokenFile: join(f.directory, "fresh.token") } };

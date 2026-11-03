@@ -22,7 +22,8 @@ function fixture() {
     ompProvenance: { target, attachmentInstanceId: "attachment-old", attachmentGeneration: 3 },
     receipt: { operationId: "original-owner-mail", payloadHash: payloadHash("Restart this lead"), sessionId: target.sessionId, sessionFile: target.sessionFile, entryId: "entry-owner", receiptId: `omp-entry:${target.sessionId}:entry-owner` } };
   const authorization = restartAuthorization(config, lane, [mail], "source-id");
-  const record: RestartRecord = { version: 1, operationId: "restart-one", authorization, authorizationHash: payloadHash(JSON.stringify(authorization)), phase: "authorized", config, before: lane,
+  const launchMetadata = { agentDir: join(dir, "owner-profile"), settingsHome: join(dir, "owner-profile"), approvalMode: "yolo" as const, provider: "fixture", model: "lead-model", effort: "medium" };
+  const record: RestartRecord = { version: 1, operationId: "restart-one", authorization, launchMetadata, authorizationHash: payloadHash(JSON.stringify({ authorization, launchMetadata })), phase: "authorized", config, before: lane,
     createdAt: "2026-11-03T00:00:00.000Z", updatedAt: "2026-11-03T00:00:00.000Z", process: { pid: 123, startedAt: "2026-11-01T00:00:00.000Z" },
     launch: { instance: "attachment-fresh", generation: 4, token: "fixture-only", bridge: join(dir, "fresh/iyen"), bootstrapFile: join(dir, "bootstrap.json") },
     continuation: { operationId: "continuation-one", text: "Continue with fresh bridge" } };

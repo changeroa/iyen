@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { defaultConfig } from "../src/config.ts";
@@ -11,12 +11,13 @@ import type { OmpTarget } from "../src/runtime/omp/contract.ts";
 const directories: string[] = [];
 afterEach(() => { for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 function record(pid: number): RestartRecord {
-  const dir = mkdtempSync(join(tmpdir(), "iyen-restart-exit-")); directories.push(dir);
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "iyen-restart-exit-"))); directories.push(dir);
   const target: OmpTarget = { kind: "omp", protocol: 1, sessionId: "00000000-0000-4000-8000-000000000001", sessionFile: join(dir, "original.jsonl"), cwd: dir,
     paneId: "w1:p1", terminalId: "original-terminal", instanceId: "old-native", generation: 1, role: "attached-lead", laneKey: "lead", runtimeVersion: "18.15.0", socketPath: join(dir, "native.sock"), tokenFile: join(dir, "native.token") };
   const mail = { id: "original", target: "lead", text: "restart", state: "sent" as const, at: "2026-11-03T00:00:00.000Z" };
   return { version: 1, operationId: "exit-proof", authorizationHash: "a".repeat(64), authorization: { source: "slack", sourceMessageId: "source", owner: "owner", thread: "original-thread", mail,
     scope: { target, instance: "old-attachment", generation: 2 } },
+    launchMetadata: { agentDir: join(dir, "owner-profile"), settingsHome: join(dir, "owner-profile"), approvalMode: "yolo", provider: "fixture", model: "lead-model", effort: "medium" },
     phase: "exit-pending", createdAt: mail.at, updatedAt: mail.at, config: defaultConfig(dir), process: { pid, startedAt: mail.at },
     before: { key: "lead", role: "lead", title: "lead", thread: "none", brief: "", done: "", openedAt: mail.at },
     launch: { instance: "new-attachment", generation: 3, token: "fixture", bridge: join(dir, "bridge"), bootstrapFile: join(dir, "bootstrap") } };

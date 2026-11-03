@@ -6,7 +6,7 @@ import { readJson } from "./ipc.ts";
 import type { DoriConfig } from "./config.ts";
 import { statusOf, type Lane } from "./registry.ts";
 import type { Mail } from "./mailbox.ts";
-import { OmpError, payloadHash, validReceipt, type OmpTarget } from "./runtime/omp/contract.ts";
+import { OmpError, payloadHash, validReceipt, type OmpTarget, type OmpLaunchMetadata } from "./runtime/omp/contract.ts";
 import { sameOmpTarget } from "./runtime/omp-integration.ts";
 
 export type RestartPhase = "authorized" | "prepare-pending" | "waiting-idle" | "held" | "exit-pending" | "exited" | "start-pending" | "fresh-held" | "rotation-pending" | "rotated" | "continuation-pending" | "continuation-staged" | "release-pending" | "released" | "refused" | "rejected";
@@ -14,7 +14,7 @@ export type RestartScope = { target: OmpTarget; instance: string; generation: nu
 export type RestartAuthorization = { source: string; sourceMessageId: string; owner: string; thread: string; mail: Mail; scope: RestartScope };
 export type RestartRecord = {
   version: 1; operationId: string; authorizationHash: string; authorization: RestartAuthorization;
-  phase: RestartPhase; createdAt: string; updatedAt: string; config: DoriConfig;
+  phase: RestartPhase; createdAt: string; updatedAt: string; config: DoriConfig; launchMetadata: OmpLaunchMetadata;
   before: Lane; launch: { instance: string; generation: number; token: string; bridge: string; bootstrapFile: string };
   process?: { pid: number; startedAt: string }; freshTarget?: OmpTarget; freshFence?: number;
   continuation?: { operationId: string; text: string }; problem?: "observation-unavailable";
@@ -119,7 +119,7 @@ export class LeadRestartCoordinator {
       }
       if (this.state.active) throw new Error("Another lead restart is active");
       if (Object.values(this.state.operations).some(op => op.phase !== "rejected" && op.authorization.source === record.authorization.source && op.authorization.thread === record.authorization.thread && op.authorization.sourceMessageId === record.authorization.sourceMessageId)) throw new Error("Owner source already consumed by another restart");
-      if (record.authorizationHash !== payloadHash(JSON.stringify(record.authorization)) || record.phase !== "authorized") throw new Error("Invalid restart authorization digest");
+      if (record.authorizationHash !== payloadHash(JSON.stringify({ authorization: record.authorization, launchMetadata: record.launchMetadata })) || record.phase !== "authorized") throw new Error("Invalid restart authorization digest");
       await this.deps.assertScope(record);
       this.save(record); return this.status(record.operationId);
     });

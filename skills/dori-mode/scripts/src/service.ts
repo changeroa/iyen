@@ -31,7 +31,7 @@ import type { Turn } from "./runtime/generated/v2/Turn.ts";
 
 import { callOmp, findOmpTarget, verifyOmpHerdr, sameOmpTarget } from "./runtime/omp-integration.ts";
 import { connectOmp } from "./runtime/omp/client.ts";
-import { sameIdentity, validReceipt, payloadHash, object, exactKeys, validateFailureRecord, type OmpTarget } from "./runtime/omp/contract.ts";
+import { sameIdentity, validReceipt, payloadHash, object, exactKeys, validateFailureRecord, validLaunchMetadata, type OmpLaunchMetadata, type OmpTarget } from "./runtime/omp/contract.ts";
 import { NativeInteractionRelay } from "./runtime/omp/interactions.ts";
 import { LeadRestartCoordinator, restartAuthorization, type RestartRecord } from "./lead-restart-coordinator.ts";
 import { pinRestartProcess, restartProcessExited, discoverRestartTarget, validateRestartProfile } from "./lead-restart-launcher.ts";
@@ -461,19 +461,28 @@ export class DoriService {
     if (this.nativeInteractions.responseHistory().some(({ operation }) => operation.source === authorization.source &&
       operation.sourceMessageId === sourceMessageId && operation.thread === authorization.thread)) throw new Error("Interaction answer cannot authorize a restart");
     const client = await connectOmp(authorization.scope.target, { timeoutMs: this.config.runtime.rpcTimeoutMs });
+    let launchMetadata: OmpLaunchMetadata;
+    const config = structuredClone(this.config);
     try {
       const snap = await client.inspect();
       if (snap.capabilities.leadRestart !== true) throw new Error("Lead restart unavailable in the currently loaded native runtime; explicit first operator bootstrap required. No source consumed.");
       if (snap.held || snap.goal || !["idle", "running"].includes(snap.state) || (await client.interactions()).length) throw new Error("Native pause, handoff or outstanding question fences restart");
-      if (snap.provider !== this.config.runtime.omp?.provider || snap.model !== before.runtime?.model || snap.effort !== before.runtime.effort ||
-        this.config.runtime.roles.lead.model !== snap.model || this.config.runtime.roles.lead.effort !== snap.effort) throw new Error("Restart configured provider/model/effort does not match attached lead");
+      if (!validLaunchMetadata(snap.launchMetadata) || snap.launchMetadata.agentDir !== snap.launchMetadata.settingsHome ||
+        snap.launchMetadata.provider !== snap.provider || snap.launchMetadata.model !== snap.model || snap.launchMetadata.effort !== snap.effort ||
+        snap.model !== before.runtime?.model || snap.effort !== before.runtime.effort || snap.launchMetadata.approvalMode === "write")
+        throw new Error("Effective native launch profile is missing, mismatched or unsupported; no source consumed");
+      launchMetadata = structuredClone(snap.launchMetadata);
+      config.runtime.settingsHome = launchMetadata.agentDir;
+      config.runtime.omp!.provider = launchMetadata.provider;
+      config.runtime.omp!.approvalMode = snap.launchMetadata.approvalMode;
+      config.runtime.roles.lead = { model: launchMetadata.model, effort: launchMetadata.effort ?? null };
     } finally { client.close(); }
-    validateRestartProfile(this.config, authorization.scope.target, resolve(this.config.stateDir, "attachments", "restart-bootstrap", `${payloadHash(operationId)}.json`));
+    validateRestartProfile(config, authorization.scope.target, resolve(config.stateDir, "attachments", "restart-bootstrap", `${payloadHash(operationId)}.json`), launchMetadata);
     const process = await pinRestartProcess(authorization.scope.target, this.config.runtime.omp!.registryDir, this.runner);
     const instance = crypto.randomUUID(), at = new Date().toISOString();
     const bridge = resolve(this.config.stateDir, "clients", "attached-lead", instance, "iyen");
-    const record: RestartRecord = { version: 1, operationId, authorization, authorizationHash: payloadHash(JSON.stringify(authorization)),
-      phase: "authorized", before, config: structuredClone(this.config), createdAt: at, updatedAt: at, process,
+    const record: RestartRecord = { version: 1, operationId, authorization, launchMetadata, authorizationHash: payloadHash(JSON.stringify({ authorization, launchMetadata })),
+      phase: "authorized", before, config, createdAt: at, updatedAt: at, process,
       launch: { instance, generation: saved.generation + 1, token: crypto.randomUUID(), bridge,
         bootstrapFile: resolve(this.config.stateDir, "attachments", "restart-bootstrap", `${payloadHash(operationId)}.json`) },
       continuation: { operationId: `lead-restart-continuation:${operationId}`,

@@ -4,7 +4,7 @@ import { atomicJson } from "./journal.ts";
 import type { Runner } from "./run.ts";
 import type { RestartRecord } from "./lead-restart-coordinator.ts";
 import { connectOmp } from "./runtime/omp/client.ts";
-import { payloadHash, type OmpExtensionBootstrap, type OmpTarget } from "./runtime/omp/contract.ts";
+import { payloadHash, validLaunchMetadata, type OmpLaunchMetadata, type OmpExtensionBootstrap, type OmpTarget } from "./runtime/omp/contract.ts";
 import { discoverOmpSafe, sameOmpTarget, verifyOmpHerdr } from "./runtime/omp-integration.ts";
 import type { DoriConfig } from "./config.ts";
 import { prepareOmpLaunch, type OmpLaunchSpec } from "./runtime/omp/launcher.ts";
@@ -60,10 +60,13 @@ export function restartBootstrap(record: RestartRecord): OmpExtensionBootstrap {
 
 
 /** All deterministic launcher refusals occur before source consumption or native shutdown. */
-export function validateRestartProfile(config: DoriConfig, target: OmpTarget, bootstrapFile: string): OmpLaunchSpec {
+export function validateRestartProfile(config: DoriConfig, target: OmpTarget, bootstrapFile: string, metadata: OmpLaunchMetadata): OmpLaunchSpec {
   const { runtime } = config, omp = runtime.omp;
   if (runtime.kind !== "omp" || !omp || !runtime.settingsHome?.startsWith("/") || !runtime.roles.lead.model || !runtime.roles.lead.effort) throw new Error("Pinned restart profile unavailable");
-  const canonical = Bun.which("omp");
+  if (!validLaunchMetadata(metadata) || metadata.agentDir !== metadata.settingsHome || runtime.settingsHome !== metadata.agentDir ||
+    omp.provider !== metadata.provider || omp.approvalMode !== metadata.approvalMode || runtime.roles.lead.model !== metadata.model ||
+    runtime.roles.lead.effort !== metadata.effort) throw new Error("Configured restart launcher differs from effective native profile");
+  const canonical = Bun.which("omp", { PATH: process.env.PATH ?? "" });
   if (!canonical || realpathSync(canonical) !== realpathSync(runtime.binary)) throw new Error("Configured OMP binary differs from Herdr canonical omp executable");
   return prepareOmpLaunch({ binary: runtime.binary, registryDir: omp.registryDir, bootstrapFile, extensionPath: omp.extensionPath, cwd: target.cwd,
     provider: omp.provider, model: runtime.roles.lead.model, effort: runtime.roles.lead.effort, approvalMode: omp.approvalMode, resumeSessionFile: target.sessionFile });
@@ -72,12 +75,12 @@ export function validateRestartProfile(config: DoriConfig, target: OmpTarget, bo
 /** Herdr's structured agent launcher owns shell readiness; never send command text. */
 export async function launchRestartNative(record: RestartRecord, bootstrap: OmpExtensionBootstrap, runner: Runner): Promise<void> {
   const { runtime } = record.config, old = record.authorization.scope.target;
-  const spec = validateRestartProfile(record.config, old, record.launch.bootstrapFile);
+  const spec = validateRestartProfile(record.config, old, record.launch.bootstrapFile, record.launchMetadata);
   if (!await restartProcessExited(record, runner)) throw new Error("Exact old process exit/Herdr detachment not proven");
   writeRestartBootstrap(record, bootstrap);
   const name = `iyen-restart-${payloadHash(record.operationId).slice(0, 16)}`;
   const result = await runner(["herdr", "agent", "start", name, "--kind", "omp", "--pane", old.paneId, "--timeout", String(runtime.startupTimeoutMs), "--",
-    "--agent-dir", runtime.settingsHome!, "--cwd", old.cwd, "--iyen-omp-bootstrap", record.launch.bootstrapFile, ...spec.argv.slice(1)],
+    "--agent-dir", record.launchMetadata.agentDir, "--start-held", "--cwd", old.cwd, "--iyen-omp-bootstrap", record.launch.bootstrapFile, ...spec.argv.slice(1)],
     { timeoutMs: runtime.startupTimeoutMs + 5000 });
   if (result.code !== 0) throw new Error("Restart startup outcome unknown; discover exact fresh controller without relaunch");
 }
