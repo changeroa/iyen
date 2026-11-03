@@ -6,7 +6,15 @@ import { fill, type ArgvTemplate } from "./config.ts";
 import type { Runner } from "./run.ts";
 import type { OmpReceipt, OmpTarget } from "./runtime/omp/contract.ts";
 export type OmpMailProvenance = { target: OmpTarget; attachmentInstanceId: string; attachmentGeneration: number };
-export type Mail = { id: string; target: string; text: string; state: "queued" | "sending" | "sent" | "unknown"; turnId?: string; receiptKind?: "omp-session-entry"; receipt?: OmpReceipt; ompProvenance?: OmpMailProvenance; thread?: string; source?: string; sourceMessageId?: string; ownerUser?: string; metadata?: unknown; at: string; attachmentInstance?: string };
+export type MailAbandonment = {
+  operationId: string; evidence: string; at: string;
+  original: Omit<Mail, "abandonment">;
+  epoch: { hostInstanceId: string; generation: number; target: OmpTarget };
+  outcome: "pending" | "received" | "abandoned";
+  delivery: "not-attempted" | "unknown";
+  completedAt?: string; processStoppedAt?: string;
+};
+export type Mail = { id: string; target: string; text: string; state: "queued" | "sending" | "sent" | "unknown" | "abandoned"; abandonment?: MailAbandonment; turnId?: string; receiptKind?: "omp-session-entry"; receipt?: OmpReceipt; ompProvenance?: OmpMailProvenance; thread?: string; source?: string; sourceMessageId?: string; ownerUser?: string; metadata?: unknown; at: string; attachmentInstance?: string };
 // Only a pre-submission refusal can return mail to queued. Any attempted send
 // remains unknown until reconciled, even if the transport reports failure.
 export class DeliveryDeferred extends Error {}
@@ -14,7 +22,7 @@ export class Mailbox {
   private rows: Record<string, Mail>;
   private queue = new SerialQueue();
   private path: string;
-  constructor(dir: string, name: string) {
+  constructor(dir: string, readonly name: string) {
     this.path = join(dir, `${name}.json`); this.rows = existsSync(this.path) ? readJson(this.path) : {};
     for (const row of Object.values(this.rows)) if (row.state === "sending") row.state = "unknown";
     atomicJson(this.path, this.rows);
@@ -22,6 +30,7 @@ export class Mailbox {
   list(): Mail[] { return Object.values(this.rows); }
   get(id: string): Mail | undefined { return this.rows[id]; }
   put(mail: Mail): Mail {
+    if (this.name !== "inbox" && (mail.state === "abandoned" || mail.abandonment)) throw new Error("Abandoned input cannot be copied to another mailbox");
     const existing = this.rows[mail.id];
     if (existing) {
       if (existing.text !== mail.text || existing.target !== mail.target) throw new Error("Operation ID reused with different content");
@@ -32,6 +41,12 @@ export class Mailbox {
   }
   mark(id: string, patch: Partial<Mail>): Mail {
     if (!this.rows[id]) throw new Error("Unknown mail");
+    if (this.rows[id]!.state === "abandoned") throw new Error("Abandoned mail is immutable; never replay");
+    const intent = this.rows[id]!.abandonment;
+    if (intent && (!patch.abandonment || patch.abandonment.operationId !== intent.operationId || patch.abandonment.evidence !== intent.evidence ||
+      !((patch.state === "sent" && patch.abandonment.outcome === "received") || (patch.state === "abandoned" && patch.abandonment.outcome === "abandoned")))) {
+      throw new Error("Mail abandonment intent fences mutation; never replay");
+    }
     const row = { ...this.rows[id]!, ...patch, id }, next = { ...this.rows, [id]: row };
     // A failed write must not make a retry believe an assignment or receipt was
     // persisted. Publish the in-memory state only after durable replacement.
@@ -41,6 +56,7 @@ export class Mailbox {
     return this.queue.run(id, async () => {
       const row = this.rows[id]; if (!row) throw new Error("Unknown mail");
       if (row.state === "sent") return row;
+      if (row.state === "abandoned" || row.abandonment) throw new Error("Mail abandonment fences delivery; never replay");
       if (row.state !== "queued") throw new Error("Delivery unknown; reconcile before retry");
       this.mark(id, { state: "sending" });
       try { const result = await action(row); return this.mark(id, { state: "sent", ...result }); }
