@@ -102,6 +102,12 @@ one unambiguous authenticated owner thread. Explicit unmatched or contradictory
 lead provenance is withheld. A worker's unmapped launch source may use its
 registered report thread only when one configured ingress/owner can be identified;
 contradictory known provenance cannot use that fallback.
+A shared Slack/Discord ingress may configure multiple owner identities. A worker
+may bind its exact registered report thread to one authenticated owner proved by
+a durable receipt in the current lead attachment; owner, controller and generation
+must all match. Other threads, old epochs, missing receipts or multiple owners in
+that thread do not qualify. Historical records without owner identity are not
+backfilled by guessing: a fresh authenticated owner message supplies the binding.
 
 Slack notices retain the actual native question, plan, labels, option IDs,
 descriptions and execution tiers, with Korean instructions and a stable
@@ -130,6 +136,8 @@ worker report thread; validated native answers are control traffic.
 Malformed or stale authenticated native answers are recorded as handled control
 and receive thread feedback, rather than restarting the ingress producer. Replayed
 or edited source IDs cannot become a fresh answer when a later question opens.
+Native owner/operator answers cannot cross a paused/held or dispatch-blocked lane.
+Resume/reconcile first, then send a fresh answer; a rejected old source is not replayed.
 
 `approval list` includes real native payloads instead of an OMP TUI placeholder.
 For authenticated operator tooling, `approval respond TOKEN --response-file FILE
