@@ -18,6 +18,8 @@ Leave the reaction in place when the work finishes. React to the incoming
 message, not the thread root or your own reply. A local chat response does not
 reach Slack and does not satisfy the reply requirement.
 
+Owner-facing clarification, choices, confirmations and approval requests also belong in the original messenger thread. In a Slack deployment, send the concrete question and options through the scoped `reply` command, then wait for the owner's Slack answer; do not open a local/native `ask` prompt or treat a local TUI response as delivery to Slack. Workers report questions or approval blockers to the lead instead of contacting the owner directly. Keep the exact source/thread and approval request IDs, and use the existing approval lifecycle to validate any eventual answer; a generic “yes” is not permission to approve a different request.
+
 The `Owner message in ...` reference is the reply destination. `Source message
 ID: slack:CHANNEL:TIMESTAMP` identifies the individual message for the reaction.
 For an older envelope without that reference, resolve the exact message from the
