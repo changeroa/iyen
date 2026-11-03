@@ -69,3 +69,15 @@ for (const conflict of ["generation", "sending", "provenance", "new-pause"] as c
     expect(x.counts()).toEqual({ releases: 0, sends: 0 });
   } finally { x.state.done(); }
 });
+
+test("explicit recovery repairs dispatch when the same native process is already open without another release", async () => {
+  const x = await fixture();
+  try {
+    await x.release();
+    const original = x.inbox.get("original");
+    expect(await resumeUncertain(x.deps, x.inbox, x.operations, x.args, async () => { throw new Error("Second release forbidden"); })).toMatchObject({ resumed: true });
+    expect((await x.deps.registry.read("worker"))?.dispatchBlocked).toBe(false);
+    expect(x.inbox.get("original")).toEqual(original);
+    expect(x.counts()).toEqual({ releases: 1, sends: 0 });
+  } finally { x.state.done(); }
+});
