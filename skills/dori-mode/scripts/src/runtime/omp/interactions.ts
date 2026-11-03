@@ -5,10 +5,10 @@ import { atomicJson, SerialQueue } from "../../journal.ts";
 import { readJson } from "../../ipc.ts";
 import type { Mailbox } from "../../mailbox.ts";
 import { statusOf, type Lane } from "../../registry.ts";
-import { OmpError, assertInteractionAnswer, identityOf, payloadHash, sameIdentity, validReceipt, validInteraction, validInteractionResponse, validInteractionStatus,
+import { OmpError, assertInteractionAnswer, identityOf, payloadHash, sameIdentity, validReceipt, validInteraction, validInteractionStatus,
   type NativeUserInteraction, type NativeInteractionResponse, type NativeInteractionStatus, type OmpIdentity } from "./contract.ts";
 
-export type InteractionOwnerEvent = { id: string; thread: string; user: string; text: string; metadata?: unknown };
+type InteractionOwnerEvent = { id: string; thread: string; user: string; metadata?: unknown };
 type Binding = { key: string; target: OmpIdentity; attachment: string; generation: number };
 export type RelayedInteraction = Binding & {
   token: string; request: NativeUserInteraction; thread: string; source: string; owner: string; sourceMessageId?: string;
@@ -44,7 +44,7 @@ export class NativeInteractionRelay {
   private operation(row: ResponseOperation): void { this.save({ ...this.state, responses: { ...this.state.responses, [row.id]: row } }); }
   private matches(row: Binding, lane: Lane): boolean {
     const runtime = lane.runtime;
-    return runtime?.kind === "omp" && !!runtime.omp && !runtime.external?.detachedAt && runtime.state !== "stopped" &&
+    return runtime?.kind === "omp" && !!runtime.omp && !runtime.external?.detachedAt && !runtime.omp.detachedAt && runtime.state !== "stopped" &&
       !["closed", "done-claimed", "verified-done"].includes(statusOf(lane)) && !lane.cleanupFence &&
       runtime.hostInstanceId === row.attachment && runtime.generation === row.generation && runtime.threadId === row.target.sessionId &&
       runtime.omp.attachmentInstanceId === row.attachment && runtime.omp.attachmentGeneration === row.generation && sameIdentity(runtime.omp.target, row.target);
@@ -98,14 +98,8 @@ export class NativeInteractionRelay {
     for (const t of r.tiers ?? []) lines.push(`실행 역할 ${t.role}: ${t.provider}/${t.model}${t.thinkingLevel ? ` (${t.thinkingLevel})` : ""}`);
     if (r.placeholder) lines.push(`입력 안내: ${r.placeholder}`);
     if (r.defaultValue !== undefined) lines.push(`현재 값: ${r.defaultValue} (자동 선택하지 않음)`);
-    lines.push(`답변 토큰: ${row.token}`, `답변 ${row.token} <응답>`, `취소: 답변 ${row.token} 취소`);
-    if (r.kind === "ask") {
-      if (r.questions!.length === 1 && !r.questions![0]!.multi) lines.push("응답: 표시된 선택지 번호 또는 정확한 이름 (숫자는 표시 번호). 직접 입력: 직접:<원문> (콜론 뒤 공백도 보존)");
-      lines.push('복수 질문/복수 선택/메모: {"kind":"submit","answers":[{"id":"질문 ID","selectedOptions":["선택지 이름"],"customInput":"직접 입력","note":"메모"}]} (질문 순서대로 모두 기입)');
-    } else if (r.kind === "confirm") lines.push("응답: true 또는 false");
-    else if (r.kind === "input" || r.kind === "editor") lines.push("응답: 입력할 원문 (여러 줄 가능)");
-    else if (r.kind === "plan-review") lines.push('응답: 정확한 선택 ID 또는 {"kind":"submit","choice":"execute","role":"제공된 역할"}. 승인은 표시된 계획 원문에만 적용되며 이후 로컬 수정본은 포함하지 않습니다. refine은 feedback 의견 필수.');
-    else lines.push("응답: 위에 제공된 정확한 선택 ID. 승인 범위는 생략하거나 확대할 수 없습니다.");
+    if (r.kind === "plan-review") lines.push("승인은 표시된 계획 원문에만 적용되며 이후 로컬 수정본은 포함하지 않습니다.");
+    lines.push("이 스레드에 평소처럼 답해 주세요. 담당 리드가 답변을 확인하고 이 요청에 전달합니다.");
     if (r.expiresAt) lines.push(`만료: ${r.expiresAt}`);
     return lines.join("\n");
   }
@@ -177,80 +171,71 @@ export class NativeInteractionRelay {
   }
   list(): RelayedInteraction[] { return Object.values(this.state.requests).filter(r => r.state === "open"); }
   unrouted(): readonly { key: string; request: NativeUserInteraction; reason: string }[] { return this.blocked; }
-  private parse(request: NativeUserInteraction, text: string): NativeInteractionResponse {
-    let response: unknown;
-    const freeText = request.kind === "input" || request.kind === "editor";
-    if (text === "취소" || text === "cancel") response = { kind: "cancel" };
-    else {
-      if (text.startsWith("{")) {
-        try {
-          const parsed: unknown = JSON.parse(text);
-          if (!freeText || parsed !== null && typeof parsed === "object" && "kind" in parsed &&
-            (parsed.kind === "submit" || parsed.kind === "cancel")) response = parsed;
-        } catch (error) { if (!freeText) throw error; }
-      }
-      if (response === undefined) {
-        if (freeText) response = { kind: "submit", value: text };
-        else if (request.kind === "ask" && request.questions?.length === 1 && !request.questions[0]!.multi) {
-          const q = request.questions[0]!;
-          const option = /^[1-9]\d*$/.test(text) ? q.options[Number(text) - 1] : q.options.find(o => o.label === text);
-          response = { kind: "submit", answers: [{ id: q.id, selectedOptions: option ? [option.label] : [],
-            ...(text.startsWith("직접:") ? { customInput: text.slice(3) } : {}) }] };
-        } else if (request.kind === "confirm") response = { kind: "submit", value: text === "true" ? true : text === "false" ? false : undefined };
-        else response = { kind: "submit", choice: text };
-      }
-    }
-    if (!validInteractionResponse(response)) throw new Error("응답 형식이 올바르지 않습니다");
-    assertInteractionAnswer(request, response); return response;
-  }
-  /** Returns false only for ordinary conversation; quoted tokens never authorize a response. */
-  receive(source: string, event: InteractionOwnerEvent): Promise<boolean> {
+  /** The lead supplies semantics; authenticated delivered conversation supplies authority. */
+  respondFromLead(token: string, response: NativeInteractionResponse, sourceMessageId: string): Promise<NativeInteractionStatus> {
     return this.queue.run("relay", async () => {
-      if (!this.deps.ingress.some(i => i.id === source && i.owners.includes(event.user))) throw new Error("Untrusted native response owner");
-      const explicit = /^답변[ \t]+(iyen-[a-f0-9]{32})(?:[ \t]|\n)([\s\S]*)$/.exec(event.text);
-      const command = /^답변(?:\s|$)/.test(event.text.trim());
-      const duplicate = Object.values(this.state.responses).find(op => op.source === source && op.sourceMessageId === event.id && op.thread === event.thread);
+      const row = this.state.requests[token];
+      if (!row || !sourceMessageId) throw new Error("Unknown native request or source message");
+      assertInteractionAnswer(row.request, response);
+      const lanes = await this.deps.lanes();
+      const lead = lanes.find(l => l.key === "lead");
+      const runtime = lead?.runtime;
+      if (!lead || runtime?.kind !== "omp" || !runtime.omp || runtime.omp.target.role !== "attached-lead" || runtime.omp.target.laneKey !== "lead" ||
+        !this.matches({ key: lead.key, target: runtime.omp.target, attachment: runtime.hostInstanceId, generation: runtime.generation }, lead) ||
+        lead.dispatchBlocked || runtime.held || statusOf(lead) === "paused") throw new Error("Current attached lead unavailable");
+      const sources = this.deps.inbox.list().filter(mail => mail.sourceMessageId === sourceMessageId &&
+        mail.source === row.source && mail.thread === row.thread);
+      if (sources.length !== 1) throw new Error("Native response requires one original authenticated source");
+      const mail = sources[0]!;
+      if (mail.target !== "lead" || mail.state !== "sent" || mail.abandonment || mail.ownerUser !== row.owner ||
+        !this.deps.ingress.some(i => i.id === mail.source && i.owners.includes(mail.ownerUser!)) ||
+        !Number.isFinite(Date.parse(mail.at)) || Date.parse(mail.at) < Date.parse(row.request.createdAt) ||
+        mail.attachmentInstance !== runtime.hostInstanceId || mail.ompProvenance?.attachmentInstanceId !== runtime.hostInstanceId ||
+        mail.ompProvenance.attachmentGeneration !== runtime.generation || !sameIdentity(mail.ompProvenance.target, runtime.omp.target) ||
+        !validReceipt(mail.receipt, runtime.omp.target, mail.id, payloadHash(mail.text))) {
+        throw new Error("Native response source is not current authenticated lead conversation");
+      }
+      const duplicate = Object.values(this.state.responses).find(op => op.source === mail.source &&
+        op.sourceMessageId === sourceMessageId && op.thread === mail.thread);
       if (duplicate) {
-        if (duplicate.owner !== event.user) throw new Error("Native response owner mismatch");
-        if (!explicit || explicit[1] !== duplicate.token || JSON.stringify(this.parse(this.state.requests[duplicate.token]!.request, explicit[2]!)) !== JSON.stringify(duplicate.response)) throw new Error("Source message reused with another answer");
-        await this.reconcile(await this.deps.lanes()); return true;
-      }
-      const pending = this.list().filter(r => r.source === source && r.thread === event.thread && r.owner === event.user);
-      // Tokens embedded in quotations/forwarded prose are data, never authority.
-      const looksLikeSelection = pending.some(r => /^(yes|no|네|예|아니오|승인|true|false|\d+)$/i.test(event.text.trim()) ||
-        r.request.options?.some(o => o.id === event.text.trim() || o.label === event.text.trim()) || r.request.questions?.some(q => q.options.some(o => o.label === event.text.trim())));
-      if (!explicit) {
-        if (command || looksLikeSelection) {
-          await this.deps.post(`native-clarify:${payloadHash(JSON.stringify([source, event.thread, event.id]))}`, event.thread,
-            "요청을 추측해서 처리하지 않습니다. 해당 질문에 표시된 `답변 iyen-… <응답>` 토큰과 정확한 선택/승인 범위를 사용해 주세요.", "lead").catch(() => {});
-          return true;
+        if (duplicate.token !== token || duplicate.owner !== mail.ownerUser || !isDeepStrictEqual(duplicate.response, response)) {
+          throw new Error("Source message reused with another answer");
         }
-        return false;
+        await this.reconcile(lanes);
+        return this.state.responses[duplicate.id]!.outcome ?? {
+          status: "pending", operationId: duplicate.id, requestId: row.request.id, responseHash: duplicate.responseHash,
+        };
       }
-      const row = this.state.requests[explicit[1]!];
-      if (!row || row.state !== "open" || row.source !== source || row.thread !== event.thread || row.owner !== event.user || row.request.secret ||
-        row.request.expiresAt && Date.parse(row.request.expiresAt) <= Date.now()) throw new Error("Native request is stale, local-only or belongs to another owner/thread");
-      const lanes = await this.deps.lanes(), lane = lanes.find(l => l.key === row.key);
+      if (row.state !== "open" || row.request.secret ||
+        row.request.expiresAt && Date.parse(row.request.expiresAt) <= Date.now()) throw new Error("Native request is stale or local-only");
+      const lane = lanes.find(l => l.key === row.key);
       if (!lane || !this.matches(row, lane)) { this.request({ ...row, state: "stale" }); throw new Error("Native request epoch expired"); }
       if (lane.dispatchBlocked || lane.runtime?.held || statusOf(lane) === "paused") throw new Error("Native response held until lane reconciliation or resume");
       const owner = this.owner(lane, row.request, lanes);
       if (!owner || owner.thread !== row.thread || owner.source !== row.source || owner.owner !== row.owner) {
         this.request({ ...row, state: "stale" }); throw new Error("Native request owner/thread binding changed");
       }
-      if (Object.values(this.state.responses).some(op => op.token === row.token && (op.state === "sending" || op.state === "unknown"))) throw new Error("Native response outcome unknown; status reconciliation required");
+      if (Object.values(this.state.responses).some(op => op.token === token && ["sending", "unknown", "applied"].includes(op.state))) {
+        throw new Error("Native response already attempted; reconcile without replay");
+      }
       const current = await this.deps.call(lane, "interactions", {});
       if (!Array.isArray(current) || !current.some(r => validInteraction(r, row.target.sessionId) && isDeepStrictEqual(r, row.request))) {
         this.request({ ...row, state: "stale" }); throw new Error("Native request completed locally or changed");
       }
-      let response: NativeInteractionResponse;
-      try { response = this.parse(row.request, explicit[2]!); }
-      catch (error) {
-        await this.deps.post(`native-invalid-answer:${payloadHash(JSON.stringify([source, event.thread, event.id]))}`, row.thread,
-          `응답이 해당 질문의 형식 또는 제공된 선택/승인 범위와 일치하지 않습니다. 원래 질문을 확인하고 \`답변 ${row.token} <응답>\` 형식으로 다시 답해 주세요. 복수 질문은 질문 ID와 순서를 모두 포함한 JSON이 필요합니다.`, row.key).catch(() => {});
-        throw error;
+      // Observation may await a resolver; re-check both epochs and source before mutation.
+      const latest = await this.deps.lanes(), currentLane = latest.find(l => l.key === row.key), currentLead = latest.find(l => l.key === "lead");
+      if (row.request.expiresAt && Date.parse(row.request.expiresAt) <= Date.now() ||
+        !currentLane || !this.matches(row, currentLane) || currentLane.dispatchBlocked || currentLane.runtime?.held || statusOf(currentLane) === "paused" ||
+        !currentLead || !this.matches({ key: lead.key, target: runtime.omp.target, attachment: runtime.hostInstanceId, generation: runtime.generation }, currentLead) ||
+        currentLead.dispatchBlocked || currentLead.runtime?.held || statusOf(currentLead) === "paused" ||
+        !isDeepStrictEqual(this.deps.inbox.get(mail.id), mail)) throw new Error("Native response binding changed during observation");
+      const currentOwner = this.owner(currentLane, row.request, latest);
+      if (!currentOwner || currentOwner.thread !== row.thread || currentOwner.source !== row.source || currentOwner.owner !== row.owner) {
+        throw new Error("Native request owner/thread binding changed");
       }
-      await this.respond(row, lane, response, source, event);
-      return true;
+      return this.respond(row, currentLane, response, mail.source!, {
+        id: sourceMessageId, user: mail.ownerUser!, thread: mail.thread!, metadata: mail.metadata,
+      });
     });
   }
   /** Operator path still requires a stable, original source-message operation identity. */
@@ -261,7 +246,7 @@ export class NativeInteractionRelay {
         row.request.expiresAt && Date.parse(row.request.expiresAt) <= Date.now()) throw new Error("Expired native request");
       if (lane.dispatchBlocked || lane.runtime?.held || statusOf(lane) === "paused") throw new Error("Native response held until lane reconciliation or resume");
       assertInteractionAnswer(row.request, response);
-      return this.respond(row, lane, response, "operator", { id: operationId, user: row.owner, thread: row.thread, text: "" });
+      return this.respond(row, lane, response, "operator", { id: operationId, user: row.owner, thread: row.thread });
     });
   }
   private async respond(row: RelayedInteraction, lane: Lane, response: NativeInteractionResponse, source: string, event: InteractionOwnerEvent): Promise<NativeInteractionStatus> {
