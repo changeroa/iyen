@@ -24,15 +24,42 @@ test("host registration rejects stale generations and identity changes",async()=
 test("inbound owner identity, stable ID and thread are required; duplicate events enqueue once",async()=>{
  await s.registry.write(lane);const event={id:"m1",thread:"chat:1",user:"owner",text:"work"};
  await expect(s.receive("test",{...event,user:"stranger"})).rejects.toThrow("Untrusted");
- await s.receive("test",event);await s.receive("test",event);expect(s.inbox.list()).toHaveLength(1);expect(s.inbox.list()[0]?.target).toBe(lane.key);
+ await s.receive("test",event);await s.receive("test",event);expect(s.inbox.list()).toHaveLength(1);expect(s.inbox.list()[0]?.target).toBe("lead");
 });
 test("paused lane receives durable queued input without starting a turn",async()=>{
  await s.registry.write({...lane,dispatchBlocked:true,status:"paused"});
  expect(await s.handle("input",{key:lane.key,text:"later",operationId:"m1"},{role:"admin"})).toMatchObject({queued:true});expect(s.inbox.get("m1")?.state).toBe("queued");
 });
-test("closed lane messages route to lead with original lane identity",async()=>{
- await s.registry.write({...lane,status:"closed",closedAt:new Date().toISOString()});await s.receive("test",{id:"m2",thread:"chat:1",user:"owner",text:"follow up"});
- expect(s.inbox.list()[0]).toMatchObject({target:"lead"});expect(s.inbox.list()[0]?.text).toContain("closed lane service-lane");
+test("owner conversation stays with the attached lead across lane lifecycle transitions",async()=>{
+ const h=await externalFixture();
+ await s.registry.write(lane);
+ for(const status of ["working","paused","closed"] as const){
+  await s.registry.update(lane.key,current=>({...current,role:"lane",status,dispatchBlocked:status==="paused"}));
+  const event={id:`owner-${status}`,thread:lane.thread,user:"owner",text:"follow up"};
+  await s.receive("test",event);
+  expect(s.inbox.get(`inbound:test:${event.thread}:${event.id}`)).toMatchObject({target:"lead",state:"queued",thread:event.thread,source:"test",attachmentInstance:h.attachment().instance});
+ }
+});
+
+test("explicit owner controls retain thread validation without transferring conversation ownership",async()=>{
+ await s.registry.write({...lane,status:"paused",dispatchBlocked:true});
+ const event={id:"pause-control",thread:lane.thread,user:"owner",text:"Pause",control:{action:"pause",args:{key:lane.key}}};
+ await expect(s.receive("test",{...event,thread:"other-thread"})).rejects.toThrow("another lane");
+ await expect(s.receive("test",{...event,user:"stranger"})).rejects.toThrow("Untrusted");
+ await s.receive("test",event);
+ expect(s.inbox.get(`inbound:test:${event.thread}:${event.id}`)).toMatchObject({target:"owner-control",state:"sent"});
+ await s.receive("test",{id:"owner-after-control",thread:lane.thread,user:"owner",text:"what happened?"});
+ expect(s.inbox.get(`inbound:test:${lane.thread}:owner-after-control`)).toMatchObject({target:"lead",state:"queued"});
+});
+
+for(const delivery of ["queued","sent","unknown"] as const)test(`owner-routing cutover preserves previously accepted ${delivery} lane delivery`,async()=>{
+ await s.registry.write(lane);
+ const event={id:"accepted-before-cutover",thread:lane.thread,user:"owner",text:"original request"},id=`inbound:test:${event.thread}:${event.id}`;
+ const original={id,target:lane.key,thread:event.thread,text:`Owner message in ${event.thread}:\nSource message ID: ${event.id}\n${event.text}`,source:"test",state:delivery,at:"2026-11-03",attachmentInstance:"original-lane-instance"};
+ s.inbox.put(original);
+ await s.receive("test",event);
+ expect(s.inbox.get(id)).toEqual(original);
+ await expect(s.receive("test",{...event,text:"changed request"})).rejects.toThrow("different content");
 });
 test("reports are explicit durable events and duplicate IDs cannot change content",async()=>{
  await s.registry.write(lane);const args={key:lane.key,text:"built",kind:"milestone",eventId:"r1"};

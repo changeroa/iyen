@@ -45,6 +45,9 @@ the returned bridge:
 BRIDGE reply --thread REF --text-file FILE --operation-id STABLE_ID
 ```
 
+Ordinary authenticated owner conversation is delivered only to the lead. Attaching a worker to the same messenger thread supplies a report destination, not conversation ownership. Forward a bounded instruction to a worker with the scoped `input` action when appropriate; do not expect owner follow-ups to reach workers automatically. Explicit owner control envelopes keep their existing lane/thread checks.
+
+
 Verify delivery before claiming the reply was sent. For work requests, share
 the result, material progress, or a blocker. Do not send routine
 “이연: 작업 진행 중입니다.” or “이연: 현재 응답을 마쳤습니다.” messages, fixed-interval
