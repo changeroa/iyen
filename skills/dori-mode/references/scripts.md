@@ -94,6 +94,9 @@ storage; it never posts a messenger acknowledgment. Read receipts and actual
 replies are chosen by the lead following the `iyen` skill, not by Herdr status
 changes or a service reaction timer.
 
+New ordinary owner messages always target the lead, even when an active, paused or closed worker lane shares the same messenger thread. A lane's `thread` is its report destination, not ownership of the conversation. The lead forwards deliberate worker instructions through scoped `input`. Explicit owner UI controls below retain their existing lane/thread validation. Already accepted inbox entries retain their recorded target, payload, attachment and delivery outcome across retries; this cutover does not reroute or replay old queued or unknown messages.
+
+
 The optional control field is for explicit owner UI actions. The service validates owner identity and target thread before dispatch:
 
 ```json

@@ -79,6 +79,8 @@ Telegram, Discord and Slack clients, typing/draft support, presence, voice trans
 
 The Iyen skill guides read receipts and replies: after reading an owner message, the lead adds an `eyes` reaction as the configured bot to that exact message, then answers in the original thread. The service does not generate routine working/completed/waiting acknowledgments or react automatically. There is no fixed status-posting or thread-renaming cycle.
 
+Ordinary authenticated owner messages always go to the lead, including follow-ups in a worker's report thread. The lead explicitly forwards worker instructions; a lane/thread association never captures the conversation. Explicit owner UI controls retain their lane/thread checks. Previously accepted queued or unknown entries are preserved for reconciliation, not automatically moved or replayed.
+
 The service supervises configured ingress commands. They emit normalized owner messages with stable IDs and advance source cursors only after a durable protocol ACK. The delivered envelope includes the source message ID separately from the reply thread. This internal ACK is not a messenger reply or a read receipt. Raw human-readable messenger watch output is not accepted directly. Thread hooks keep account credentials outside worker environments. See the exact [adapter and approval contracts](skills/dori-mode/references/scripts.md).
 
 ## Migration and recovery
