@@ -144,11 +144,15 @@ test("retries retain stable intent across restart, reject conflicts, and never r
     await expect(abandonManagedInput(f.deps, { ...args, evidence: "different evidence" })).rejects.toThrow("conflicts");
     await expect(abandonManagedInput(f.deps, { ...args, operationId: "different-operation" })).rejects.toThrow("conflicts");
     f.deps.runtime.stop = stop;
+    await expect(abandonManagedInput(f.deps, args)).rejects.toThrow("without resubmitting stop");
+    expect(f.stopped()).toBe(0);
+    // The original stop subsequently completes and publishes its exact exit proof.
+    await f.deps.registry.update("worker-one", lane => ({ ...lane, runtime: { ...lane.runtime!, state: "stopped" } }));
     const result = await abandonManagedInput(f.deps, args);
     await f.deps.registry.update("worker-one", lane => ({ ...lane, runtime: { ...lane.runtime!, generation: 3, state: "idle", omp: { ...lane.runtime!.omp!, target: { ...target, instanceId: "recovered-controller" } } } }));
     f.deps.inbox = new Mailbox(f.disk.dir, "inbox");
     expect(await abandonManagedInput(f.deps, args)).toEqual(result);
-    expect(f.stopped()).toBe(1);
+    expect(f.stopped()).toBe(0);
     expect(f.deps.inbox.list().filter(row => row.state === "queued")).toEqual([]);
     await expect(f.deps.inbox.deliver(args.id, async () => ({ turnId: "replay" }))).rejects.toThrow("never replay");
   } finally { f.done(); }
@@ -217,9 +221,11 @@ for (const state of ["queued", "unknown"] as const) test(`restart after ${state}
   const f = await fixture(state);
   try {
     const rename = fs.renameSync;
-    let inboxWrites = 0;
     const fault = spyOn(fs, "renameSync").mockImplementation((from, to) => {
-      if (String(to) === join(f.disk.dir, "inbox.json") && ++inboxWrites === 2) throw new Error("final write failed");
+      if (String(to) === join(f.disk.dir, "inbox.json")) {
+        const snapshot: Record<string, Mail> = JSON.parse(fs.readFileSync(from, "utf8"));
+        if (snapshot[args.id]?.state === "abandoned") throw new Error("final write failed");
+      }
       return rename(from, to);
     });
     try { await expect(abandonManagedInput(f.deps, args)).rejects.toThrow("final write failed"); } finally { fault.mockRestore(); }
@@ -229,6 +235,6 @@ for (const state of ["queued", "unknown"] as const) test(`restart after ${state}
     await expect(f.deps.inbox.deliver(args.id, async () => ({ turnId: "replay" }))).rejects.toThrow("never replay");
     const result = await abandonManagedInput(f.deps, args);
     expect(result).toMatchObject({ state: "abandoned", abandonment: { outcome: "abandoned", original: f.original, evidence: args.evidence } });
-    expect(f.stopped()).toBe(state === "queued" ? 0 : 2);
+    expect(f.stopped()).toBe(state === "queued" ? 0 : 1);
   } finally { f.done(); }
 });

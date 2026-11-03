@@ -158,14 +158,18 @@ export class DoriService {
             active.omp.attachmentGeneration !== runtime.generation || !sameOmpTarget(active.omp.target, target) || active.external?.detachedAt ||
             active.state === "stopped" || ["closed", "done-claimed", "verified-done"].includes(statusOf(current)) || current.cleanupFence)
             throw new Error("Native interaction epoch changed");
+          if (action === "interaction-respond" && (current.dispatchBlocked || active.held || statusOf(current) === "paused")) throw new Error("Native response remains held");
         };
         await assertCurrent();
         const result = await callOmp(target, action, args, config, runner);
         await assertCurrent(); return result;
       },
       post: async (id, thread, text, key) => {
-        this.outbox.put({ id, target: thread, text, state: "queued", at: new Date().toISOString() });
-        if (config.hooks.threadReply) await this.deps.post!(id, config.hooks.threadReply, { key, thread, text });
+        const existing = this.outbox.get(id);
+        if (existing && existing.target !== thread) throw new Error("Native notice thread changed");
+        const immutableText = existing?.text ?? text;
+        this.outbox.put({ id, target: thread, text: immutableText, state: "queued", at: new Date().toISOString() });
+        if (config.hooks.threadReply) await this.deps.post!(id, config.hooks.threadReply, { key, thread, text: immutableText });
       },
     });
     this.phase = "ready"; this.writeHealth();
@@ -1081,6 +1085,23 @@ export class DoriService {
     if (action === "sync") return syncRegistry(this.deps, Boolean(args.write));
     if (action === "approval-list") return this.approvals();
     if (action === "approval-respond") {
+      if (caller.role === "lead") {
+        if (caller.key !== "lead" || !caller.instance || typeof args.id !== "string" || !args.id.startsWith("iyen-") ||
+          typeof args.sourceMessageId !== "string" || !args.sourceMessageId) throw new Error("Current attached lead native response requires original owner source-message-id");
+        const scope = this.attachment(await this.lane("lead"));
+        return withBindingFence(this.config.stateDir, async () => {
+          const assertCurrent = async () => {
+            this.assertNoPendingLeadMutation();
+            const lead = await this.lane("lead"), current = this.attachment(lead);
+            if (current.instance !== scope.instance || current.generation !== scope.generation || lead.dispatchBlocked ||
+              lead.runtime?.held || lead.runtime?.external?.detachedAt || lead.runtime?.state === "stopped") throw new Error("Lead response scope changed or held");
+          };
+          await assertCurrent();
+          const result = await this.nativeInteractions.respondFromLead(args.id, args.response, args.sourceMessageId);
+          await assertCurrent();
+          return result;
+        });
+      }
       if (caller.role !== "admin") throw new Error("Approval requires the authenticated owner control channel");
       if (typeof args.id === "string" && args.id.startsWith("native-blocked:")) throw new Error("Native owner/thread binding unresolved; this diagnostic is not an answer token");
       if (typeof args.id === "string" && args.id.startsWith("iyen-")) {
@@ -1092,7 +1113,7 @@ export class DoriService {
       const boot = readJson<Bootstrap>(bootstrapPath(this.config.stateDir, selected.key));
       return ipc(hostSocket(this.config.stateDir, selected.key), boot.hostToken, "approval", { id: selected.requestId, response: args.response });
     }
-    if (action === "mail-list") return { inbox: this.inbox.list(), outbox: this.outbox.list(), operations: this.operations.list(), failures: this.failures.list() };
+    if (action === "mail-list") return { inbox: this.inbox.list(), outbox: this.outbox.list(), operations: this.operations.list(), failures: this.failures.list(), nativeResponses: this.nativeInteractions.responseHistory() };
     if (action === "mail-abandon") {
       if (caller.role !== "admin" && !(caller.role === "lead" && caller.key === "lead" && caller.instance)) throw new Error("Input abandonment requires current attached lead or operator");
       const leadScope = this.attachment(await this.lane("lead"));
@@ -1293,38 +1314,15 @@ export class DoriService {
     const id = `inbound:${source}:${event.thread}:${event.id}`;
     const previous = this.inbox.get(id);
     if (previous?.target === "owner-control" && !event.control) {
-      // A source ACK retry is not a fresh answer, even if its request appeared later.
-      if (previous.text !== event.text) {
-        const rejection = `native-source-conflict:${payloadHash(JSON.stringify([id, event.text]))}`;
-        if (this.config.hooks.threadReply) await this.deps.post!(rejection, this.config.hooks.threadReply,
-          { key: "lead", thread: event.thread, text: "이미 처리한 원본 메시지 ID의 응답 내용을 바꿔 적용하지 않습니다. 원래 질문의 토큰으로 새 메시지를 보내 주세요." }).catch(() => {});
-      }
+      // Preserve historical accepted targets; never replay a rejected old answer.
       return;
     }
     const known = (await this.registry.list()).find(l => l.thread === event.thread && l.role !== "lead");
-    let nativeControl = false;
-    if (this.config.runtime.kind === "omp" && !previous && !event.control) {
-      try { nativeControl = await this.nativeInteractions.receive(source, event); }
-      catch (error) {
-        if (!/^답변(?:\s|$)/.test(event.text)) throw error;
-        // Invalid/stale owner answers are durable rejected control, not a receiver crash.
-        nativeControl = true;
-        const rejection = `native-answer-rejected:${payloadHash(id)}`;
-        if (this.config.hooks.threadReply) await this.deps.post!(rejection, this.config.hooks.threadReply,
-          { key: "lead", thread: event.thread, text: "이 응답의 적용을 확인하지 못했습니다. 질문 토큰·스레드·제공된 선택 및 승인 범위를 확인해 주세요. 이 메시지를 자동 재전송하지 않으며, 결과가 불확실한 요청은 먼저 기존 처리 결과를 확인합니다." }).catch(() => {});
-      }
-    }
-    if (nativeControl) {
-      this.putInbox({ id, target: "owner-control", text: event.text, source, sourceMessageId: event.id, ownerUser: event.user,
-        ...(event.metadata !== undefined ? { metadata: event.metadata } : {}), thread: event.thread, state: "sent", at: new Date().toISOString() });
-      this.ingressHealth.set(source, { process: this.ingressHealth.get(source)?.process ?? "starting", lastAcceptedAt: new Date().toISOString() });
-      return;
-    }
     if (event.control) {
       const allowed = ["pause", "resume", "object-done", "approval-respond"];
       if (!allowed.includes(event.control.action)) throw new Error("Unsupported inbound control");
       if (event.control.action === "approval-respond") {
-        if (typeof event.control.args?.id === "string" && event.control.args.id.startsWith("iyen-")) throw new Error("Native replies require the explicit answer token in authenticated owner text");
+        if (typeof event.control.args?.id === "string" && event.control.args.id.startsWith("iyen-")) throw new Error("Native responses require lead mediation of the authenticated original owner message");
         const request = (await this.approvals()).find(a => a.id === event.control.args?.id);
         if (!request || (await this.lane(request.key)).thread !== event.thread) throw new Error("Approval belongs to another thread");
       } else if (!known || event.control.args?.key !== known.key) throw new Error("Control belongs to another lane");

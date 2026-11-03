@@ -402,3 +402,32 @@ test("same identity mismatch in a new episode refreshes latest diagnostic time",
  expect(second.code).toBe(first.code);expect(Date.parse(second.at)).toBeGreaterThan(Date.parse(first.at));
  expect(second.evidence).toMatchObject({check:"herdr-association",observed:{threadId:"22222222-2222-4222-8222-222222222222"}});
 });
+
+for(const text of ["1","응 그걸로 해줘","첫 번째 말고 두 번째로 바꿔줘","답변 iyen-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1","> 답변 iyen-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1"]){
+ test(`pending native questions never intercept ordinary owner conversation: ${text}`,async()=>{
+  const requests=Object.fromEntries(["a","b"].map(letter=>{
+   const token=`iyen-${letter.repeat(32)}`;
+   return [token,{token,key:lane.key,thread:lane.thread,source:"test",owner:"owner",state:"open",attachment:"worker",generation:1,target:{},
+    request:{id:`question-${letter}`,sessionId:"worker-session",kind:"ask",title:"Choice",createdAt:"2026-01-01T00:00:00Z",
+     questions:[{id:"choice",question:"Which option?",options:[{label:"first"},{label:"second"}]}]}}];
+  }));
+  atomicJson(join(state.dir,"native-interactions.json"),{version:1,requests,responses:{}});
+  s=new DoriService({...s.config,runtime:{...s.config.runtime,kind:"omp"}},fakeRunner(newWorld()));
+  const event={id:"natural-owner-answer",thread:lane.thread,user:"owner",text,metadata:{sourceTs:"original-ts",attachments:[{id:"attachment"}]}};
+  await s.receive("test",event);
+  expect(s.inbox.get(`inbound:test:${event.thread}:${event.id}`)).toMatchObject({target:"lead",state:"queued",source:"test",sourceMessageId:event.id,ownerUser:"owner",thread:event.thread,metadata:event.metadata,text:`Owner message in ${event.thread}:\nSource message ID: ${event.id}\n${text}`});
+  expect(s.nativeInteractions.list().map(row=>({token:row.token,state:row.state}))).toEqual(Object.values(requests).map(row=>({token:row.token,state:"open"})));
+  expect(s.outbox.list()).toEqual([]);
+ });
+}
+
+test("natural routing does not retroactively replay a source rejected by the previous parser",async()=>{
+ const event={id:"old-rejected-source",thread:lane.thread,user:"owner",text:"1"};
+ const original={id:`inbound:test:${event.thread}:${event.id}`,target:"owner-control",text:event.text,source:"test",thread:event.thread,state:"sent" as const,at:"original"};
+ s.inbox.put(original);
+ await s.receive("test",event);
+ expect(s.inbox.get(original.id)).toEqual(original);
+ expect(s.outbox.list()).toEqual([]);
+ await s.receive("test",{...event,text:"2"});
+ expect(s.inbox.get(original.id)).toEqual(original);
+});
