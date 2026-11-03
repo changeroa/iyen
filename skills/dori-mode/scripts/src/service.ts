@@ -9,6 +9,7 @@ import { Registry, statusOf, withStatus, type Lane, LANE_KEY } from "./registry.
 import { claimDone, closeLane, objectDone, watchTick, type FlowDeps } from "./done-flow.ts";
 import { abandonManagedInput } from "./mail-abandon.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
+import { resumeUncertain } from "./resume-uncertain.ts";
 import { launchLane, quoteForPane, validateLaunch, LaunchError, type LaunchInput } from "./launch.ts";
 import { freshnessTick } from "./freshness.ts";
 import { deadPaneTick } from "./dead-panes.ts";
@@ -104,6 +105,10 @@ export class DoriService {
         const lane = await this.registry.read(key);
         if (!lane || lane.dispatchBlocked || statusOf(lane) === "closed") throw new Error("Lane dispatch is blocked");
         const mail = this.putInbox({ id: operationId, target: key, text, thread: lane.thread, state: "queued", at: new Date().toISOString() });
+        if (lane.runtime?.kind === "omp" && lane.runtime.backend === "herdr-tui") {
+          const snapshot = await call<RuntimeSnapshot>(key, "inspect");
+          if (snapshot.state !== "idle" || snapshot.held || snapshot.activeTurnId) throw new DeliveryDeferred("Managed OMP control input waits for idle native admission");
+        }
         if (lane.runtime?.backend === "external-current-session") {
           if (mail.attachmentInstance && mail.attachmentInstance !== lane.runtime.hostInstanceId) throw new DeliveryDeferred("Mail belongs to a previous lead attachment");
           if (this.attachment(lane).excludedInboxIds.includes(mail.id)) throw new DeliveryDeferred("Historical mail is held for explicit reconciliation");
@@ -1044,6 +1049,17 @@ export class DoriService {
       await this.registry.write(lane); await this.boot((await this.lane(key))); return this.lane(key);
     }
     if (action === "pause") return pauseLane(this.deps, await this.lane(key), args.note ?? "Owner requested pause");
+    if (action === "resume" && args.allowUnknown) {
+      if (caller.role !== "lead" || caller.key !== "lead" || !caller.instance) throw new Error("Uncertain resume requires the current scoped lead");
+      return this.dispatchQueue.run(key, () => resumeUncertain(this.deps, this.inbox, this.operations, {
+        key, operationId: args.operationId, evidence: args.evidence, expectedInstance: args.expectedInstance, expectedGeneration: args.expectedGeneration,
+      }, async intent => {
+        const boot = readJson<Bootstrap>(bootstrapPath(this.config.stateDir, key));
+        if (boot.instance !== intent.instance || boot.generation !== intent.generation) throw new Error("Uncertain resume host bootstrap changed");
+        await verifyOmpHerdr(intent.target, this.runner);
+        return ipc<RuntimeSnapshot>(hostSocket(this.config.stateDir, key), boot.hostToken, "release", { origin: "user", operationId: `${intent.operationId}:release` }, this.config.runtime.rpcTimeoutMs * 3);
+      }));
+    }
     if (action === "resume") return resumeLane(this.deps, await this.lane(key), args.note ?? "Owner requested resume");
     if (action === "claim-done") {
       if (!args.evidence?.trim()) throw new Error("Evidence required");
@@ -1066,11 +1082,8 @@ export class DoriService {
         return { turnId: mail.turnId, ...(mail.receiptKind ? { receiptKind: mail.receiptKind, receipt: mail.receipt } : {}) };
       }
       if (lane.dispatchBlocked) return { queued: true, operationId: mail.id };
-      if (lane.runtime?.backend === "external-current-session") {
-        try { return await this.deps.runtime.input(key, args.text, args.operationId); }
-        catch (error) { if (error instanceof DeliveryDeferred) return { queued: true, operationId: mail.id }; throw error; }
-      }
-      return this.deps.runtime.input(key, args.text, args.operationId);
+      try { return await this.deps.runtime.input(key, args.text, args.operationId); }
+      catch (error) { if (error instanceof DeliveryDeferred) return { queued: true, operationId: mail.id }; throw error; }
     }
     if (action === "report") {
       if (!["milestone", "blocker", "question", "done"].includes(args.kind) || !args.text || !args.eventId) throw new Error("Invalid report");

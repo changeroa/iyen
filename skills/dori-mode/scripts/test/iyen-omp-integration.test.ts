@@ -216,6 +216,34 @@ test("current lead reconciles a held managed lane's real receipt without releasi
     expect(mutations).toBe(0);
   } finally { worker.cleanup(); x.f.cleanup(); }
 });
+test("managed steering stays unattempted while native work is busy and is submitted once after idle", async () => {
+  const f = ompFixture(), config = profile(f.directory), service = new DoriService(config, association(f));
+  let busy = true, inputs = 0;
+  const server = Bun.serve({ unix: hostSocket(config.stateDir, "worker"), async fetch(request) {
+    const { action, args } = await request.json() as { action: string; args: any };
+    if (action === "inspect") return Response.json({ result: { threadId: f.identity.sessionId, state: busy ? "running" : "idle",
+      activeTurnId: busy ? "active" : undefined, held: false, goal: null } });
+    if (action !== "input") throw new Error("Only input or observation expected");
+    inputs++;
+    return Response.json({ result: { turnId: "native-entry", receiptKind: "omp-session-entry", receipt: receipt(f, args.operationId, args.text) } });
+  } });
+  try {
+    atomicJson(bootstrapPath(config.stateDir, "worker"), { key: "worker", hostToken: "fixture-token" });
+    await service.registry.write({ key: "worker", role: "lane", title: "worker", thread: "none", brief: "/brief", done: "file /done", cwd: f.directory, pane: f.identity.paneId,
+      status: "working", openedAt: new Date().toISOString(), runtime: { kind: "omp", backend: "herdr-tui", threadId: f.identity.sessionId, state: "running",
+        hostInstanceId: "host", generation: 1, binaryVersion: "18.15.0", omp: { kind: "omp", target: f.target,
+          attachmentInstanceId: "host", attachmentGeneration: 1, attachedAt: new Date().toISOString(), excludedInboxIds: [] } } });
+    const args = { key: "worker", operationId: "steering", text: "Bounded next instruction" };
+    expect(await service.handle("input", args, { role: "admin" })).toMatchObject({ queued: true });
+    expect(service.inbox.get("steering")?.state).toBe("queued");
+    expect(service.inbox.get("steering")?.ompProvenance).toBeUndefined();
+    expect(inputs).toBe(0);
+    busy = false;
+    expect(await service.handle("input", args, { role: "admin" })).toMatchObject({ receiptKind: "omp-session-entry" });
+    expect(service.inbox.get("steering")?.state).toBe("sent");
+    expect(inputs).toBe(1);
+  } finally { server.stop(true); f.cleanup(); }
+});
 test("scoped queued receipt lookup does not start input and native held or unavailable input is not ready", async () => {
   let mutations = 0;
   const x = await setup(() => { mutations++; throw new Error("No native input permitted"); });
