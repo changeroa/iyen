@@ -1,26 +1,34 @@
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
-# Dori — Codex 런타임
+# Iyen — Codex·OMP 런타임
 
-`iyen` 스킬을 설치한 뒤 현재 Codex 대화에서 **“이연 모드 시작”**이라고 요청하면 그 대화가 이연 리드가 됩니다. 별도 리드는 띄우지 않습니다. 이연은 메신저 요청을 받고, 필요한 작업만 독립된 Codex 작업자 세션에 맡깁니다.
+Iyen은 메신저 리드와 작업 레인을 관리하는 상위 시스템입니다. **Codex와 OMP(oh-my-pi)는 이 저장소의 하위 런타임 구성 요소**이며, 별도 Iyen 제품이 아닙니다. `iyen` 스킬은 검증된 현재 대화를 리드로 연결하고 별도 리드를 띄우지 않습니다.
 
-OMP(oh-my-pi)도 [별도의 선택형 런타임 프로필](skills/dori-mode/references/setup.md#opt-in-omp-profile-alongside-codex)로 사용할 수 있습니다. 기본값은 Codex입니다. 확장을 준비한 OMP 대화를 리드로 연결하거나 관리형 작업자를 띄울 수 있으며, 관리형 일시정지와 복구에는 안내된 `executionHold` 지원 OMP 포크가 필요합니다.
+| 구성 요소 | 코드 | 역할 |
+|---|---|---|
+| Iyen 코어 | `src/` | 소유자 메시지 라우팅, scoped 제어, 전달 기록, 레인 생명주기와 완료 판정 |
+| Codex 런타임 | `src/runtime/codex/` | Codex RPC·생성 프로토콜 타입·읽기 전용 관찰·현재 세션 연결 |
+| OMP 런타임 | `src/runtime/omp/` | OMP 확장·전달 영수증·scoped 도구·세션 연결·관리형 작업자 통합 |
+| 공통 런타임 호스트 | `src/runtime/` | 호스트 생명주기, Herdr 연동, 런타임 상태 계약 |
+| 에이전트 스킬 | `skills/` | 리드 운영 지침, 활성화 도우미, 설정 예시 |
 
-기존 시스템 구조는 유지합니다. 메신저 스레드와 작업 레인 연결, 진행 보고, 5분 완료 이의 제기, 실제 Done 증거 확인, 자원 제한과 heavy 슬롯은 그대로입니다. `dori serve`가 감시와 상태 저장을 담당하고, Codex가 추론·도구·turn·goal을 실행합니다. 작업자는 레인별 stdio MCP를, 현재 세션의 리드는 등록 시 받은 전용 실행 파일을 사용합니다. 기존 세션의 모델과 권한은 유지합니다.
+`runtime.kind`로 `codex`(기존 기본값) 또는 `omp`를 선택합니다. 두 런타임 모두 같은 Iyen 서비스와 메신저·레인 생명주기를 사용합니다. OMP는 [격리 프로필 설정](skills/dori-mode/references/setup.md#opt-in-omp-profile-alongside-codex)을 따르며, 관리형 일시정지·복구에는 문서에 안내된 `executionHold` 지원 포크가 필요합니다. 런타임별 모델·권한·신원 검증은 유지합니다.
+
+설치·타입 검사·테스트는 저장소 루트에서 실행합니다. `dori` 명령과 기존 설정·persona 저장 위치는 유지합니다. 이전 스킬 내부 패키지에서 업그레이드할 때는 운영 절차에 따라 소스 경로가 고정된 실행기·attachment·watchdog 설정을 재생성하고, OMP 프로필의 `extensionPath`를 `/absolute/iyen/src/runtime/omp/extension.ts`로 갱신해야 합니다. 실행 중인 리드 아래에서 소스 경로를 옮기거나 미확정 전송을 재실행하지 마세요. 이 소스 구조 변경은 운영 배포를 수행하지 않습니다.
 
 ## 설치와 시작
 
-Bun 1.3+, Codex CLI, Herdr, git이 필요합니다. 현재 세션 리드는 CLI와 데몬 버전의 일치 여부와 필요한 메시지 기능을 검사하며, 릴리스별 허용 목록을 요구하지 않습니다. 관리형 워커는 설정된 버전 고정값(기본 **0.163.0**)을 사용합니다. GitHub 완료 조건에는 gh, 패키지 발행 확인에는 npm을 사용합니다.
+Bun 1.3+, Herdr, git과 선택한 런타임(Codex CLI 또는 설정된 OMP 바이너리·확장)이 필요합니다. Codex 리드는 CLI·데몬 호환성을, Codex 관리형 작업자는 설정된 버전 고정값(기본 **0.163.0**)을 검사합니다. OMP는 설정된 버전과 정확한 네이티브 신원을 검사합니다. GitHub 완료 조건에는 gh, 패키지 발행 확인에는 npm을 사용합니다.
 
 Herdr가 pane·세션 식별과 실행 상태의 기준이며, Codex 어댑터는 실제 세션과 메시지 전달 기록을 검증합니다. 호환되는 업데이트 뒤에는 `runtime.externalBinary`를 다시 찾아 같은 세션에 자동 재연결합니다. 다른 세션으로 옮길 때는 메시지를 선택하는 명시적 인계가 필요합니다. `dori health`로 시작 시 복구 진행, 수신 활동과 전달 보류를 구분할 수 있습니다. 수신 어댑터의 저장 ACK는 이연이 메시지를 읽었다는 뜻이 아닙니다. [복구와 인계 안내](skills/dori-mode/references/setup.md)를 참고하세요.
 
 ```sh
-cd skills/dori-mode/scripts
+cd /path/to/iyen
 bun install --frozen-lockfile
 bun link
 ```
 
-신규 설치만 `references/config.example.json`을 `~/.dori-codex/config.json`으로 복사하세요. `defaultCwd`, `laneWorkspace`, 메신저 hook과 owner ID를 설정합니다. 기존 설정은 덮어쓰지 않고 마이그레이션합니다.
+신규 설치만 `skills/dori-mode/references/config.example.json`을 `~/.dori-codex/config.json`으로 복사하세요. `defaultCwd`, `laneWorkspace`, 메신저 hook과 owner ID를 설정합니다. 기존 설정은 덮어쓰지 않고 마이그레이션합니다.
 
 ```sh
 export DORI_CONFIG="$HOME/.dori-codex/config.json"
@@ -75,11 +83,11 @@ dori migrate --apply --handoff-file /path/to/handoff.json
 ## 검증
 
 ```sh
-cd skills/dori-mode/scripts
+cd /path/to/iyen
 bun test
 bun run typecheck
 ```
 
 테스트는 fake RPC와 별도 daemon/session-host 프로세스를 사용합니다. 실제 모델·메신저 API는 호출하지 않습니다. 로컬 실제 Codex에서는 초기화, thread 생성, paused goal 조회, 필수 MCP 도구 등록까지 추론 없이 확인했습니다. 실제 모델·메신저·호스트 sandbox를 연결한 운영 전 검증은 별도로 필요합니다. journal 자동 회전은 아직 제공하지 않습니다.
 
-MIT. 설치 스크립트의 upstream URL 이름은 역사적 경로이며 런타임 의존성과 무관합니다.
+MIT. 설치 스크립트는 `changeroa/iyen` 저장소를 사용합니다.

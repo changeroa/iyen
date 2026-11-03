@@ -2,8 +2,8 @@ import { existsSync, lstatSync } from "node:fs";
 import type { DoriConfig } from "./config.ts";
 import { run } from "./run.ts";
 import { connectOmp } from "./runtime/omp/client.ts";
-import { discoverOmpSafe, ompProfileEnvironment, ompVersionMatches, verifyOmpHerdr } from "./runtime/omp-integration.ts";
-import { startCodex } from "./runtime/codex.ts";
+import { discoverOmpSafe, ompProfileEnvironment, ompVersionMatches, verifyOmpHerdr } from "./runtime/omp/integration.ts";
+import { startCodex } from "./runtime/codex/client.ts";
 export const doctor = async (config: DoriConfig): Promise<{ ok: boolean; checks: { name: string; ok: boolean; detail: string }[] }> => {
   const checks: { name: string; ok: boolean; detail: string }[] = [];
   if (config.runtime.kind === "omp") {

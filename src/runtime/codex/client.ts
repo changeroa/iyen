@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
-import type { RuntimeConfig, RoleConfig } from "../config.ts";
-import type { RuntimeSnapshot, RuntimeState } from "./types.ts";
+import type { RuntimeConfig, RoleConfig } from "../../config.ts";
+import type { RuntimeSnapshot, RuntimeState } from "../types.ts";
 import { RpcClient, type RpcMessage } from "./protocol.ts";
 import type { InitializeParams } from "./generated/InitializeParams.ts";
 import type { ThreadStartParams } from "./generated/v2/ThreadStartParams.ts";
@@ -63,7 +63,7 @@ export class CodexSession {
     if (role.effort && chosen && !chosen.supportedReasoningEfforts.some(e => e.reasoningEffort === role.effort)) throw new Error("Unsupported model effort");
     const params: ThreadStartParams = { cwd, model: chosen?.model, modelProvider: "openai", sandbox: this.config.sandbox,
       approvalPolicy: this.config.approvalPolicy, developerInstructions: instructions,
-      config: { ...(this.context ? { "mcp_servers.dori_runtime": { command: process.execPath, args: [resolve(import.meta.dir, "../cli.ts"), "mcp-server"], env: { DORI_CONTEXT: this.context.file, DORI_CONFIG: this.context.configFile, DORI_STATE_DIR: this.context.stateDir }, enabled: true, required: true,
+      config: { ...(this.context ? { "mcp_servers.dori_runtime": { command: process.execPath, args: [resolve(import.meta.dir, "../../cli.ts"), "mcp-server"], env: { DORI_CONTEXT: this.context.file, DORI_CONFIG: this.context.configFile, DORI_STATE_DIR: this.context.stateDir }, enabled: true, required: true,
         // This service-owned tool enforces lead/lane capabilities itself. Explicit
         // approval applies only here; command and other MCP policies stay intact.
         enabled_tools: ["control"], tools: { control: { approval_mode: "approve" } },

@@ -129,7 +129,7 @@ test("explicit operator handoff archives legacy control state, preserves old ide
 // A read-only observer transport keeps recovery tests in process; socket-level
 // protocol coverage belongs to the external-session and integration fixtures.
 async function externalFixture(notifications = false) {
- const { ExternalSessionError, sharedDaemon } = await import("../src/runtime/external-current-session.ts");
+ const { ExternalSessionError, sharedDaemon } = await import("../src/runtime/codex/external-current-session.ts");
  const threadId="11111111-1111-4111-8111-111111111111", pane="test:pane", socketPath=join(state.dir,"exact-daemon.sock");
  let version="0.200.0", offline=false, identity=threadId, reportedSocket=socketPath, accept=true;
  let threadStatus:any={type:"idle"}, agentStatus="idle";
@@ -352,7 +352,7 @@ test("health reports sanitized causes, queue age and ingress evidence without cr
 });
 
 test("failed normal observation followed by successful exact rebind is bounded to one recovery",async()=>{
- const h=await externalFixture();const {ExternalSessionError}=await import("../src/runtime/external-current-session.ts");let observations=0;
+ const h=await externalFixture();const {ExternalSessionError}=await import("../src/runtime/codex/external-current-session.ts");let observations=0;
  h.transport.observe=async()=>{observations++;throw new ExternalSessionError("runtime-unavailable","Shared Codex observer unavailable; delivery is waiting for reconnection.");};
  expect(await s.handle("status",{key:"lead"},{role:"admin"})).toMatchObject({readiness:"ready"});
  expect(observations).toBe(1);expect(h.queues()).toHaveLength(0);

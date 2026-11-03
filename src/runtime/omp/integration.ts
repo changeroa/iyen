@@ -1,19 +1,19 @@
 import { chmodSync, existsSync, lstatSync, readdirSync, realpathSync, unlinkSync } from "node:fs";
 import { createConnection } from "node:net";
-import { acquireFileFence } from "../binding-fence.ts";
+import { acquireFileFence } from "../../binding-fence.ts";
 import { dirname, join, resolve } from "node:path";
-import type { DoriConfig } from "../config.ts";
-import { atomicJson } from "../journal.ts";
-import { hostSocket, ipc, readJson, serviceSocket } from "../ipc.ts";
-import { DeliveryDeferred } from "../mailbox.ts";
-import { quoteForPane } from "../launch.ts";
-import { run, type Runner } from "../run.ts";
-import { drainOmpFailures, failureCursorPath } from "./omp/failures.ts";
-import { connectOmp } from "./omp/client.ts";
-import { discoverOmp, prepareOmpLaunch } from "./omp/launcher.ts";
-import { OmpError, sameIdentity, validReceipt, payloadHash, type OmpTarget, type OmpSnapshot, type OmpExtensionBootstrap } from "./omp/contract.ts";
-import type { Bootstrap } from "./session-host.ts";
-import type { RuntimeInputReceipt, RuntimeRef, RuntimeSnapshot } from "./types.ts";
+import type { DoriConfig } from "../../config.ts";
+import { atomicJson } from "../../journal.ts";
+import { hostSocket, ipc, readJson, serviceSocket } from "../../ipc.ts";
+import { DeliveryDeferred } from "../../mailbox.ts";
+import { quoteForPane } from "../../launch.ts";
+import { run, type Runner } from "../../run.ts";
+import { drainOmpFailures, failureCursorPath } from "./failures.ts";
+import { connectOmp } from "./client.ts";
+import { discoverOmp, prepareOmpLaunch } from "./launcher.ts";
+import { OmpError, sameIdentity, validReceipt, payloadHash, type OmpTarget, type OmpSnapshot, type OmpExtensionBootstrap } from "./contract.ts";
+import type { Bootstrap } from "../session-host.ts";
+import type { RuntimeInputReceipt, RuntimeRef, RuntimeSnapshot } from "../types.ts";
 
 /** Establish the same narrow process boundary as managed Codex, without inherited service/admin context. */
 export const ompProfileEnvironment = (settingsHome: string, env: NodeJS.ProcessEnv = process.env): Record<string, string> => {
@@ -181,7 +181,7 @@ const runOmpOwnedSessionHost = async (stateDir: string, boot: Bootstrap): Promis
     const bootstrap: OmpExtensionBootstrap = { protocol: 1, registryDir: omp.registryDir, role: "managed-lane", laneKey: boot.key,
       expectedCwd: realpathSync(boot.cwd), expectedPaneId: boot.pane, expectedTerminalId: pane.terminal_id,
       ...(boot.threadId ? { expectedSessionId: boot.threadId, expectedSessionFile: prior!.target.sessionFile } : {}),
-      service: { contextFile: join(clientDir, "context.json"), configFile: join(clientDir, "config.json"), stateDir, cliPath: resolve(import.meta.dir, "../cli.ts"), bunBinary: process.execPath } };
+      service: { contextFile: join(clientDir, "context.json"), configFile: join(clientDir, "config.json"), stateDir, cliPath: resolve(import.meta.dir, "../../cli.ts"), bunBinary: process.execPath } };
     atomicJson(bootstrapFile, bootstrap);
     const spec = prepareOmpLaunch({ binary: config.runtime.binary, registryDir: omp.registryDir, bootstrapFile, extensionPath: omp.extensionPath,
       cwd: boot.cwd, provider: omp.provider, model: role.model, effort: role.effort, approvalMode: omp.approvalMode,

@@ -4,10 +4,10 @@ import { join } from "node:path";
 import { defaultConfig } from "../src/config.ts";
 import { DeliveryDeferred } from "../src/mailbox.ts";
 import type { Runner } from "../src/run.ts";
-import { discoverExternal, ExternalCurrentSession, observeExternal, sharedDaemon } from "../src/runtime/external-current-session.ts";
+import { discoverExternal, ExternalCurrentSession, observeExternal, sharedDaemon } from "../src/runtime/codex/external-current-session.ts";
 import { operationText } from "../src/runtime/herdr.ts";
-import { readLoadedThreads, readTurns, receiptInTurns, type Observer, type ObserverMethod } from "../src/runtime/observer.ts";
-import { RpcError } from "../src/runtime/protocol.ts";
+import { readLoadedThreads, readTurns, receiptInTurns, type Observer, type ObserverMethod } from "../src/runtime/codex/observer.ts";
+import { RpcError } from "../src/runtime/codex/protocol.ts";
 import { withState } from "./fakes.ts";
 
 const threadId = "11111111-1111-4111-8111-111111111111", otherId = "22222222-2222-4222-8222-222222222222";

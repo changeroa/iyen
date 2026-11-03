@@ -3,10 +3,10 @@ import { mkdirSync, writeFileSync, readFileSync, chmodSync, realpathSync } from 
 import { join } from "node:path";
 import { defaultConfig } from "../src/config.ts";
 import { HerdrSession, operationText } from "../src/runtime/herdr.ts";
-import { connectObserver, type Observer } from "../src/runtime/observer.ts";
+import { connectObserver, type Observer } from "../src/runtime/codex/observer.ts";
 import { prepareBackend, resolveCodexBinary, retireBackend, type Bootstrap } from "../src/runtime/session-host.ts";
 import { socketDir } from "../src/ipc.ts";
-import { RpcError } from "../src/runtime/protocol.ts";
+import { RpcError } from "../src/runtime/codex/protocol.ts";
 import { withState } from "./fakes.ts";
 const harness = () => {
  const calls:string[][]=[],reads:string[]=[];

@@ -261,7 +261,7 @@ A separate profile uses these runtime fields (replace every example path):
     "roles": { "lane": { "model": "EXPLICIT_MODEL", "effort": "medium" } },
     "omp": {
       "registryDir": "/absolute/isolated-omp/controllers",
-      "extensionPath": "/absolute/iyen/skills/dori-mode/scripts/src/runtime/omp/extension.ts",
+      "extensionPath": "/absolute/iyen/src/runtime/omp/extension.ts",
       "provider": "EXPLICIT_PROVIDER",
       "approvalMode": "always-ask"
     }

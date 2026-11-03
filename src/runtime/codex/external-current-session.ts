@@ -1,15 +1,15 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { isAbsolute } from "node:path";
-import type { RuntimeConfig } from "../config.ts";
-import { DeliveryDeferred } from "../mailbox.ts";
-import { realClock, type Clock, type Runner } from "../run.ts";
-import { operationText, type Agent } from "./herdr.ts";
+import type { RuntimeConfig } from "../../config.ts";
+import { DeliveryDeferred } from "../../mailbox.ts";
+import { realClock, type Clock, type Runner } from "../../run.ts";
+import { operationText, type Agent } from "../herdr.ts";
 import { connectObserver, ObserverCompatibilityError, readThread, readOptionalGoal, readLoadedThreads, readTurns, receipt, type Observer } from "./observer.ts";
 import { RpcError } from "./protocol.ts";
-import { resolveCodexBinary } from "./session-host.ts";
+import { resolveCodexBinary } from "../session-host.ts";
 import type { Turn } from "./generated/v2/Turn.ts";
-import type { ExternalHoldCode, RuntimeSnapshot } from "./types.ts";
+import type { ExternalHoldCode, RuntimeSnapshot } from "../types.ts";
 
 export const THREAD_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export type ExternalIdentity = { threadId: string; pane: string; cwd: string; model?: string; effort?: string };

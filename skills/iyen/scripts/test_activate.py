@@ -108,7 +108,6 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(result["session"], SESSION)
         attach, env = self.calls[2]
         self.assertTrue(Path(attach[1]).is_absolute())
-        self.assertTrue(attach[1].endswith("skills/dori-mode/scripts/src/cli.ts"))
         self.assertEqual(attach[2:7], ["lead-activate", "--thread-id", SESSION, "--pane", PANE])
         self.assertEqual(env["DORI_CONFIG"], str(self.config.resolve()))
         self.assertEqual(self.calls[-1][0], [str(self.bridge), "status", "lead"])

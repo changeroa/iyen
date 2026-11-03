@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import { RpcClient, type RpcMessage } from "../src/runtime/protocol.ts";
-import { CodexSession, safeEnvironment } from "../src/runtime/codex.ts";
+import { RpcClient, type RpcMessage } from "../src/runtime/codex/protocol.ts";
+import { CodexSession, safeEnvironment } from "../src/runtime/codex/client.ts";
 import { defaultConfig } from "../src/config.ts";
 
 const harness = (handle: (msg: RpcMessage) => unknown, timeout = 200) => {

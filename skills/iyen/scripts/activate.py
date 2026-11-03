@@ -108,7 +108,7 @@ def activate(args):
                 raise ActivationError("--operation-id is required for repeatable handoff")
             if not mail_ids and not no_mail:
                 raise ActivationError("Explicit --mail-id selections or --no-mail required")
-    cli = Path(__file__).resolve().parents[3] / "skills/dori-mode/scripts/src/cli.ts"
+    cli = Path(__file__).resolve().parents[3] / "src/cli.ts"
     bun = shutil.which("bun")
     if not bun or not cli.is_file():
         raise ActivationError("Install this skill with its Iyen repository and Bun runtime")

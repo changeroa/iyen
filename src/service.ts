@@ -20,14 +20,14 @@ import type { RuntimeInputReceipt, ExternalHoldCode, RuntimeControl, RuntimeRef,
 import { WorkTimers } from "./work.ts";
 import { turnFailure, ompFailureGuidance } from "./turn-failure.ts";
 import { DeliveryDeferred, Mailbox, postHook, type Mail } from "./mailbox.ts";
-import { ExternalCurrentSession, ExternalSessionError, discoverExternal, observeExternal, sharedDaemon, THREAD_UUID, type Attachment as CodexAttachment } from "./runtime/external-current-session.ts";
-import { connectObserver, receiptInTurns } from "./runtime/observer.ts";
+import { ExternalCurrentSession, ExternalSessionError, discoverExternal, observeExternal, sharedDaemon, THREAD_UUID, type Attachment as CodexAttachment } from "./runtime/codex/external-current-session.ts";
+import { connectObserver, receiptInTurns } from "./runtime/codex/observer.ts";
 import { withBindingFence } from "./binding-fence.ts";
 import { readWatchTarget } from "./watchdog.ts";
 import { operationText } from "./runtime/herdr.ts";
-import type { Turn } from "./runtime/generated/v2/Turn.ts";
+import type { Turn } from "./runtime/codex/generated/v2/Turn.ts";
 
-import { callOmp, findOmpTarget, verifyOmpHerdr, sameOmpTarget } from "./runtime/omp-integration.ts";
+import { callOmp, findOmpTarget, verifyOmpHerdr, sameOmpTarget } from "./runtime/omp/integration.ts";
 import { connectOmp } from "./runtime/omp/client.ts";
 import { sameIdentity, validReceipt, payloadHash, object, exactKeys, validateFailureRecord, type OmpTarget } from "./runtime/omp/contract.ts";
 type Attachment = CodexAttachment & { omp?: OmpTarget };

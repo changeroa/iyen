@@ -1,16 +1,16 @@
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
-# Dori — Codex ランタイム
+# Iyen — Codex・OMP ランタイム
 
-Iyen モードは現在の Codex 会話をリードとして接続します。「이연 모드 시작」で開始し、別のリードは起動しません。独立した Codex セッションは委任するワーカーだけに使用します。
+Iyen はメッセンジャーとレーンを管理するシステムです。Codex と OMP は同じリポジトリのランタイム構成要素で、`src/runtime/codex/` と `src/runtime/omp/` にあります。`runtime.kind` で選択します。共通サービスは `src/`、スキルは `skills/` にあります。検証済みの現在の会話をリードとして接続し、別のリードは起動しません。
 
-Bun 1.3+, Herdr, git, gh と Codex CLI が必要です。接続するリードは CLI とデーモンのバージョン一致と必要なメッセージ機能を検証し、リリースごとの許可リストには依存しません。互換性のある更新後は同じセッションに自動再接続します。別セッションへの移行には明示的な引き継ぎが必要です。`dori health` で復旧・受信・配信の状態を確認できます。管理ワーカーは設定された固定バージョン（既定 **0.163.0**）を使用します。
+Bun 1.3+, Herdr, git と選択したランタイムが必要です。Codex の接続リードは CLI・デーモンの互換性を、管理ワーカーは設定されたバージョンを検証します。OMP は専用のバイナリ・拡張と隔離プロファイルを使用します。詳細は [設定ガイド](skills/dori-mode/references/setup.md) を参照してください。
 
 ```sh
-cd skills/dori-mode/scripts
+cd /path/to/iyen
 bun install --frozen-lockfile
 bun link
-# Configure ~/.dori-codex/config.json from references/config.example.json
+# Configure ~/.dori-codex/config.json from skills/dori-mode/references/config.example.json
 export DORI_CONFIG="$HOME/.dori-codex/config.json"
 dori doctor
 dori serve

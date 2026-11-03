@@ -17,12 +17,12 @@ Registry updates that do not change state do not append snapshots. Startup reads
 Install Bun 1.3+, git, Herdr, Codex CLI, and gh for GitHub completion signals. Authenticate Codex using its normal login flow. Do not export credentials into config files. On this Mac, required secret reads use the configured op-agent wrapper and an explicit vault; inject only references into the consuming process.
 
 ```sh
-cd skills/dori-mode/scripts
+cd /path/to/iyen
 bun install --frozen-lockfile
 bun link
 ```
 
-Copy references/config.example.json to ~/.dori-codex/config.json only for a new installation. Set defaultCwd and an existing laneWorkspace. Set an explicit model and reasoning effort for workers; launch validates them against the installed catalog. The current-session lead retains its existing model, effort and permissions. The private sidecar inherits the established CODEX_HOME settings/tools/plugins/auth/history and adds process-scoped Dori overrides without writing global config. Set runtime.settingsHome only when selecting another established settings home. Configure sandbox and approval policy explicitly; installation never relaxes them. Preserve existing config and use migration for legacy installs.
+Copy skills/dori-mode/references/config.example.json to ~/.dori-codex/config.json only for a new installation. Set defaultCwd and an existing laneWorkspace. Set an explicit model and reasoning effort for workers; launch validates them against the installed catalog. The current-session lead retains its existing model, effort and permissions. The private sidecar inherits the established CODEX_HOME settings/tools/plugins/auth/history and adds process-scoped Dori overrides without writing global config. Set runtime.settingsHome only when selecting another established settings home. Configure sandbox and approval policy explicitly; installation never relaxes them. Preserve existing config and use migration for legacy installs.
 
 `dori paths` inspects persistent paths without contacting the service. CLI,
 installer and activation resolve config on each invocation: explicit helper
@@ -127,8 +127,8 @@ export BUN_BIN="/absolute/path/to/compatible/bun"
 export OMP_CWD="/absolute/path/to/project"
 export OMP_PROVIDER="EXPLICIT_PROVIDER_ID"
 export OMP_MODEL="EXPLICIT_MODEL_ID"
-export IYEN_CLI="$IYEN_REPO/skills/dori-mode/scripts/src/cli.ts"
-export IYEN_EXTENSION="$IYEN_REPO/skills/dori-mode/scripts/src/runtime/omp/extension.ts"
+export IYEN_CLI="$IYEN_REPO/src/cli.ts"
+export IYEN_EXTENSION="$IYEN_REPO/src/runtime/omp/extension.ts"
 mkdir -p "$IYEN_OMP_HOME/agent" "$IYEN_OMP_HOME/controllers"
 chmod 700 "$IYEN_OMP_HOME" "$IYEN_OMP_HOME/agent" "$IYEN_OMP_HOME/controllers"
 python3 - <<'PY'
