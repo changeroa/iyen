@@ -261,6 +261,8 @@ parked input may be handled as execution continues; the owner's decision must
 cover that consequence. Lost release acknowledgement permits read-only
 observation of the same native process, never a second release request. A new
 uncertain input requires a new owner decision.
+If the exact original native process is already open, this operation repairs
+only its matching dispatch barrier without requesting another native release.
 
 Managed-lane control input is kept unattempted in the durable queue while native
 work is busy. Only idle admission submits it. This avoids turning a normal
