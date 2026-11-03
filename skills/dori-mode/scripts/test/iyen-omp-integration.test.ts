@@ -383,10 +383,21 @@ test("watchdog routing fence covers asynchronous native input through its bounde
   } finally { finish?.(); x.f.cleanup(); }
 });
 
-test("host-only epoch rotation retains unknown native provenance, blocks release and reconciles without replay", async () => {
-  const f = ompFixture(), config = profile(f.directory), s = new DoriService(config, association(f));
-  let inputs = 0, releases = 0;
-  await f.serve(r => ({ protocol: 1, id: r.id, identity: f.identity, result: r.method === "inspect" ? f.snapshot : { status: "received", receipt: receipt(f, r.params.operationId, "work") } }));
+test("current scoped lead reconciles a managed lost ACK before releasing the held original native session", async () => {
+  const lead = await setup(), f = ompFixture(), config = lead.config;
+  const runner: Runner = async argv => {
+    const a = await association(lead.f)(argv), b = await association(f)(argv);
+    return { code: 0, err: "", out: JSON.stringify({ result: { agents: [...JSON.parse(a.out).result.agents, ...JSON.parse(b.out).result.agents] } }) };
+  };
+  const s = new DoriService(config, runner);
+  const attached = await s.handle("lead-activate", lead.args, { role: "admin" });
+  const caller = { role: "lead" as const, key: "lead", instance: attached.lead.runtime.hostInstanceId };
+  let inputs = 0, releases = 0, received = false;
+  const receiptGate = Promise.withResolvers<void>(), receiptRequested = Promise.withResolvers<void>();
+  await f.serve(async r => {
+    if (r.method === "operation" && r.params.operationId === "revoked-scope") { receiptRequested.resolve(); await receiptGate.promise; }
+    return { protocol: 1, id: r.id, identity: f.identity, result: r.method === "inspect" ? f.snapshot : received ? { status: "received", receipt: receipt(f, r.params.operationId, "work") } : { status: "absent" } };
+  });
   const native = { kind: "omp" as const, target: f.target, attachmentInstanceId: "H1", attachmentGeneration: 1, attachedAt: new Date().toISOString(), excludedInboxIds: [] };
   await s.registry.write({ key: "worker", role: "lane", title: "worker", thread: "none", brief: "/b", done: "closed a/b#1", cwd: f.directory, pane: f.identity.paneId, openedAt: new Date().toISOString(), runtime: {
     kind: "omp", backend: "herdr-tui", threadId: f.identity.sessionId, state: "idle", hostInstanceId: "H1", generation: 1, binaryVersion: "18.15.0", omp: native } });
@@ -403,15 +414,28 @@ test("host-only epoch rotation retains unknown native provenance, blocks release
     expect(original).toMatchObject({ state: "unknown", attachmentInstance: "H1", ompProvenance: { target: f.target, attachmentInstanceId: "H1", attachmentGeneration: 1 } });
     await s.registry.update("worker", lane => ({ ...lane, dispatchBlocked: true, holdReason: "recovery", runtime: { ...lane.runtime!, hostInstanceId: "H2", generation: 2, omp: { ...native, attachmentInstanceId: "H2", attachmentGeneration: 2 } } }));
     atomicJson(bootstrapPath(config.stateDir, "worker"), { hostToken: "host", laneToken: "lane", instance: "H2", role: "lane" });
-    const restarted = new DoriService(config, association(f));
+    const restarted = new DoriService(config, runner);
     await expect(restarted.deps.runtime.release("worker", "user")).rejects.toThrow("unresolved operation fence"); expect(releases).toBe(0);
-    const result = await restarted.handle("mail-resolve", { box: "inbox", id: "lost-host", state: "sent", evidence: "exact native receipt" }, { role: "admin" });
+    const args = { box: "inbox", id: "lost-host", state: "sent", evidence: "exact native receipt" };
+    await expect(restarted.handle("mail-resolve", { ...args, state: "queued" }, caller)).rejects.toThrow();
+    await expect(restarted.handle("mail-resolve", { ...args, box: "outbox" }, caller)).rejects.toThrow();
+    await expect(restarted.handle("mail-resolve", args, { role: "lane", key: "worker" })).rejects.toThrow("capability");
+    await expect(restarted.handle("mail-resolve", args, caller)).rejects.toThrow("receipt unavailable");
+    expect(restarted.inbox.get("lost-host")).toEqual(original);
+    received = true;
+    const result = await restarted.handle("mail-resolve", args, caller);
     expect(result).toMatchObject({ state: "sent", attachmentInstance: "H1", ompProvenance: original.ompProvenance });
     await restarted.deps.runtime.release("worker", "user"); expect(releases).toBe(1); expect(inputs).toBe(1);
     restarted.inbox.put({ id: "legacy-unknown", target: "worker", text: "no recorded native evidence", state: "unknown", attachmentInstance: "H1", at: new Date().toISOString() });
     await expect(restarted.deps.runtime.release("worker", "user")).rejects.toThrow("unresolved operation fence");
-    await expect(restarted.handle("mail-resolve", { box: "inbox", id: "legacy-unknown", state: "sent", evidence: "operator" }, { role: "admin" })).rejects.toThrow("provenance missing");
-  } finally { server.stop(true); f.cleanup(); }
+    await expect(restarted.handle("mail-resolve", { box: "inbox", id: "legacy-unknown", state: "sent", evidence: "operator" }, caller)).rejects.toThrow("provenance missing");
+    restarted.inbox.put({ ...original, id: "revoked-scope" });
+    const rejected = expect(restarted.handle("mail-resolve", { ...args, id: "revoked-scope" }, caller)).rejects.toThrow();
+    await receiptRequested.promise;
+    await restarted.handle("lead-detach", { threadId: lead.args.threadId }, caller);
+    receiptGate.resolve(); await rejected;
+    expect(restarted.inbox.get("revoked-scope")?.state).toBe("unknown");
+  } finally { receiptGate.resolve(); server.stop(true); f.cleanup(); lead.f.cleanup(); }
 });
 
 for (const change of ["detach", "prepared-handoff", "committed-handoff", "stopped", "native-generation", "row"] as const) {
