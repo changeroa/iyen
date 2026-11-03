@@ -4,9 +4,9 @@ import { join, dirname } from "node:path";
 import { defaultConfig } from "../src/config.ts";
 import { atomicJson } from "../src/journal.ts";
 import { ipc, readJson, serviceSocket, socketDir } from "../src/ipc.ts";
-import { connectObserver } from "../src/runtime/observer.ts";
+import { connectObserver } from "../src/runtime/codex/observer.ts";
 import { operationText } from "../src/runtime/herdr.ts";
-import { startCodex } from "../src/runtime/codex.ts";
+import { startCodex } from "../src/runtime/codex/client.ts";
 import { withState } from "./fakes.ts";
 const waitFor = async<T>(fn:()=>Promise<T>,accept:(value:T)=>boolean):Promise<T>=>{
  const end=Date.now()+15000;

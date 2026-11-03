@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
 import { defaultConfig } from "../src/config.ts";
 import { DeliveryDeferred } from "../src/mailbox.ts";
-import { ExternalCurrentSession } from "../src/runtime/external-current-session.ts";
+import { ExternalCurrentSession } from "../src/runtime/codex/external-current-session.ts";
 import { operationText } from "../src/runtime/herdr.ts";
-import type { Observer } from "../src/runtime/observer.ts";
+import type { Observer } from "../src/runtime/codex/observer.ts";
 import type { Runner } from "../src/run.ts";
 import { withState } from "./fakes.ts";
 

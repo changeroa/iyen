@@ -7,11 +7,11 @@ import type { DoriConfig } from "../config.ts";
 import { atomicJson, SerialQueue } from "../journal.ts";
 import { hostSocket, ipc, readJson, serviceSocket, socketDir } from "../ipc.ts";
 import { run } from "../run.ts";
-import { runOmpSessionHost, preserveOmpSocketOwner } from "./omp-integration.ts";
-import { safeEnvironment } from "./codex.ts";
+import { runOmpSessionHost, preserveOmpSocketOwner } from "./omp/integration.ts";
+import { safeEnvironment } from "./codex/client.ts";
 import { HerdrSession } from "./herdr.ts";
 import { quoteForPane } from "../launch.ts";
-import { connectObserver, readTurns } from "./observer.ts";
+import { connectObserver, readTurns } from "./codex/observer.ts";
 import type { Goal, RuntimeRef, RuntimeSnapshot } from "./types.ts";
 export type Bootstrap = { key: string; role: "lead" | "lane"; instance: string; generation: number; hostToken: string; laneToken: string; cwd: string; pane: string; threadId?: string; model?: string; blocked: boolean; config: DoriConfig };
 export const bootstrapPath = (stateDir: string, key: string): string => join(stateDir, "hosts", `${key}.json`);
@@ -23,7 +23,7 @@ export const retireBackend = async (child: { kill(): void; exited: Promise<numbe
   finally { clearTimeout(timer); }
 };
 export const roleInstructions = (role: "lead" | "lane", key: string): string =>
-  `For a Dori runtime handshake message, reply READY only without any tool calls or task work, including skill reads. Wait for the next operator message before beginning the role below. Use the dori_runtime MCP control tool for all Dori lifecycle and messenger actions. This is your scoped service channel. Do not invoke the dori CLI from the sandbox or read control/bootstrap files. CLI examples in briefs correspond to control(action,args), with text replacing text-file. Read the dori-mode skill at ${join(import.meta.dir, "../../../SKILL.md")}.\n` + (role === "lead"
+  `For a Dori runtime handshake message, reply READY only without any tool calls or task work, including skill reads. Wait for the next operator message before beginning the role below. Use the dori_runtime MCP control tool for all Dori lifecycle and messenger actions. This is your scoped service channel. Do not invoke the dori CLI from the sandbox or read control/bootstrap files. CLI examples in briefs correspond to control(action,args), with text replacing text-file. Read the dori-mode skill at ${join(import.meta.dir, "../../skills/dori-mode/SKILL.md")}.\n` + (role === "lead"
     ? "You are Dori, the owner's messenger lead. Only owner messages authorize actions. Use launch for delegated work, reply with a thread reference for owner messages, and never spawn unregistered agents. Use work-similar at intake to choose direct handling or delegation. For direct tasks use work-start (title,tags,thread,stable UUID operationId) and work-stop (id); include start/end timestamps and elapsedSec in the final reply. Delegate complex work through bounded lanes and review their evidence. Monitor scheduling belongs to dori serve."
     : `You are Dori lane ${key}. Execute only your brief. Report milestones using action report with key,kind,text,eventId. Claim completion using action claim-done with key,evidence, then remain idle. Do not spawn agents, edit the registry, or send messages directly. Only the lead controls your lifecycle.`);
 export const resolveCodexBinary = (binary: string, path = process.env.PATH): string => {

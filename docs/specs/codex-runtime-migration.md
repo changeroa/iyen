@@ -25,7 +25,7 @@
 - 기존 native goal의 조회·pause/resume과 turn interrupt는 구현했다. 새 goal의 생성/예산 설정은 Codex의 기존 기능과 사용자의 지시를 따른다. 별도의 자동 continue 루프를 만들지 않았다.
 - local-only protocol probe에서 실제 Codex 0.163.0의 initialize, 모델 목록, thread 생성, paused goal 조회, required MCP 연결과 tool 등록을 확인했다. 모델 추론과 실제 메신저 전송은 수행하지 않았다.
 - 단위·프로세스 통합 테스트는 fixture runtime으로 중복 전달, lane 권한, pause, completion race, migration, 동일 thread 재개를 검증한다. active goal의 실제 자동 지속과 live connector 동작은 운영 전 smoke test 범위다.
-- journal 자동 회전과 기본 Codex TUI 복제는 포함하지 않았다. 생성된 protocol 타입은 `runtime/generated/VERSION`에 버전을 기록했다.
+- journal 자동 회전과 기본 Codex TUI 복제는 포함하지 않았다. 생성된 protocol 타입은 `src/runtime/codex/generated/VERSION`에 버전을 기록했다.
 
 실행 방법과 실제 명령 계약은 [README](../../README.ko.md), [runtime guide](../../skills/dori-mode/references/scripts.md)가 우선한다. 아래 항목은 초기 설계 근거와 인수 기준을 보존한다.
 
@@ -63,15 +63,15 @@
 
 | 현재 근거 | 현재 동작 | 전환 |
 |---|---|---|
-| [`config.ts`](../../skills/dori-mode/scripts/src/config.ts) | `omo --model`, Claude 모델, `ulw set goal and work`, `~/.omo/agent/sessions` | 검증된 Codex binary·역할별 모델·실행 정책 |
-| [`launch.ts`](../../skills/dori-mode/scripts/src/launch.ts) | pane에 실행 문자열 전달, 20초 후 화면/Herdr 상태 확인 | session-host handshake와 thread/turn 응답 확인 |
+| [`config.ts`](../../src/config.ts) | `omo --model`, Claude 모델, `ulw set goal and work`, `~/.omo/agent/sessions` | 검증된 Codex binary·역할별 모델·실행 정책 |
+| [`launch.ts`](../../src/launch.ts) | pane에 실행 문자열 전달, 20초 후 화면/Herdr 상태 확인 | session-host handshake와 thread/turn 응답 확인 |
 | `session-id.ts` (전환 시 삭제) | senpi/OMO 프로세스, `--session`, `PI_SESSION_ID`, 파일 시각 추측 | RPC가 반환한 `thread.id`를 즉시 저장 |
-| [`panes.ts`](../../skills/dori-mode/scripts/src/panes.ts) | send-text → Enter → working 상태 변화 | 런타임 입력 RPC와 request/turn 식별자 |
-| [`pause.ts`](../../skills/dori-mode/scripts/src/pause.ts) | `/goal pause`, `/goal resume`, 화면 정규식, Escape | goal RPC + turn interrupt + read-back |
-| [`freshness.ts`](../../skills/dori-mode/scripts/src/freshness.ts) | 화면의 `[REPORT]`를 두 tick 동안 관찰 | 명시적 report 이벤트와 전송 ledger |
-| [`sync.ts`](../../skills/dori-mode/scripts/src/sync.ts), [`dead-panes.ts`](../../skills/dori-mode/scripts/src/dead-panes.ts) | pane/process/screen 비교 | runtime heartbeat·thread 상태와 pane 존재 여부를 각각 비교 |
-| [`registry.ts`](../../skills/dori-mode/scripts/src/registry.ts) | 프로세스마다 JSON read-modify-write | 단일 writer, lane별 직렬화, revision |
-| [`done-flow.ts`](../../skills/dori-mode/scripts/src/done-flow.ts) | 완료 신호 검사, pane 알림, worktree 정리 | 검증기는 재사용, 알림·정지는 런타임 제어로 교체 |
+| [`panes.ts`](../../src/panes.ts) | send-text → Enter → working 상태 변화 | 런타임 입력 RPC와 request/turn 식별자 |
+| [`pause.ts`](../../src/pause.ts) | `/goal pause`, `/goal resume`, 화면 정규식, Escape | goal RPC + turn interrupt + read-back |
+| [`freshness.ts`](../../src/freshness.ts) | 화면의 `[REPORT]`를 두 tick 동안 관찰 | 명시적 report 이벤트와 전송 ledger |
+| [`sync.ts`](../../src/sync.ts), [`dead-panes.ts`](../../src/dead-panes.ts) | pane/process/screen 비교 | runtime heartbeat·thread 상태와 pane 존재 여부를 각각 비교 |
+| [`registry.ts`](../../src/registry.ts) | 프로세스마다 JSON read-modify-write | 단일 writer, lane별 직렬화, revision |
+| [`done-flow.ts`](../../src/done-flow.ts) | 완료 신호 검사, pane 알림, worktree 정리 | 검증기는 재사용, 알림·정지는 런타임 제어로 교체 |
 | [`SKILL.md`](../../skills/dori-mode/SKILL.md), [`setup.md`](../../skills/dori-mode/references/setup.md) | 리드의 monitor 도구와 pi integration 가정 | serve + session-host 기반 운영 계약 |
 
 `signals.ts`, `heavy-slot.ts`, 메신저 클라이언트와 thread ledger는 기존 구현을 활용한다. `routing.ts`의 재사용 판단은 pane idle 대신 런타임의 idle/approval/pause 상태를 확인하도록 바꾼다.
@@ -132,7 +132,7 @@ codex app-server --help
 codex app-server generate-ts --out <temporary-directory>
 ```
 
-이하 RPC 명칭과 필드는 이 바이너리가 생성한 `ClientRequest.ts`, `ServerRequest.ts`, `ServerNotification.ts`, `v2/*.ts`를 근거로 한다. 공개 문서만으로 지원 버전을 추정하지 않는다. 구현 시 선택한 Codex 버전을 고정하고 생성 타입을 `runtime/generated/`에 둔다. `0.163.0`은 조사 기준이지 아직 검증된 운영 버전은 아니다.
+이하 RPC 명칭과 필드는 이 바이너리가 생성한 `ClientRequest.ts`, `ServerRequest.ts`, `ServerNotification.ts`, `v2/*.ts`를 근거로 한다. 공개 문서만으로 지원 버전을 추정하지 않는다. 구현 시 선택한 Codex 버전을 고정하고 생성 타입을 `src/runtime/codex/generated/`에 둔다. `0.163.0`은 조사 기준이지 아직 검증된 운영 버전은 아니다.
 
 공식 app-server 문서는 thread·turn·goal RPC와 버전별 스키마 생성을 설명한다. [프로토콜 문서](https://learn.chatgpt.com/docs/app-server)
 
@@ -449,12 +449,12 @@ dori migrate --apply
 
 ## 9. 파일별 구현 계획
 
-아래 경로는 `skills/dori-mode/scripts/` 기준이다. 초기 구현은 하나의 Bun 패키지 안에서 진행한다.
+아래 경로는 Iyen 저장소 루트 기준이다. 공통 서비스와 Codex·OMP 하위 런타임은 하나의 Bun 패키지에서 관리한다.
 
 | 파일 | 변경 내용 |
 |---|---|
-| `src/runtime/protocol.ts`, `generated/` | 버전 고정 RPC 타입, framing, pending request, timeout, server request |
-| `src/runtime/codex.ts` | start/resume/input/steer/interrupt/goal/status 기능 |
+| `src/runtime/codex/protocol.ts`, `src/runtime/codex/generated/` | 버전 고정 RPC 타입, framing, pending request, timeout, server request |
+| `src/runtime/codex/client.ts` | start/resume/input/steer/interrupt/goal/status 기능 |
 | `src/runtime/session-host.ts` | subprocess·heartbeat·재연결·terminal 출력 |
 | `src/service.ts`, `src/ipc.ts` | 단일 daemon, 로컬 control socket, 역할별 command dispatch |
 | `src/journal.ts`, `src/registry.ts` | version/revision, operation 기록, lane queue, recovery |
@@ -466,10 +466,10 @@ dori migrate --apply
 | `src/panes.ts` | Herdr 위치·생성·종료만 담당; sendVerified 제거 |
 | `src/session-id.ts` | 삭제. 세션 파일 파싱 대체 구현도 만들지 않음 |
 | `test/fakes.ts`와 신규 protocol fixtures | fake Codex transport, fake host, deterministic clock |
-| `install.sh` | Codex 호환성 검사와 serve/lead 실행 안내; 기존 config 덮어쓰기 금지 |
-| 스킬, references, 4개 README | Codex-only 설치·운영·세션·복구·마이그레이션 문서 |
+| `install.sh` | Iyen 루트 패키지 설치와 선택한 런타임의 활성화 안내; 기존 config 덮어쓰기 금지 |
+| 스킬, references, 4개 README | Iyen 코어와 Codex·OMP 구성 요소의 설치·운영·세션·복구·마이그레이션 문서 |
 
-별도 provider interface와 factory는 두지 않는다. 테스트에 필요한 작은 runtime/transport 계약만 주입한다. Dori 도메인 모듈이 Codex wire type을 직접 import하지 않도록 `runtime/codex.ts`가 변환한다.
+별도 provider interface와 factory는 두지 않는다. 테스트에 필요한 작은 runtime/transport 계약만 주입한다. Codex wire 계약은 `src/runtime/codex/`, OMP 확장·전달·도구 계약은 `src/runtime/omp/`, 공통 호스트·상태 계약은 `src/runtime/`에서 관리한다.
 
 ## 10. 마이그레이션과 롤백
 

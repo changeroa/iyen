@@ -7,13 +7,13 @@ import { serviceClient } from "./ipc.ts";
 import { readStartupHealth } from "./health.ts";
 import { statusOf, type Lane } from "./registry.ts";
 import { run, type Runner } from "./run.ts";
-import { observeExternal, sharedDaemon, THREAD_UUID, type Attachment as CodexAttachment } from "./runtime/external-current-session.ts";
+import { observeExternal, sharedDaemon, THREAD_UUID, type Attachment as CodexAttachment } from "./runtime/codex/external-current-session.ts";
 import { connectOmp } from "./runtime/omp/client.ts";
 import { sameIdentity, identityOf, type OmpTarget, type OmpIdentity } from "./runtime/omp/contract.ts";
-import { verifyOmpHerdr } from "./runtime/omp-integration.ts";
+import { verifyOmpHerdr } from "./runtime/omp/integration.ts";
 import { operationText } from "./runtime/herdr.ts";
 import { acquireFileFence, withBindingFence, runBindingCommand } from "./binding-fence.ts";
-import { receipt, readThread, readLoadedThreads, readOptionalGoal, readTurns } from "./runtime/observer.ts";
+import { receipt, readThread, readLoadedThreads, readOptionalGoal, readTurns } from "./runtime/codex/observer.ts";
 
 const read = <T>(path: string): T | null => { try { return JSON.parse(readFileSync(path, "utf8")); } catch { return null; } };
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");

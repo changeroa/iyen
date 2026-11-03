@@ -4,10 +4,10 @@ import type { RuntimeConfig, RoleConfig } from "../config.ts";
 import type { Clock, Runner } from "../run.ts";
 import { realClock } from "../run.ts";
 import type { RuntimeSnapshot, Goal } from "./types.ts";
-import type { Thread } from "./generated/v2/Thread.ts";
-import { readGoal, readLoadedThreads, readTurns, receipt, type Observer } from "./observer.ts";
+import type { Thread } from "./codex/generated/v2/Thread.ts";
+import { readGoal, readLoadedThreads, readTurns, receipt, type Observer } from "./codex/observer.ts";
 import { verifyTurnPolicy, PolicyPending } from "./policy.ts";
-import { RpcError } from "./protocol.ts";
+import { RpcError } from "./codex/protocol.ts";
 
 export type Agent = { agent?: string; pane_id: string; name?: string; interactive_ready?: boolean; agent_status: string; agent_session?: { agent: string; kind: string; value: string } };
 export const operationText = (text: string, id: string): string => `${text}\n\n[DORI_OPERATION:${createHash("sha256").update(id).digest("hex")}]`;

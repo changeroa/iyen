@@ -41,7 +41,7 @@ Prepare activation, exact configuration and readiness before the receive downtim
 Default preflight, which does not mutate files:
 
 ```
-node skills/dori-mode/scripts/compat/install.mjs --config /ABSOLUTE/CUTOVER.json --target /ABSOLUTE/runtime/lead-pane.mjs
+node compat/install.mjs --config /ABSOLUTE/CUTOVER.json --target /ABSOLUTE/runtime/lead-pane.mjs
 ```
 
 Review the returned paths/hashes and rollback instructions. A later explicitly authorized local invocation can add `--apply`. It verifies syntax, exact original hash, both stopped dispatchers again, creates and verifies a hash-addressed original backup, writes private adjacent configuration, and atomically replaces the shim. Existing adjacent compatibility configuration is refused to prevent silent recutover. The installer does not stop, restart, enable or send anything. Preserve dispatcher stop/disable state until replacement/configuration and exact readiness are verified; restart both services promptly in the controlled window. Native provider/authentication readiness and lead bootstrap must be verified separately before claiming operational readiness.

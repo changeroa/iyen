@@ -10,7 +10,7 @@ Workers must not follow old `dori report` examples, inspect context/bootstrap/re
 
 ## Deterministic lead compatibility bootstrap
 
-`scripts/src/runtime/omp/instructions.ts` exports `ompLeadBootstrap(context)`. It returns Markdown from explicit non-secret context only, without reading/copying source files, starting processes, changing settings or sending messages. The operator supplies:
+`src/runtime/omp/instructions.ts` exports `ompLeadBootstrap(context)`. It returns Markdown from explicit non-secret context only, without reading/copying source files, starting processes, changing settings or sending messages. The operator supplies:
 
 ```json
 {
@@ -26,7 +26,7 @@ Workers must not follow old `dori report` examples, inspect context/bootstrap/re
 
 These are placeholders, not deployment configuration. Preserve the existing configured LEAD and persona paths; do not substitute a new empty installation's persona directory. Use only the absolute executable returned by successful activation. Obtain the expected session/pane/epoch from that exact activation and its scoped `status lead` result. Never search raw bridge/control/registry files or use administrative credentials to populate this artifact.
 
-For example, from `skills/dori-mode/scripts`, render a reviewed local context JSON into a private lead-only artifact:
+For example, from the Iyen repository root, render a reviewed local context JSON into a private lead-only artifact:
 
 ```sh
 umask 077

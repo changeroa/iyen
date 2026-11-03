@@ -6,7 +6,7 @@ import { atomicJson } from "../src/journal.ts";
 import { DoriService } from "../src/service.ts";
 import { hostSocket } from "../src/ipc.ts";
 import { bootstrapPath } from "../src/runtime/session-host.ts";
-import { ompManagedEnvironment, ompProfileEnvironment, ompPaneCommand, ompVersionMatches, verifyOmpHerdr, discoverOmpSafe, waitForOmpDetach, stopOmpManagedProcess } from "../src/runtime/omp-integration.ts";
+import { ompManagedEnvironment, ompProfileEnvironment, ompPaneCommand, ompVersionMatches, verifyOmpHerdr, discoverOmpSafe, waitForOmpDetach, stopOmpManagedProcess } from "../src/runtime/omp/integration.ts";
 import { payloadHash } from "../src/runtime/omp/contract.ts";
 import { readWatchTarget, DeliveryWatchdog } from "../src/watchdog.ts";
 import { ompFixture } from "./fixtures/omp.ts";
@@ -503,7 +503,7 @@ test("SIGKILL OMP host recovery removes only its stale socket and reconnects the
 
 test("stale-host cleanup refuses a live foreign replacement even with dead old-owner metadata", async () => {
   const { lstatSync } = await import("node:fs");
-  const { ompHostOwnerPath, prepareOmpHostSocket } = await import("../src/runtime/omp-integration.ts");
+  const { ompHostOwnerPath, prepareOmpHostSocket } = await import("../src/runtime/omp/integration.ts");
   const f = ompFixture(), config = profile(f.directory), socket = hostSocket(config.stateDir, "worker");
   const dead = Bun.spawn([process.execPath, "-e", "process.exit(0)"], { stdout: "ignore", stderr: "ignore" }); await dead.exited;
   const replacement = Bun.serve({ unix: socket, fetch() { return Response.json({ error: "foreign owner" }, { status: 403 }); } });

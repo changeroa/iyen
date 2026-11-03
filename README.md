@@ -1,21 +1,29 @@
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
-# Dori — Codex runtime
+# Iyen — Codex and OMP runtimes
 
-Iyen mode turns the current Codex conversation into the messenger lead. Ask “이연 모드 시작” with the `iyen` skill installed: the same session receives owner messages and delegates work into independent worker sessions. No separate lead session is created.
+Iyen is the messenger lead and lane orchestration system. Codex and OMP (oh-my-pi) are runtime components of this repository, not separate Iyen products. The `iyen` skill attaches the current verified conversation as the lead; it does not create a separate lead session.
 
-OMP (oh-my-pi) is also available through an [opt-in, isolated runtime profile](skills/dori-mode/references/setup.md#opt-in-omp-profile-alongside-codex). Codex remains the default. OMP supports attaching an explicitly prepared native conversation and launching managed workers; managed pause and recovery require the linked OMP fork with `executionHold` support.
+| Component | Source | Responsibility |
+|---|---|---|
+| Iyen core | `src/` | Owner routing, scoped control, durable delivery, lane lifecycle and completion |
+| Codex runtime | `src/runtime/codex/` | Codex RPC, generated protocol types, read-only observation and current-session attachment |
+| OMP runtime | `src/runtime/omp/` | OMP extension, receipts, scoped tool, attachment and managed-worker integration |
+| Shared runtime host | `src/runtime/` | Host lifecycle, Herdr coordination and runtime state contracts |
+| Agent skills | `skills/` | Lead operating instructions, activation helpers and configuration examples |
 
-Activation requires the current Herdr session to be loaded in the running local Codex shared daemon; an unobservable standalone session is refused. The lead uses that existing session and daemon. Each worker lane runs a **real interactive Codex TUI in Herdr** connected to its own app-server endpoint. `dori serve` owns monitors and durable state; Codex owns reasoning, tools, turns and native goals; Herdr owns TUI start/resume, prompts, controls and exit. A read-only observer verifies exact persisted operation markers and turn/goal state; idle status is never a delivery receipt. Workers call a scoped stdio MCP tool. The existing lead uses a generation-scoped command bridge without changing its sandbox or loading a new MCP server. OMO is not required.
+Select the component with `runtime.kind`: `codex` (the existing default) or `omp`. Both use the same Iyen service and lane/messenger lifecycle. OMP setup uses an [isolated runtime profile](skills/dori-mode/references/setup.md#opt-in-omp-profile-alongside-codex); managed pause and recovery require the documented OMP fork with `executionHold` support. Runtime-native model, permission and identity checks remain unchanged.
+
+Run installation, type checking and tests from the repository root. The `dori` command and existing persistent config/persona locations are unchanged. When upgrading an installed checkout from the former skill-local package layout, regenerate source-pinned launchers/attachments and watchdog configuration through the documented operator lifecycle, and update an OMP profile's `extensionPath` to `/absolute/iyen/src/runtime/omp/extension.ts`. Do not relocate a serving checkout underneath an active lead or replay pending sends. This source refactor does not perform a live deployment.
 
 ## Install and start
 
-Requirements: Bun 1.3+, Herdr, git, and Codex CLI. Attached leads validate the matching CLI/daemon pair and required messaging capabilities instead of requiring each release in a version allowlist. Managed workers retain their configured version pin (default **0.163.0**). Use gh for GitHub Done signals and npm for published-package signals. Use the existing messenger integration or an ACK/replay adapter described below.
+Requirements: Bun 1.3+, Herdr, git, and the selected runtime (Codex CLI or the configured OMP binary/extension). Codex attached leads validate the matching CLI/daemon pair and required messaging capabilities; managed Codex workers retain their configured version pin (default **0.163.0**). OMP validates its configured version and exact native identity. Use gh for GitHub Done signals and npm for published-package signals.
 
 For attached leads, Herdr identifies the pane/session and supplies execution status; the Codex adapter verifies loaded identity and actual delivery receipts. Compatible updates reconnect the same session automatically using `runtime.externalBinary`. After closing the previous session, start a new conversation and ask for `iyen mode`: activation verifies that the old lead ended and records a handoff without replaying old mail. A still-live or unverified former lead requires explicit reconciliation. `dori health` distinguishes service recovery, ingress activity and held delivery; the ingress adapter's storage ACK is not a turn receipt. See [runtime recovery and handoff](skills/dori-mode/references/setup.md).
 
 ```sh
-cd skills/dori-mode/scripts
+cd /path/to/iyen
 bun install --frozen-lockfile
 bun link
 ```
@@ -79,6 +87,8 @@ Telegram, Discord and Slack clients, typing/draft support, presence, voice trans
 
 The Iyen skill guides read receipts and replies: after reading an owner message, the lead adds an `eyes` reaction as the configured bot to that exact message, then answers in the original thread. The service does not generate routine working/completed/waiting acknowledgments or react automatically. There is no fixed status-posting or thread-renaming cycle.
 
+Ordinary authenticated owner messages always go to the lead, including follow-ups in a worker's report thread. The lead explicitly forwards worker instructions; a lane/thread association never captures the conversation. Explicit owner UI controls retain their lane/thread checks. Previously accepted queued or unknown entries are preserved for reconciliation, not automatically moved or replayed.
+
 The service supervises configured ingress commands. They emit normalized owner messages with stable IDs and advance source cursors only after a durable protocol ACK. The delivered envelope includes the source message ID separately from the reply thread. This internal ACK is not a messenger reply or a read receipt. Raw human-readable messenger watch output is not accepted directly. Thread hooks keep account credentials outside worker environments. See the exact [adapter and approval contracts](skills/dori-mode/references/scripts.md).
 
 ## Migration and recovery
@@ -99,14 +109,14 @@ Stop legacy workers first. Active lanes need explicit stopped-source confirmatio
 ## Validation
 
 ```sh
-cd skills/dori-mode/scripts
+cd /path/to/iyen
 bun test
 bun run typecheck
 ```
 
 Tests include separate daemon/session-host processes with fixture Codex and Herdr executables. They do not call real models or messenger APIs. Real CLI initialization, thread creation, paused-goal inspection and required MCP tool registration were separately checked without inference. Live model, connector and host sandbox behavior still require an isolated deployment smoke test. The local journal currently retains history without automatic rotation.
 
-MIT. The installer retains the original upstream repository URL; that historical name is not a runtime dependency.
+MIT. The installer uses the `changeroa/iyen` repository.
 
 ### Independent delivery watchdog
 

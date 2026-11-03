@@ -11,7 +11,7 @@ afterEach(() => {
 });
 
 test("the shipped example config loads, with ~ paths expanded and unset fields defaulted", async () => {
-  const c = await loadConfig(join(import.meta.dir, "../../references/config.example.json"), "/home/ana");
+  const c = await loadConfig(join(import.meta.dir, "../skills/dori-mode/references/config.example.json"), "/home/ana");
   expect(c.stateDir).toBe("/home/ana/.dori/state");
   expect(c.defaultCwd).toBe("/home/ana/code/my-project");
   expect(c.closeAfterMin).toBe(5);

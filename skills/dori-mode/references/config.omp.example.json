@@ -17,7 +17,7 @@
     },
     "omp": {
       "registryDir": "/absolute/isolated-omp/controllers",
-      "extensionPath": "/absolute/iyen/skills/dori-mode/scripts/src/runtime/omp/extension.ts",
+      "extensionPath": "/absolute/iyen/src/runtime/omp/extension.ts",
       "provider": "EXPLICIT_PROVIDER_ID",
       "approvalMode": "always-ask"
     }

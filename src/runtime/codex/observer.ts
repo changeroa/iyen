@@ -2,7 +2,7 @@ import { RpcClient, RpcError } from "./protocol.ts";
 import { isAbsolute } from "node:path";
 import type { Thread } from "./generated/v2/Thread.ts";
 import type { Turn } from "./generated/v2/Turn.ts";
-import type { Goal } from "./types.ts";
+import type { Goal } from "../types.ts";
 
 // There is deliberately no general RPC escape hatch on this interface. The TUI
 // is the sole writer; even resuming an unloaded thread here would violate that.

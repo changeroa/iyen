@@ -1,16 +1,16 @@
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
-# Dori — Codex 运行时
+# Iyen — Codex 与 OMP 运行时
 
-Iyen 模式将当前 Codex 对话连接为主代理。请求“이연 모드 시작”即可启动，不创建另一个主代理。只有委派的工作任务使用独立 Codex 会话。
+Iyen 是管理消息与任务通道的上层系统。Codex 和 OMP 是同一仓库中的运行时组件，分别位于 `src/runtime/codex/` 和 `src/runtime/omp/`，通过 `runtime.kind` 选择。共享服务位于 `src/`，技能位于 `skills/`。将已验证的当前会话连接为主代理，不创建另一个主代理。
 
-需要 Bun 1.3+、Herdr、git、gh 和 Codex CLI。连接的主代理会验证 CLI 与守护进程版本一致以及必要的消息功能，不再依赖逐个发布版本的允许列表。兼容更新后会自动重新连接同一会话；切换到其他会话需要明确交接。可用 `dori health` 区分恢复、接收和投递状态。托管工作进程继续使用配置中固定的版本（默认 **0.163.0**）。
+需要 Bun 1.3+、Herdr、git 和选定的运行时。Codex 连接主代理验证 CLI 与守护进程的兼容性，托管工作进程验证配置的版本。OMP 使用配置的二进制、扩展及隔离配置。详见[设置指南](skills/dori-mode/references/setup.md)。
 
 ```sh
-cd skills/dori-mode/scripts
+cd /path/to/iyen
 bun install --frozen-lockfile
 bun link
-# Configure ~/.dori-codex/config.json from references/config.example.json
+# Configure ~/.dori-codex/config.json from skills/dori-mode/references/config.example.json
 export DORI_CONFIG="$HOME/.dori-codex/config.json"
 dori doctor
 dori serve

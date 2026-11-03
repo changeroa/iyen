@@ -20,14 +20,14 @@ import type { RuntimeInputReceipt, ExternalHoldCode, RuntimeControl, RuntimeRef,
 import { WorkTimers } from "./work.ts";
 import { turnFailure, ompFailureGuidance } from "./turn-failure.ts";
 import { DeliveryDeferred, Mailbox, postHook, type Mail } from "./mailbox.ts";
-import { ExternalCurrentSession, ExternalSessionError, discoverExternal, observeExternal, sharedDaemon, THREAD_UUID, type Attachment as CodexAttachment } from "./runtime/external-current-session.ts";
-import { connectObserver, receiptInTurns } from "./runtime/observer.ts";
+import { ExternalCurrentSession, ExternalSessionError, discoverExternal, observeExternal, sharedDaemon, THREAD_UUID, type Attachment as CodexAttachment } from "./runtime/codex/external-current-session.ts";
+import { connectObserver, receiptInTurns } from "./runtime/codex/observer.ts";
 import { withBindingFence } from "./binding-fence.ts";
 import { readWatchTarget } from "./watchdog.ts";
 import { operationText } from "./runtime/herdr.ts";
-import type { Turn } from "./runtime/generated/v2/Turn.ts";
+import type { Turn } from "./runtime/codex/generated/v2/Turn.ts";
 
-import { callOmp, findOmpTarget, verifyOmpHerdr, sameOmpTarget } from "./runtime/omp-integration.ts";
+import { callOmp, findOmpTarget, verifyOmpHerdr, sameOmpTarget } from "./runtime/omp/integration.ts";
 import { connectOmp } from "./runtime/omp/client.ts";
 import { sameIdentity, validReceipt, payloadHash, object, exactKeys, validateFailureRecord, type OmpTarget } from "./runtime/omp/contract.ts";
 type Attachment = CodexAttachment & { omp?: OmpTarget };
@@ -1210,12 +1210,14 @@ export class DoriService {
       await this.inbox.deliver(id, async () => { await this.handle(event.control.action, event.control.args, { role: "admin" }); return {}; });
       return;
     }
-    const target = known && statusOf(known) !== "closed" ? known.key : "lead";
+    // A lane's thread is its report destination, not ownership of owner input.
+    // Preserve accepted delivery targets across retries; never relabel unknown work.
+    const previous = this.inbox.get(id);
+    const target = previous?.target ?? "lead";
     const intakeLane = target === "lead" ? await this.registry.read("lead") : null;
     const envelope = `Owner message in ${event.thread}${known && statusOf(known) === "closed" ? ` (closed lane ${known.key}; reopen if appropriate)` : ""}:`;
     // Retries of pre-metadata intake must retain the original operation text,
     // including when its delivery is uncertain. New events carry the source ID.
-    const previous = this.inbox.get(id);
     const text = previous?.text === `${envelope}\n${event.text}` ? previous.text : `${envelope}\nSource message ID: ${event.id}\n${event.text}`;
     this.putInbox({ id, target, attachmentInstance: this.intakeInstance(intakeLane), thread: event.thread, text, source, state: "queued", at: new Date().toISOString() });
     this.ingressHealth.set(source, { process: this.ingressHealth.get(source)?.process ?? "starting", lastAcceptedAt: new Date().toISOString() });

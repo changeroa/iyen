@@ -4,8 +4,8 @@ import { DoriService } from "../src/service.ts";
 import { atomicJson } from "../src/journal.ts";
 import { hostSocket } from "../src/ipc.ts";
 import { bootstrapPath } from "../src/runtime/session-host.ts";
-import { CodexSession } from "../src/runtime/codex.ts";
-import { RpcClient } from "../src/runtime/protocol.ts";
+import { CodexSession } from "../src/runtime/codex/client.ts";
+import { RpcClient } from "../src/runtime/codex/protocol.ts";
 import type { Lane } from "../src/registry.ts";
 import { fakeRunner, newWorld, withState } from "./fakes.ts";
 

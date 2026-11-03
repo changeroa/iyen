@@ -7,7 +7,7 @@ import { hostSocket, readJson, socketDir } from "../src/ipc.ts";
 import { DoriService } from "../src/service.ts";
 import { operationText } from "../src/runtime/herdr.ts";
 import { backendSocket, prepareBackend, runSessionHost, startSessionHost } from "../src/runtime/session-host.ts";
-import { sharedDaemon } from "../src/runtime/external-current-session.ts";
+import { sharedDaemon } from "../src/runtime/codex/external-current-session.ts";
 import { deadPaneTick } from "../src/dead-panes.ts";
 import { withState } from "./fakes.ts";
 import type { Runner } from "../src/run.ts";

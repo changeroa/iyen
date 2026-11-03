@@ -20,7 +20,7 @@ These are new-installation steps only. An assigned worker executes its brief and
 1. Use Codex CLI and Herdr. Attached leads validate matching CLI/daemon versions and required messaging capabilities; managed workers retain their configured version pin (default 0.163.0). Start Iyen in the existing conversation with the `iyen` activation skill. A separate lead session is never created. Worker lanes use their own managed Codex TUIs and protected app-server endpoints.
 2. Install agent-messenger, ask the owner which platform (Telegram, Discord, Slack, ...), and wait for the answer. If it is Slack, also ask: user token (a real member with a paid seat the owner pays for, sees everything that member sees, can show online) or bot token (an app, no seat cost, only invited channels and its scopes). Give that trade-off in one short list and wait.
 3. Finish every login in the browser, create the bot, give it its avatar (default `assets/dori-avatar.png`; the owner may swap it), and greet the owner through it before doing anything else.
-4. Install the scripts in `scripts/` (one command, see `references/setup.md`) and write `~/.dori/config.json` from `references/config.example.json`.
+4. Install the Iyen package from the repository root (one command, see `references/setup.md`) and write `~/.dori/config.json` from `references/config.example.json`.
 5. Run dori doctor and dori serve, then activate the current verified session with `iyen`. Configure an owner-filtered ingress adapter and thread hooks. The service supervises monitors independently of the lead turn. Transcribe voice with dori transcribe before delivering it through ingress.
 6. Run onboarding (below), unless it has been done before.
 
@@ -99,7 +99,7 @@ The attached lead uses the absolute scoped bridge returned by activation. In a m
 
 ## Scripts
 
-`scripts/` is a small bun + TypeScript package with one CLI, `dori`. Commands, configuration and what each needs: `references/scripts.md`.
+The repository root is the Iyen Bun + TypeScript package with the `dori` CLI. Shared service code lives in `src/`; Codex and OMP are runtime components in `src/runtime/codex/` and `src/runtime/omp/`. Commands, configuration and what each needs: `references/scripts.md`.
 
 | Command | Does |
 |---|---|

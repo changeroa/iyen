@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "dori-mode-scripts",
+      "name": "iyen",
       "devDependencies": {
         "@types/bun": "^1.3.0",
         "typescript": "^5.9.0",
