@@ -4,6 +4,7 @@ import { createConnection, type Socket } from "node:net";
 import { isAbsolute } from "node:path";
 import { OMP_MAX_FRAME_BYTES, OmpError, assertIdentity, exactKeys, identityOf, nonempty, object, payloadHash, validReceipt, validSnapshot, validFailureRequest, validateFailurePage,
   validInteraction, validInteractionResponse, validInteractionStatus,
+  validRestartIntent, validRestartStatus, validRestartContinuation,
   type NativeInteractionReceipt, type OmpController, type OmpMethod, type OmpOperation, type OmpReceipt, type OmpSnapshot, type OmpTarget } from "./contract.ts";
 
 export async function connectOmp(target: OmpTarget, options: { timeoutMs?: number } = {}): Promise<OmpController> {
@@ -99,6 +100,17 @@ export async function connectOmp(target: OmpTarget, options: { timeoutMs?: numbe
     hold: async (origin, operationId) => snapshot(await request("hold", { origin, operationId })),
     release: async (origin, operationId) => snapshot(await request("release", { origin, operationId })),
     stop: async operationId => { const result = await request("stop", { operationId }); return object(result) && exactKeys(result, ["stopping"]) && result.stopping === true ? { stopping: true } : invalid(); },
+    leadRestart: async (method, intent) => {
+      if (!validRestartIntent(intent) || (method === "restart-release" && !intent.previousTarget))
+        throw new OmpError("invalid-params", "Invalid restart intent", false);
+      const result = await request(method, intent);
+      return validRestartStatus(result, target, intent) ? result : invalid();
+    },
+    leadRestartStage: async (intent, text) => {
+      if (!validRestartIntent(intent) || !intent.previousTarget || !nonempty(text)) throw new OmpError("invalid-params", "Invalid restart continuation", false);
+      const result = await request("restart-stage", { ...intent, text, payloadHash: payloadHash(text) });
+      return validRestartContinuation(result, target, intent) && result.textHash === payloadHash(text) ? result : invalid();
+    },
     close: () => { closed = true; for (const socket of sockets) socket.destroy(); },
   };
   try { await controller.inspect(); return controller; } catch (error) { controller.close(); throw error; }

@@ -9,10 +9,33 @@ export type OmpIdentity = {
   laneKey: string; protocol: 1; runtimeVersion: string;
 };
 export type OmpTarget = OmpIdentity & { socketPath: string; tokenFile: string };
+export type OmpLaunchMetadata = {
+  agentDir: string; settingsHome: string; approvalMode: "always-ask" | "always-ask-cached" | "write" | "yolo";
+  provider: string; model: string; effort?: string;
+};
+export type LeadRestartIntent = {
+  operationId: string; authorizationHash: string; sourceMessageId: string; launchMetadata: OmpLaunchMetadata; previousTarget?: OmpTarget;
+};
+export type LeadRestartBootstrap = LeadRestartIntent & { previousTarget: OmpTarget };
+export type LeadRestartStatus = {
+  operationId: string; authorizationHash: string; sourceMessageId: string;
+  phase: "waiting-idle" | "held" | "exit-requested" | "released" | "failed";
+  target: OmpTarget; message?: string;
+  launchMetadata: OmpLaunchMetadata;
+  process: { pid: number; controllerInstanceId: string; controllerGeneration: number };
+  bootstrap?: LeadRestartBootstrap;
+  fence?: { sessionId: string; generation: number; status: "open" | "holding" | "held" };
+  continuation?: LeadRestartContinuation;
+};
+export type LeadRestartContinuation = {
+  operationId: string; authorizationHash: string; target: OmpTarget; textHash: string; receipt: OmpReceipt;
+};
+export const leadRestartContinuationId = (operationId: string): string => `lead-restart-continuation:${operationId}`;
 export type OmpExtensionBootstrap = {
   protocol: 1; registryDir: string; role: "attached-lead" | "managed-lane"; laneKey: string;
   expectedCwd: string; expectedPaneId: string; expectedTerminalId: string;
   expectedSessionId?: string; expectedSessionFile?: string;
+  restart?: LeadRestartBootstrap;
   service?: { contextFile: string; configFile: string; stateDir: string; cliPath: string; bunBinary: string };
 };
 export type OmpGoal = { status: "active" | "paused"; objective: string; tokenBudget: number | null } | null;
@@ -21,13 +44,15 @@ export type OmpSnapshot = {
   identity: OmpIdentity;
   state: "starting" | "idle" | "running" | "waiting_approval" | "waiting_input" | "pausing" | "recovering" | "failed" | "stopped";
   held: boolean; activeRunId?: string; goal: OmpGoal; model: string; provider: string; effort?: string;
-  capabilities: { inspect: true; input: boolean; durableReceipts: boolean; durableFailures: boolean; hold: boolean; release: boolean; stop: boolean; goals: boolean; interactions?: boolean };
+  launchMetadata?: OmpLaunchMetadata;
+  capabilities: { inspect: true; input: boolean; durableReceipts: boolean; durableFailures: boolean; hold: boolean; release: boolean; stop: boolean; goals: boolean; interactions?: boolean; leadRestart?: boolean };
   eventSequence: number;
 };
 export type OmpOperation = { status: "absent" }
   | { status: "reserved" | "attempted" | "unknown"; operationId: string; payloadHash: string }
   | { status: "received"; receipt: OmpReceipt };
-export type OmpMethod = "inspect" | "failures" | "input" | "operation" | "hold" | "release" | "stop" | "interactions" | "interaction-respond" | "interaction-response-status";
+export type OmpMethod = "inspect" | "failures" | "input" | "operation" | "hold" | "release" | "stop" | "interactions" | "interaction-respond" | "interaction-response-status"
+  | "restart-prepare" | "restart-inspect" | "restart-commit" | "restart-release" | "restart-stage";
 export type OmpRequest = { protocol: 1; id: string; token: string; target: OmpIdentity; method: OmpMethod; params: Record<string, unknown> };
 export type OmpResponse = { protocol: 1; id: string; identity: OmpIdentity } & (
   { result: unknown; error?: never } | { error: { code: string; message: string; attempted: boolean }; result?: never });
@@ -43,6 +68,8 @@ export type OmpController = {
   release(origin: "user" | "automatic", operationId: string): Promise<OmpSnapshot>;
   /** Acknowledges shutdown intent only; the host must independently prove process exit. */
   stop(operationId: string): Promise<{ stopping: true }>;
+  leadRestart(method: "restart-prepare" | "restart-inspect" | "restart-commit" | "restart-release", intent: LeadRestartIntent): Promise<LeadRestartStatus>;
+  leadRestartStage(intent: LeadRestartIntent, text: string): Promise<LeadRestartContinuation>;
   close(): void;
 };
 /** attempted=false is a verified pre-submit refusal; undefined is transport uncertainty. */
@@ -79,22 +106,92 @@ export function validReceipt(value: unknown, target: OmpIdentity, operationId: s
     value.sessionFile === target.sessionFile && nonempty(value.entryId) && value.receiptId === `omp-entry:${target.sessionId}:${value.entryId}`;
 }
 export function validSnapshot(value: unknown, target: OmpIdentity): value is OmpSnapshot {
-  if (!object(value) || !exactKeys(value, ["identity", "state", "held", "goal", "model", "provider", "capabilities", "eventSequence"], ["activeRunId", "effort"]) ||
+  if (!object(value) || !exactKeys(value, ["identity", "state", "held", "goal", "model", "provider", "capabilities", "eventSequence"], ["activeRunId", "effort", "launchMetadata"]) ||
     !validIdentity(value.identity) || !sameIdentity(value.identity, target) || typeof value.held !== "boolean" ||
     !["starting", "idle", "running", "waiting_approval", "waiting_input", "pausing", "recovering", "failed", "stopped"].includes(value.state as string) ||
     typeof value.model !== "string" || typeof value.provider !== "string" || !Number.isSafeInteger(value.eventSequence) || (value.eventSequence as number) < 0 ||
     (value.activeRunId !== undefined && !nonempty(value.activeRunId)) || (value.effort !== undefined && !nonempty(value.effort))) return false;
   const goal = value.goal, caps = value.capabilities;
+  if (value.launchMetadata !== undefined && (!validLaunchMetadata(value.launchMetadata) ||
+    value.launchMetadata.provider !== value.provider || value.launchMetadata.model !== value.model ||
+    value.launchMetadata.effort !== value.effort)) return false;
   return (goal === null || (object(goal) && exactKeys(goal, ["status", "objective", "tokenBudget"]) && ["active", "paused"].includes(goal.status as string) &&
     nonempty(goal.objective) && (goal.tokenBudget === null || (Number.isSafeInteger(goal.tokenBudget) && (goal.tokenBudget as number) > 0)))) &&
-    object(caps) && exactKeys(caps, ["inspect", "input", "durableReceipts", "durableFailures", "hold", "release", "stop", "goals"], ["interactions"]) && caps.inspect === true &&
+    object(caps) && exactKeys(caps, ["inspect", "input", "durableReceipts", "durableFailures", "hold", "release", "stop", "goals"], ["interactions", "leadRestart"]) && caps.inspect === true &&
     Object.values(caps).every(v => typeof v === "boolean");
+}
+export function validLaunchMetadata(value: unknown): value is OmpLaunchMetadata {
+  return object(value) && exactKeys(value, ["agentDir", "settingsHome", "approvalMode", "provider", "model"], ["effort"]) &&
+    nonempty(value.agentDir) && isAbsolute(value.agentDir) && nonempty(value.settingsHome) && isAbsolute(value.settingsHome) &&
+    ["always-ask", "always-ask-cached", "write", "yolo"].includes(value.approvalMode as string) &&
+    nonempty(value.provider) && nonempty(value.model) && (value.effort === undefined || nonempty(value.effort));
+}
+export function sameLaunchMetadata(a: OmpLaunchMetadata, b: OmpLaunchMetadata): boolean {
+  return a.agentDir === b.agentDir && a.settingsHome === b.settingsHome && a.approvalMode === b.approvalMode &&
+    a.provider === b.provider && a.model === b.model && a.effort === b.effort;
+}
+export function validRestartIntent(value: unknown): value is LeadRestartIntent {
+  if (!object(value) || !exactKeys(value, ["operationId", "authorizationHash", "sourceMessageId", "launchMetadata"], ["previousTarget"]) ||
+    !nonempty(value.operationId) || value.operationId.length > 512 || !hash(value.authorizationHash) ||
+    !nonempty(value.sourceMessageId) || value.sourceMessageId.length > 512 || !validLaunchMetadata(value.launchMetadata)) return false;
+  const previous = value.previousTarget;
+  if (previous === undefined) return true;
+  if (!object(previous) || !exactKeys(previous, [...identityKeys, "socketPath", "tokenFile"]) ||
+    !nonempty(previous.socketPath) || !isAbsolute(previous.socketPath) || !nonempty(previous.tokenFile) || !isAbsolute(previous.tokenFile)) return false;
+  const { socketPath: _socket, tokenFile: _token, ...identity } = previous;
+  return validIdentity(identity) && identity.role === "attached-lead" && identity.laneKey === "lead";
+}
+export function validRestartStatus(value: unknown, target: OmpTarget, intent: LeadRestartIntent): value is LeadRestartStatus {
+  return object(value) && exactKeys(value, ["operationId", "authorizationHash", "sourceMessageId", "launchMetadata", "phase", "target", "process"], ["message", "bootstrap", "fence", "continuation"]) &&
+    value.operationId === intent.operationId && value.authorizationHash === intent.authorizationHash && value.sourceMessageId === intent.sourceMessageId &&
+    validLaunchMetadata(value.launchMetadata) &&
+    (!["held", "exit-requested", "released"].includes(value.phase as string) || sameLaunchMetadata(value.launchMetadata, intent.launchMetadata)) &&
+    ["waiting-idle", "held", "exit-requested", "released", "failed"].includes(value.phase as string) &&
+    validRestartIntent({ ...intent, previousTarget: value.target }) &&
+    object(value.target) && sameIdentity(value.target as OmpTarget, target) &&
+    value.target.socketPath === target.socketPath && value.target.tokenFile === target.tokenFile &&
+    object(value.process) && exactKeys(value.process, ["pid", "controllerInstanceId", "controllerGeneration"]) &&
+    Number.isSafeInteger(value.process.pid) && (value.process.pid as number) > 0 &&
+    value.process.controllerInstanceId === target.instanceId && value.process.controllerGeneration === target.generation &&
+    (value.bootstrap === undefined ? intent.previousTarget === undefined :
+      validRestartIntent(value.bootstrap) && !!value.bootstrap.previousTarget && !!intent.previousTarget &&
+      value.bootstrap.operationId === intent.operationId && value.bootstrap.authorizationHash === intent.authorizationHash &&
+      value.bootstrap.sourceMessageId === intent.sourceMessageId &&
+      sameLaunchMetadata(value.bootstrap.launchMetadata, intent.launchMetadata) &&
+      sameIdentity(value.bootstrap.previousTarget, intent.previousTarget) &&
+      value.bootstrap.previousTarget.socketPath === intent.previousTarget.socketPath &&
+      value.bootstrap.previousTarget.tokenFile === intent.previousTarget.tokenFile) &&
+    (value.fence === undefined || object(value.fence) && exactKeys(value.fence, ["sessionId", "generation", "status"]) &&
+      value.fence.sessionId === target.sessionId && Number.isSafeInteger(value.fence.generation) &&
+      (value.fence.generation as number) >= 0 && ["open", "holding", "held"].includes(value.fence.status as string)) &&
+    (!["held", "exit-requested", "released"].includes(value.phase as string) ||
+      object(value.fence) && value.fence.status === (value.phase === "released" ? "open" : "held")) &&
+    (value.continuation === undefined || validRestartContinuation(value.continuation, target, intent)) &&
+    (value.message === undefined || typeof value.message === "string");
+}
+export function validRestartContinuation(value: unknown, target: OmpTarget, intent: LeadRestartIntent): value is LeadRestartContinuation {
+  return object(value) && exactKeys(value, ["operationId", "authorizationHash", "target", "textHash", "receipt"]) &&
+    value.operationId === intent.operationId && value.authorizationHash === intent.authorizationHash && hash(value.textHash) &&
+    validRestartIntent({ ...intent, previousTarget: value.target }) && object(value.target) &&
+    sameIdentity(value.target as OmpTarget, target) && value.target.socketPath === target.socketPath && value.target.tokenFile === target.tokenFile &&
+    validReceipt(value.receipt, target, leadRestartContinuationId(intent.operationId), value.textHash);
 }
 export function parseRequest(value: unknown): OmpRequest {
   if (!object(value) || !exactKeys(value, ["protocol", "id", "token", "target", "method", "params"]) || value.protocol !== 1 ||
     !nonempty(value.id) || !nonempty(value.token) || !validIdentity(value.target) || !object(value.params) ||
-    !["inspect", "failures", "input", "operation", "hold", "release", "stop", "interactions", "interaction-respond", "interaction-response-status"].includes(value.method as string)) throw new OmpError("invalid-request", "Invalid OMP request", false);
+    !["inspect", "failures", "input", "operation", "hold", "release", "stop", "interactions", "interaction-respond", "interaction-response-status",
+      "restart-prepare", "restart-inspect", "restart-commit", "restart-release", "restart-stage"].includes(value.method as string)) throw new OmpError("invalid-request", "Invalid OMP request", false);
   const p = value.params, method = value.method;
+  if (method === "restart-stage") {
+    const { text, payloadHash: digest, ...intent } = p;
+    if (!validRestartIntent(intent) || !intent.previousTarget || typeof text !== "string" || text.length === 0 || payloadHash(text) !== digest)
+      throw new OmpError("invalid-params", "Invalid restart continuation", false);
+    return value as OmpRequest;
+  }
+  if ((method as string).startsWith("restart-")) {
+    if (!validRestartIntent(p) || (method === "restart-release" && !p.previousTarget)) throw new OmpError("invalid-params", "Invalid restart intent", false);
+    return value as OmpRequest;
+  }
   const fields = method === "inspect" || method === "interactions" ? [] : method === "interaction-respond" ? ["operationId", "requestId", "response"] : method === "interaction-response-status" ? ["operationId"] : method === "failures" ? ["after", "limit"] : method === "input" ? ["operationId", "text", "payloadHash"] : method === "operation" ? ["operationId", "payloadHash"] : method === "stop" ? ["operationId"] : ["operationId", "origin"];
   if (!exactKeys(p, fields) || (!["inspect", "interactions", "failures"].includes(method as string) && !nonempty(p.operationId)) ||
     (method === "interaction-respond" && (!nonempty(p.requestId) || !validInteractionResponse(p.response))) ||

@@ -3,7 +3,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { mkdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
-import { OmpError, assertIdentity, exactKeys, nonempty, object, payloadHash, type OmpExtensionBootstrap, type OmpTarget } from "./contract.ts";
+import { OmpError, assertIdentity, exactKeys, nonempty, object, payloadHash, validRestartIntent, validLaunchMetadata, sameLaunchMetadata, type OmpExtensionBootstrap, type OmpTarget } from "./contract.ts";
 import { parseOmpVersion } from "./launcher.ts";
 import { durableJson, privateDirectory, readPrivateJson } from "./receipts.ts";
 import { OmpControlServer, type OmpContext, type OmpNativeApi } from "./server.ts";
@@ -19,7 +19,7 @@ export type OmpExtensionOptions = {
   herdrPane?: (paneId: string) => Promise<{ pane_id: string; terminal_id: string; cwd: string; agent?: string; agent_session?: { kind: string; value: string; agent: string; source: string } }>;
 };
 export function parseBootstrap(value: unknown): OmpExtensionBootstrap {
-  if (!object(value) || !exactKeys(value, ["protocol", "registryDir", "role", "laneKey", "expectedCwd", "expectedPaneId", "expectedTerminalId"], ["expectedSessionId", "expectedSessionFile", "service"]) || value.protocol !== 1 ||
+  if (!object(value) || !exactKeys(value, ["protocol", "registryDir", "role", "laneKey", "expectedCwd", "expectedPaneId", "expectedTerminalId"], ["expectedSessionId", "expectedSessionFile", "service", "restart"]) || value.protocol !== 1 ||
     !["attached-lead", "managed-lane"].includes(value.role as string) || !["registryDir", "laneKey", "expectedCwd", "expectedPaneId", "expectedTerminalId"].every(key => nonempty(value[key])) ||
     !isAbsolute(value.registryDir as string) || !isAbsolute(value.expectedCwd as string) ||
     (value.expectedSessionId !== undefined && !nonempty(value.expectedSessionId)) || (value.expectedSessionFile !== undefined && (!nonempty(value.expectedSessionFile) || !isAbsolute(value.expectedSessionFile))) ||
@@ -28,19 +28,27 @@ export function parseBootstrap(value: unknown): OmpExtensionBootstrap {
     const s = value.service;
     if (!object(s) || !exactKeys(s, ["contextFile", "configFile", "stateDir", "cliPath", "bunBinary"]) || !Object.values(s).every(path => nonempty(path) && isAbsolute(path))) throw new OmpError("invalid-bootstrap", "Managed OMP requires explicit scoped service paths", false);
   }
+  if (value.restart !== undefined && (!validRestartIntent(value.restart) || !value.restart.previousTarget ||
+    value.role !== "attached-lead" || value.expectedSessionId !== value.restart.previousTarget.sessionId ||
+    value.expectedSessionFile !== value.restart.previousTarget.sessionFile ||
+    value.expectedPaneId !== value.restart.previousTarget.paneId || value.expectedTerminalId !== value.restart.previousTarget.terminalId ||
+    value.expectedCwd !== value.restart.previousTarget.cwd)) throw new OmpError("invalid-restart-bootstrap", "Restart bootstrap must pin exact previous native session", false);
   return value as OmpExtensionBootstrap;
 }
 
 /** Explicit opt-in only. Uses a small structural boundary to keep native OMP out of Iyen's install. */
 export async function registerOmpExtension(native: unknown, options: OmpExtensionOptions = {}): Promise<void> {
   const env = options.env ?? process.env;
-  if (!env.IYEN_OMP_BOOTSTRAP && !env.IYEN_OMP_REGISTRY_DIR) return;
-  const bootstrap = env.IYEN_OMP_BOOTSTRAP ? parseBootstrap(readPrivateJson(env.IYEN_OMP_BOOTSTRAP)) : undefined;
+  if (!object(native) || typeof native.on !== "function" || typeof native.sendUserMessage !== "function" || typeof native.getThinkingLevel !== "function" || typeof native.registerTool !== "function") throw new OmpError("sdk-incompatible", "OMP extension SDK incompatible", false);
+  const api = native as unknown as OmpExtensionApi;
+  // Native --iyen-omp-bootstrap is extracted BEFORE extension factory loading.
+  // Extension getFlag() is populated later and cannot configure this factory.
+  const bootstrapPath = env.IYEN_OMP_BOOTSTRAP;
+  if (!bootstrapPath && !env.IYEN_OMP_REGISTRY_DIR) return;
+  const bootstrap = bootstrapPath ? parseBootstrap(readPrivateJson(bootstrapPath)) : undefined;
   const registryDir = bootstrap?.registryDir ?? env.IYEN_OMP_REGISTRY_DIR!;
   if (!isAbsolute(registryDir)) throw new OmpError("invalid-registry", "OMP registry must be an explicit absolute path", false);
   privateDirectory(registryDir);
-  if (!object(native) || typeof native.on !== "function" || typeof native.sendUserMessage !== "function" || typeof native.getThinkingLevel !== "function" || typeof native.registerTool !== "function") throw new OmpError("sdk-incompatible", "OMP extension SDK incompatible", false);
-  const api = native as unknown as OmpExtensionApi;
   // OMP injects its own SDK exports as api.pi; do not resolve a second runtime dependency.
   const version = parseOmpVersion(options.runtimeVersion ?? (object(native.pi) ? native.pi.VERSION as string : ""));
   const herdrPane = options.herdrPane ?? (async (paneId: string) => {
@@ -100,6 +108,7 @@ export async function registerOmpExtension(native: unknown, options: OmpExtensio
     const sessionDirectory = join(sessionsRoot, payloadHash([sessionId, sessionFile, target.role, target.laneKey].join("\0")));
     const ownedController = new OmpControlServer(target, token, sessionDirectory, () => current!, api, { timeoutMs: options.timeoutMs,
       startHeld: !!bootstrap?.expectedSessionId,
+      restart: bootstrap?.restart,
       verifyAssociation,
     });
     controller = ownedController;
@@ -109,6 +118,23 @@ export async function registerOmpExtension(native: unknown, options: OmpExtensio
   };
   const scheduleStart = (ctx: OmpContext) => {
     cleanup(); current = ctx;
+    if (bootstrap?.restart) {
+      const core = ctx.executionHold;
+      if (!core?.tryHoldForRestart || core.isRestartStartupHeld?.() !== true)
+        throw new OmpError("restart-fresh-native-required", "Restart bootstrap requires a fresh --start-held native process", false);
+      const metadata = core.getLaunchMetadata?.();
+      if (!validLaunchMetadata(metadata) || metadata.agentDir !== metadata.settingsHome ||
+        !sameLaunchMetadata(metadata, bootstrap.restart.launchMetadata))
+        throw new OmpError("restart-launch-mismatch", "Fresh native launch profile differs from original borrowed lead", false);
+      // Adopt the constructor-time fence before disk/Herdr awaits in start().
+      const latch = core.tryHoldForRestart(bootstrap.restart.operationId, bootstrap.restart.authorizationHash);
+      lifecycle = lifecycle.catch(() => {}).then(async () => {
+        const held = await latch;
+        if (held?.status !== "held") throw new OmpError("restart-startup-busy", "Fresh startup did not acquire idle latch", false);
+        await start(ctx);
+      });
+      return lifecycle;
+    }
     lifecycle = lifecycle.catch(() => {}).then(() => start(ctx)); return lifecycle;
   };
   // Do not await registry readiness from SessionStart: the native Herdr hook may run later.
