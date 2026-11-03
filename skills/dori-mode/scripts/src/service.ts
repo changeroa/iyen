@@ -1080,6 +1080,7 @@ export class DoriService {
     if (action === "approval-list") return this.approvals();
     if (action === "approval-respond") {
       if (caller.role !== "admin") throw new Error("Approval requires the authenticated owner control channel");
+      if (typeof args.id === "string" && args.id.startsWith("native-blocked:")) throw new Error("Native owner/thread binding unresolved; this diagnostic is not an answer token");
       if (typeof args.id === "string" && args.id.startsWith("iyen-")) {
         if (typeof args.operationId !== "string" || !args.operationId) throw new Error("Native approval response requires stable --operation-id");
         return this.nativeInteractions.respondOperator(args.id, args.response, args.operationId);
@@ -1190,8 +1191,8 @@ export class DoriService {
     if (action === "tick") { await this.tick(); return { accepted: true }; }
     throw new Error(`Unknown service action: ${action}`);
   }
-  async approvals(): Promise<{ id: string; key: string; requestId: string; request: unknown }[]> {
-    const result: { id: string; key: string; requestId: string; request: unknown }[] = [];
+  async approvals(): Promise<{ id: string; key: string; requestId: string; request: unknown; relayBlocked?: string }[]> {
+    const result: { id: string; key: string; requestId: string; request: unknown; relayBlocked?: string }[] = [];
     for (const lane of await this.registry.open()) {
       if (lane.runtime?.kind === "omp") continue;
       if (!lane.runtime?.threadId || lane.runtime.backend === "external-current-session") continue;
@@ -1203,6 +1204,8 @@ export class DoriService {
     }
     await this.nativeInteractions.poll();
     result.push(...this.nativeInteractions.list().map(row => ({ id: row.token, key: row.key, requestId: row.request.id, request: row.request })));
+    result.push(...this.nativeInteractions.unrouted().map(row => ({ id: `native-blocked:${row.key}:${row.request.id}`,
+      key: row.key, requestId: row.request.id, request: row.request, relayBlocked: row.reason })));
     return result;
   }
   notifyFailures(): Promise<void> { return this.withIntake(() => this.notifyFailuresScoped()); }

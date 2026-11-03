@@ -31,6 +31,7 @@ export class NativeInteractionRelay {
   private readonly path: string;
   private readonly queue = new SerialQueue();
   private state: RelayState;
+  private blocked: { key: string; request: NativeUserInteraction; reason: string }[] = [];
   constructor(private readonly deps: InteractionRelayDeps) {
     this.path = join(deps.stateDir, "native-interactions.json");
     this.state = existsSync(this.path) ? readJson<RelayState>(this.path) : { version: 1, requests: {}, responses: {} };
@@ -132,6 +133,7 @@ export class NativeInteractionRelay {
   private async pollScoped(): Promise<void> {
     const lanes = await this.deps.lanes();
     await this.reconcile(lanes);
+    const blocked: typeof this.blocked = [];
     for (const row of Object.values(this.state.requests)) {
       if (row.state === "open" && (row.request.expiresAt && Date.parse(row.request.expiresAt) <= Date.now() ||
         !lanes.some(lane => lane.key === row.key && this.matches(row, lane)))) this.request({ ...row, state: "stale" });
@@ -161,6 +163,7 @@ export class NativeInteractionRelay {
         }
         const owner = this.owner(lane, request, lanes);
         if (!owner) {
+          blocked.push({ key: lane.key, request, reason: "authenticated-owner-thread-unresolved" });
           if (prior?.state === "open") this.request({ ...prior, state: "stale" });
           continue;
         }
@@ -170,8 +173,10 @@ export class NativeInteractionRelay {
         await this.deps.post(`native-interaction:${token}`, row.thread, this.render(row), row.key).catch(() => {});
       }
     }
+    this.blocked = blocked;
   }
   list(): RelayedInteraction[] { return Object.values(this.state.requests).filter(r => r.state === "open"); }
+  unrouted(): readonly { key: string; request: NativeUserInteraction; reason: string }[] { return this.blocked; }
   private parse(request: NativeUserInteraction, text: string): NativeInteractionResponse {
     let response: unknown;
     const freeText = request.kind === "input" || request.kind === "editor";

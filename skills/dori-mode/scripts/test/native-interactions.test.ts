@@ -635,3 +635,19 @@ test("owner and operator answers cannot cross a native execution hold and a fres
     expect(h.results.get("ask-1")).toEqual({ kind: "submit", answers: [{ id: "strategy", selectedOptions: ["단순 구현"] }] });
   } finally { h.cleanup(); }
 });
+
+test("unrouted native questions remain visible to scoped approval inspection but are not answerable tokens", async () => {
+  const h = await fixture(true);
+  try {
+    h.config.ingress[0]!.owners.push("second-owner");
+    const request = h.ask("unrouted-question", { sourceEntryId: "launch-entry", sourceOperationHash: payloadHash("launch") });
+    await h.publish([request]);
+    const pending = await h.service().approvals();
+    expect(pending).toEqual([{ id: "native-blocked:worker:unrouted-question", key: "worker", requestId: request.id,
+      request, relayBlocked: "authenticated-owner-thread-unresolved" }]);
+    expect(h.notifications).toEqual([]);
+    await expect(h.service().handle("approval-respond", { id: pending[0]!.id, response: { kind: "submit", choice: "once" },
+      operationId: "not-a-real-answer-token" }, { role: "admin" })).rejects.toThrow();
+    expect(h.attempts()).toBe(0);
+  } finally { h.cleanup(); }
+});

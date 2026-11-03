@@ -140,6 +140,10 @@ Native owner/operator answers cannot cross a paused/held or dispatch-blocked lan
 Resume/reconcile first, then send a fresh answer; a rejected old source is not replayed.
 
 `approval list` includes real native payloads instead of an OMP TUI placeholder.
+Unrouted native questions are also visible locally with `relayBlocked` and a
+`native-blocked:…` diagnostic ID. That ID is not an answer token and cannot be used
+to bypass missing authenticated owner/thread binding; no question is sent externally
+until that binding is established.
 For authenticated operator tooling, `approval respond TOKEN --response-file FILE
 --operation-id SOURCE_MESSAGE_ID` resolves the same native dialog. Preserve that
 operation identity when reconciling. Codex approval commands are unchanged.
