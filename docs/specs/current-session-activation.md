@@ -138,6 +138,9 @@ and receive thread feedback, rather than restarting the ingress producer. Replay
 or edited source IDs cannot become a fresh answer when a later question opens.
 Native owner/operator answers cannot cross a paused/held or dispatch-blocked lane.
 Resume/reconcile first, then send a fresh answer; a rejected old source is not replayed.
+OMP lanes are not automatically nudged for periodic progress merely because they
+are idle or old. Explicit reports still follow the configured durable report path.
+The existing Codex freshness policy is unchanged.
 
 `approval list` includes real native payloads instead of an OMP TUI placeholder.
 Unrouted native questions are also visible locally with `relayBlocked` and a

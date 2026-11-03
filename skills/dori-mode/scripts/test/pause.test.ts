@@ -29,3 +29,13 @@ test("pause cannot stop a closing lane and resume cannot wake a working lane", a
  expect((await pauseLane(d,{ ...lane, status: "done-claimed" },"wait")).code).toBe(2);
  expect((await resumeLane(d,lane,"go")).code).toBe(2);
 });
+
+for (const kind of ["omp", "codex"] as const) test(`${kind} idle freshness preserves the runtime-specific automatic progress policy`, async () => {
+ const w = newWorld(), clock = fakeClock(10000000), d = depsFor(w,clock,state.dir);
+ await d.registry.write({ ...lane, runtime: { kind, backend: "herdr-tui", threadId: "native-session", state: "idle",
+   hostInstanceId: "host", generation: 1, binaryVersion: "18.15.0" } });
+ const acts = await freshnessTick(d,"/home/test");
+ expect(w.runtimeCalls?.length ?? 0).toBe(kind === "omp" ? 0 : 1);
+ expect((await d.registry.read(lane.key))?.lastNudgeAt).toBe(kind === "omp" ? undefined : clock.at);
+ expect(acts.map(act => act.kind)).toEqual(kind === "omp" ? [] : ["nudged"]);
+});
