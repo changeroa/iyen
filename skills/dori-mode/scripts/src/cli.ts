@@ -64,6 +64,7 @@ const scopedHelp = `iyen — scoped service commands
   recover KEY | reopen KEY [--text-file FILE]
   adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS --transfer-confirmed
   sync [--write] | approval list | mail list
+  mail resolve ID --box inbox --state sent --evidence TEXT
   work start --title T [--tag TAG ...] [--thread REF] [--operation-id UUID]
   work stop ID | work similar [--title T] [--tag TAG ...]
 
