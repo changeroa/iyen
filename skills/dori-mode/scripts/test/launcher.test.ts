@@ -220,7 +220,7 @@ async function codexProtocolFixture() {
     if (args[1] === "pane" && args[2] === "get") return ok({ pane });
     if (args[1] === "pane" && args[2] === "process-info") return ok({ process_info: processInfo });
     if (args[1] === "agent" && args[2] === "prompt") { submittedText = args[4]!; return { code: 124, out: "", err: "prompt receipt lost" }; }
-    if (args[1] === "pane" && args[2] === "report-agent-session") { if (reportAccepted) agent.agent_session = { agent: "codex", kind: "id", value: args.at(-1) }; if (reportLost) return { code: 124, out: "", err: "report response lost" }; return ok(); }
+    if (args[1] === "pane" && args[2] === "report-agent-session") { if (reportAccepted && args[args.indexOf("--source") + 1] === "herdr:codex") agent.agent_session = { agent: "codex", kind: "id", value: args.at(-1) }; if (reportLost) return { code: 124, out: "", err: "report response lost" }; return ok(); }
     throw new Error(`unexpected command ${args.slice(0,3)}`);
   };
   return { s, row, runner, calls, reads, agent, thread, foreground, pane, processInfo, set hookOnResume(value: boolean) { hookOnResume = value; }, set reportLost(value: boolean) { reportLost = value; }, set reportAccepted(value: boolean) { reportAccepted = value; }, set publish(value: boolean) { publish = value; }, get resumed() { return resumed; }, close: async () => { await server.stop(true); rmSync(socketPath, { force: true }); } };
