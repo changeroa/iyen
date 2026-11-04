@@ -196,12 +196,28 @@ mail and old attachment histories stay untouched. The launcher never selects
 `--last` or an arbitrary idle agent, clears an owner hold, or posts an activation
 message to a messenger.
 
+When `iyen omp` resumes an exited OMP from the original interactive shell, it
+starts OMP as an inherited-terminal child and waits until that TUI exits. Only
+the native child reads terminal input. The launcher first proves its foreground
+job, exact owned lock helpers, and authenticated launcher-owned service are the
+only processes directly under that shell job. Helpers and owned services run in
+separate process groups;
+background or suspended processes block startup. A different target pane still
+uses Herdr's shell-prompt startup path. No pane move or ownership guard bypass
+is needed for same-shell resume.
+
 `--json` includes the scoped bridge and native identity for automation; ordinary
-output only shows the session and pane. A verified bootstrap receipt confirms
+output only shows the session and pane. With an inherited-terminal OMP child,
+the JSON result is printed after the TUI exits so it does not interrupt the TUI;
+use a separate shell for immediate machine-readable launcher output.
+A verified bootstrap receipt confirms
 native delivery, not that the model has finished reading its instructions.
 Durable intent is kept in `stateDir/launcher/launch.json` and service startup
 intent in `stateDir/launcher-service.json`. After an uncertain native start or
 prompt, repeat the same command to reconcile receipts without replay. An
+explicit structured Herdr refusal before dispatch is recorded separately and
+can be retried; timeouts, input failures, and lost responses retain their exact
+startup intent and diagnostics without relaunching. An
 uncertain service startup needs supervisor/process inspection before clearing
 its startup intent; do not delete journals to force an unverified second start.
 The launcher is operator-only and refuses scoped `DORI_CONTEXT`/lane credentials.

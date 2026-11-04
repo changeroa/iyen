@@ -9,8 +9,9 @@ import { connectObserver, readLoadedThreads, readThread, receipt } from "../runt
 import { connectOmp } from "../runtime/omp/client.ts";
 import { discoverOmpSafe, findOmpTarget, ompVersionMatches } from "../runtime/omp-integration.ts";
 import { prepareOmpLaunch } from "../runtime/omp/launcher.ts";
+import { callerOwnsTerminal, type TerminalLaunch } from "./terminal.ts";
 export type Identity = { threadId: string; pane: string; cwd: string; terminalId?: string; sessionFile?: string };
-export type LaunchRecord = { version: 1; operationId: string; configPath: string; phase: "prepared" | "native-starting" | "native-ready" | "attached" | "ready"; pane?: string; terminalId?: string; cwd: string; identity?: Identity; model: string; effort: string; nativeProcess?: { pid: number; pane: string; terminalId: string; verified?: boolean }; handshakeAttempted?: boolean; initialize?: boolean; attachmentRequest?: { action: "lead-activate" | "lead-reconnect"; args: Record<string, unknown>; completed?: boolean }; bootstrap?: { operationId: string; text: string; phase: "sending" | "received" }; attachment?: { instance: string; generation: number } };
+export type LaunchRecord = { version: 1; operationId: string; configPath: string; phase: "prepared" | "native-refused" | "native-starting" | "native-ready" | "attached" | "ready"; pane?: string; terminalId?: string; cwd: string; identity?: Identity; model: string; effort: string; nativeProcess?: { pid: number; pane: string; terminalId: string; verified?: boolean }; startResult?: { code: number; out: string; err: string }; terminalChildPid?: number; handshakeAttempted?: boolean; initialize?: boolean; attachmentRequest?: { action: "lead-activate" | "lead-reconnect"; args: Record<string, unknown>; completed?: boolean }; bootstrap?: { operationId: string; text: string; phase: "sending" | "received" }; attachment?: { instance: string; generation: number } };
 export const agentName = (operationId: string) => `iyen-${operationId.replaceAll("-", "").slice(0, 24)}`;
 export async function herdr(runner: Runner, args: string[], timeoutMs = 30000): Promise<any> {
   const result = await runner(["herdr", ...args], { timeoutMs });
@@ -69,7 +70,7 @@ export async function selectPane(config: DoriConfig, saved: Identity | undefined
   if (!pane?.pane_id || !pane.terminal_id) throw new Error("Created pane identity unavailable; inspect Herdr before retry");
   record.pane = pane.pane_id; record.terminalId = pane.terminal_id; persist(); return { pane, occupied: false };
 }
-export async function nativeLead(config: DoriConfig, saved: Identity | undefined, record: LaunchRecord, occupied: boolean, runner: Runner, persist: () => void): Promise<Identity> {
+export async function nativeLead(config: DoriConfig, saved: Identity | undefined, record: LaunchRecord, occupied: boolean, runner: Runner, persist: () => void, terminal?: TerminalLaunch): Promise<Identity> {
   const kind = config.runtime.kind, timeout = config.runtime.startupTimeoutMs, deadline = Date.now() + timeout;
   if (kind === "omp") {
     const omp = config.runtime.omp!, bootstrapFile = join(config.stateDir, "launcher", `${record.operationId}.omp.json`);
@@ -90,12 +91,33 @@ export async function nativeLead(config: DoriConfig, saved: Identity | undefined
       atomicJson(bootstrapFile, { protocol: 1, role: "attached-lead", laneKey: "lead", registryDir: omp.registryDir, expectedCwd: record.cwd, expectedPaneId: record.pane, expectedTerminalId: record.terminalId,
         ...(saved ? { expectedSessionId: saved.threadId, expectedSessionFile: saved.sessionFile } : {}) });
       const spec = prepareOmpLaunch({ binary: config.runtime.binary, registryDir: omp.registryDir, bootstrapFile, extensionPath: omp.extensionPath, cwd: record.cwd, provider: omp.provider, model: record.model, effort: record.effort, approvalMode: omp.approvalMode, resumeSessionFile: saved?.sessionFile });
-      record.phase = "native-starting"; persist();
-      // A nonzero start result is uncertain; only discovery below can settle it.
-      await runner(["herdr", "agent", "start", agentName(record.operationId), "--kind", "omp", "--pane", record.pane!, "--timeout", String(timeout), "--", "--agent-dir", config.runtime.settingsHome!, "--cwd", record.cwd, "--iyen-omp-bootstrap", bootstrapFile, ...spec.argv.slice(1)], { timeoutMs: timeout + 5000 });
+      const sameTerminal = terminal && await callerOwnsTerminal(record.pane!, runner, terminal);
+      const argv = ["--agent-dir", config.runtime.settingsHome!, "--cwd", record.cwd, "--iyen-omp-bootstrap", bootstrapFile, ...spec.argv.slice(1)];
+      record.phase = "native-starting"; delete record.startResult; persist();
+      if (sameTerminal) {
+        // The CLI keeps the shell job alive; no pane input or shell command is injected.
+        let child;
+        try { child = terminal.start([config.runtime.binary, ...argv], record.cwd); }
+        catch (error) {
+          record.phase = "native-refused";
+          record.startResult = { code: 127, out: "", err: error instanceof Error ? error.message : "Native spawn failed before child creation" }; persist();
+          throw new Error(`OMP startup refused before child creation: ${record.startResult.err}`);
+        }
+        record.terminalChildPid = child.pid; persist();
+      } else {
+        const result = await runner(["herdr", "agent", "start", agentName(record.operationId), "--kind", "omp", "--pane", record.pane!, "--timeout", String(timeout), "--", ...argv], { timeoutMs: timeout + 5000 });
+        record.startResult = result; persist();
+        // Only structured pre-dispatch refusal codes prove that no command was sent.
+        let error: any;
+        try { error = JSON.parse(result.out)?.error; } catch {}
+        if (result.code !== 0 && ["agent_pane_busy", "agent_pane_not_found", "agent_name_taken", "invalid_agent_argument", "invalid_agent_timeout", "invalid_agent_name", "unsupported_agent_kind"].includes(error?.code)) {
+          record.phase = "native-refused"; persist();
+          throw new Error(`OMP startup refused before dispatch (${error.code}): ${error.message ?? "inspect the target pane and retry"}`);
+        }
+      }
     }
     do { const target = await inspect(); if (target) return target; await Bun.sleep(100); } while (Date.now() < deadline);
-    throw new Error("OMP startup outcome unknown; exact launch intent retained, retry to reconcile without relaunch");
+    throw new Error(`OMP startup outcome unknown; exact launch intent retained, retry to reconcile without relaunch${record.startResult ? ` (Herdr exit ${record.startResult.code}: ${record.startResult.err || record.startResult.out})` : ""}`);
   }
   const daemon = await discoverExternal(runner, config.runtime), observer = await connectObserver(daemon.socketPath, config.runtime.rpcTimeoutMs);
   try {
