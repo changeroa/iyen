@@ -199,7 +199,10 @@ async function codexProtocolFixture() {
   const s = selection(); s.config.runtime.binary = process.execPath; s.config.runtime.startupTimeoutMs = 50;
   const socketPath = serviceSocket(s.config.stateDir).replace("service.sock", "codex.sock");
   const row = record(s); row.pane = "p1"; row.terminalId = "t1";
-  const calls: string[][] = [], reads: string[] = []; let submittedText = "", publish = true, resumed: string | undefined;
+  const calls: string[][] = [], reads: string[] = []; let submittedText = "", publish = true, resumed: string | undefined, hookOnResume = true, reportLost = false, reportAccepted = true;
+  const foreground: any = { pid: 321, name: "codex", cwd: row.cwd, argv: [] };
+  const pane = { pane_id: "p1", terminal_id: "t1", cwd: row.cwd, agent: "codex" };
+  const processInfo: any = { pane_id: "p1", foreground_process_group_id: 321, shell_pid: 123, foreground_processes: [foreground] };
   const agent: any = { agent: "codex", pane_id: "p1", name: agentName(row.operationId), agent_status: "idle" };
   const thread = { id: uuid, cwd: row.cwd, model: row.model, reasoningEffort: row.effort, status: { type: "idle" } };
   const server = Bun.serve({ unix: socketPath, fetch(request, server) { if (server.upgrade(request)) return; return new Response(null, { status: 400 }); }, websocket: { message(ws, raw) {
@@ -210,13 +213,17 @@ async function codexProtocolFixture() {
   const runner: Runner = async args => {
     calls.push([...args]);
     if (args[0] === process.execPath) return args[1] === "queue" ? { code: 0, out: "--thread ID --message TEXT", err: "" } : { code: 0, out: JSON.stringify({ status: "running", socketPath, cliVersion: "0.163.0", appServerVersion: "0.163.0" }), err: "" };
-    if (args[1] === "agent" && args[2] === "start") { const native = args.slice(args.indexOf("--") + 1); if (native[0] === "resume") { resumed = native[1]; agent.agent_session = { agent: "codex", kind: "id", value: resumed }; } return ok({ agent }); }
+    if (args[1] === "agent" && args[2] === "start") { const native = args.slice(args.indexOf("--") + 1); if (native[0] === "resume") { resumed = native[1]; foreground.argv = ["codex", ...native]; if (hookOnResume) agent.agent_session = { agent: "codex", kind: "id", value: resumed }; } return ok({ agent }); }
     if (args[1] === "agent" && args[2] === "get") return ok({ agent });
+    if (args[1] === "agent" && args[2] === "list") return ok({ agents: [agent] });
+    if (args[1] === "pane" && args[2] === "list") return ok({ panes: [pane] });
+    if (args[1] === "pane" && args[2] === "get") return ok({ pane });
+    if (args[1] === "pane" && args[2] === "process-info") return ok({ process_info: processInfo });
     if (args[1] === "agent" && args[2] === "prompt") { submittedText = args[4]!; return { code: 124, out: "", err: "prompt receipt lost" }; }
-    if (args[1] === "pane" && args[2] === "report-agent-session") { agent.agent_session = { agent: "codex", kind: "id", value: args.at(-1) }; return ok(); }
+    if (args[1] === "pane" && args[2] === "report-agent-session") { if (reportAccepted) agent.agent_session = { agent: "codex", kind: "id", value: args.at(-1) }; if (reportLost) return { code: 124, out: "", err: "report response lost" }; return ok(); }
     throw new Error(`unexpected command ${args.slice(0,3)}`);
   };
-  return { s, row, runner, calls, reads, agent, thread, set publish(value: boolean) { publish = value; }, get resumed() { return resumed; }, close: async () => { await server.stop(true); rmSync(socketPath, { force: true }); } };
+  return { s, row, runner, calls, reads, agent, thread, foreground, pane, processInfo, set hookOnResume(value: boolean) { hookOnResume = value; }, set reportLost(value: boolean) { reportLost = value; }, set reportAccepted(value: boolean) { reportAccepted = value; }, set publish(value: boolean) { publish = value; }, get resumed() { return resumed; }, close: async () => { await server.stop(true); rmSync(socketPath, { force: true }); } };
 }
 test("native Codex lost prompt response reconciles exact observer receipt once", async () => {
   const h = await codexProtocolFixture();
@@ -289,4 +296,76 @@ test("same profile through alternate registries shares state launch fence", asyn
   let active = 0, max = 0; h.deps.preflight = async () => { max = Math.max(max, ++active); await Bun.sleep(30); active--; };
   await Promise.all([launch("codex", { registry: s.registryPath }, h.deps), launch("codex", { registry: otherRegistry }, h.deps)]);
   expect(max).toBe(1); expect(h.prompts).toHaveLength(1);
+});
+
+test("unhooked exact native Codex resume proves foreground argv and observer without prompt", async () => {
+  const h = await codexProtocolFixture(); h.hookOnResume = false;
+  try {
+    const result = await nativeLead(h.s.config, { threadId: uuid, pane: "old", cwd: h.row.cwd }, h.row, false, h.runner, () => {});
+    expect(result.threadId).toBe(uuid); expect(h.row.nativeProcess).toMatchObject({ pid: 321, verified: true });
+    expect(h.calls.filter(a => a[2] === "prompt")).toHaveLength(0); expect(h.calls.filter(a => a[2] === "report-agent-session")).toHaveLength(1);
+  } finally { await h.close(); }
+});
+test("unhooked resumed own startup retries lost report without new TUI or prompt", async () => {
+  const h = await codexProtocolFixture(); h.hookOnResume = false; h.reportLost = true; h.reportAccepted = false;
+  const saved = { threadId: uuid, pane: "old", cwd: h.row.cwd };
+  try {
+    await expect(nativeLead(h.s.config, saved, h.row, false, h.runner, () => {})).rejects.toThrow("unavailable");
+    expect((await selectPane(h.s.config, saved, h.row, h.runner, () => {})).occupied).toBe(true);
+    h.reportLost = false; h.reportAccepted = true;
+    expect((await nativeLead(h.s.config, saved, h.row, true, h.runner, () => {})).threadId).toBe(uuid);
+    expect(h.calls.filter(a => a[2] === "start")).toHaveLength(1); expect(h.calls.filter(a => a[2] === "prompt")).toHaveLength(0);
+  } finally { await h.close(); }
+});
+test("post-report process replacement remains refused even with matching reported hook on retry", async () => {
+  const h = await codexProtocolFixture(); h.hookOnResume = false;
+  const saved = { threadId: uuid, pane: "old", cwd: h.row.cwd }; const base = h.runner;
+  const runner: Runner = async args => { const result = await base(args); if (args[2] === "report-agent-session") { h.foreground.pid = 999; h.processInfo.foreground_process_group_id = 999; } return result; };
+  try {
+    await expect(nativeLead(h.s.config, saved, h.row, false, runner, () => {})).rejects.toThrow("replaced");
+    expect(h.agent.agent_session.value).toBe(uuid); expect(h.row.nativeProcess?.verified).not.toBe(true);
+    await expect(nativeLead(h.s.config, saved, h.row, true, runner, () => {})).rejects.toThrow("replaced");
+    expect(h.calls.filter(a => a[2] === "report-agent-session")).toHaveLength(1); expect(h.calls.filter(a => a[2] === "start")).toHaveLength(1); expect(h.calls.filter(a => a[2] === "prompt")).toHaveLength(0);
+  } finally { await h.close(); }
+});
+test.each(["uuid", "remote", "model", "effort", "cwd", "multiple", "terminal", "name", "observer", "hook"])("unhooked resume rejects %s mismatch before reporting identity", async kind => {
+  const h = await codexProtocolFixture(); h.hookOnResume = false; const base = h.runner;
+  const runner: Runner = async args => {
+    const result = await base(args);
+    if (args[2] === "start") {
+      const index = kind === "uuid" ? 2 : kind === "remote" ? h.foreground.argv.indexOf("--remote") + 1 : kind === "model" ? h.foreground.argv.indexOf("--model") + 1 : kind === "effort" ? h.foreground.argv.indexOf("-c") + 1 : -1;
+      if (index >= 0) h.foreground.argv[index] = "different";
+      if (kind === "cwd") h.foreground.cwd = "/";
+      if (kind === "multiple") h.processInfo.foreground_processes.push({ ...h.foreground, pid: 322 });
+      if (kind === "terminal") h.pane.terminal_id = "changed";
+      if (kind === "name") h.agent.name = "unrelated";
+      if (kind === "observer") h.thread.model = "different";
+      if (kind === "hook") h.agent.agent_session = { agent: "codex", kind: "id", value: "22222222-2222-4222-8222-222222222222" };
+    }
+    return result;
+  };
+  try {
+    await expect(nativeLead(h.s.config, { threadId: uuid, pane: "old", cwd: h.row.cwd }, h.row, false, runner, () => {})).rejects.toThrow();
+    expect(h.calls.filter(a => a[2] === "report-agent-session")).toHaveLength(0); expect(h.calls.filter(a => a[2] === "prompt")).toHaveLength(0);
+  } finally { await h.close(); }
+});
+test("first reconnect request uses fresh revision after native startup", async () => {
+  const s = selection(), h = harness(s, lead(s, { identityVerified: false, holdReason: "recovery", dispatchBlocked: true })), native = h.deps.nativeLead, call = h.deps.call;
+  h.deps.nativeLead = async (...args) => { const identity = await native(...args); h.current = { ...h.current, revision: 21 }; return identity; };
+  h.deps.call = async (selection, action, args) => { if (action === "lead-reconnect") expect(args.expectedRevision).toBe(21); return call(selection, action, args); };
+  expect((await launchLocked(s, {}, h.deps)).ready).toBe(true);
+});
+test.each(["epoch", "thread", "pause"])("source %s change during native startup refuses first reconnect", async kind => {
+  const s = selection(), h = harness(s, lead(s, { identityVerified: false, holdReason: "recovery", dispatchBlocked: true })), native = h.deps.nativeLead;
+  h.deps.nativeLead = async (...args) => { const identity = await native(...args); h.current = { ...h.current, ...(kind === "pause" ? { status: "paused" } : { runtime: { ...h.current.runtime, ...(kind === "epoch" ? { hostInstanceId: "other" } : { threadId: "other" }) } }) }; return identity; };
+  await expect(launchLocked(s, {}, h.deps)).rejects.toThrow(); expect(h.calls).not.toContain("lead-reconnect");
+});
+test("completed resume process proof survives native-ready retry after later service failure", async () => {
+  const h = await codexProtocolFixture(); h.hookOnResume = false; const saved = { threadId: uuid, pane: "old", cwd: h.row.cwd };
+  try {
+    await nativeLead(h.s.config, saved, h.row, false, h.runner, () => {});
+    expect(h.row.nativeProcess?.verified).toBe(true); h.row.phase = "native-ready";
+    expect((await nativeLead(h.s.config, saved, h.row, true, h.runner, () => {})).threadId).toBe(uuid);
+    expect(h.calls.filter(a => a[2] === "start")).toHaveLength(1); expect(h.calls.filter(a => a[2] === "report-agent-session")).toHaveLength(1); expect(h.calls.filter(a => a[2] === "prompt")).toHaveLength(0);
+  } finally { await h.close(); }
 });

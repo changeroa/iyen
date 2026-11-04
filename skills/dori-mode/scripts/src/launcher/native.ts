@@ -10,7 +10,7 @@ import { connectOmp } from "../runtime/omp/client.ts";
 import { discoverOmpSafe, findOmpTarget, ompVersionMatches } from "../runtime/omp-integration.ts";
 import { prepareOmpLaunch } from "../runtime/omp/launcher.ts";
 export type Identity = { threadId: string; pane: string; cwd: string; terminalId?: string; sessionFile?: string };
-export type LaunchRecord = { version: 1; operationId: string; configPath: string; phase: "prepared" | "native-starting" | "native-ready" | "attached" | "ready"; pane?: string; terminalId?: string; cwd: string; identity?: Identity; model: string; effort: string; handshakeAttempted?: boolean; initialize?: boolean; attachmentRequest?: { action: "lead-activate" | "lead-reconnect"; args: Record<string, unknown>; completed?: boolean }; bootstrap?: { operationId: string; text: string; phase: "sending" | "received" }; attachment?: { instance: string; generation: number } };
+export type LaunchRecord = { version: 1; operationId: string; configPath: string; phase: "prepared" | "native-starting" | "native-ready" | "attached" | "ready"; pane?: string; terminalId?: string; cwd: string; identity?: Identity; model: string; effort: string; nativeProcess?: { pid: number; pane: string; terminalId: string; verified?: boolean }; handshakeAttempted?: boolean; initialize?: boolean; attachmentRequest?: { action: "lead-activate" | "lead-reconnect"; args: Record<string, unknown>; completed?: boolean }; bootstrap?: { operationId: string; text: string; phase: "sending" | "received" }; attachment?: { instance: string; generation: number } };
 export const agentName = (operationId: string) => `iyen-${operationId.replaceAll("-", "").slice(0, 24)}`;
 export async function herdr(runner: Runner, args: string[], timeoutMs = 30000): Promise<any> {
   const result = await runner(["herdr", ...args], { timeoutMs });
@@ -53,8 +53,8 @@ export async function selectPane(config: DoriConfig, saved: Identity | undefined
       if (record.terminalId && pane.terminal_id !== record.terminalId || saved?.terminalId && expectedPane === saved.pane && pane.terminal_id !== saved.terminalId || realpathSync(pane.cwd) !== record.cwd) throw new Error("Saved pane terminal/cwd identity changed; refusing launch");
       const occupant = agents.find(a => a.pane_id === expectedPane);
       if (pane.agent || occupant) {
-        const pendingFresh = !saved && record.phase === "native-starting" && occupant?.agent === config.runtime.kind && occupant.name === agentName(record.operationId);
-        if (!pendingFresh && (!saved || occupant?.agent !== config.runtime.kind || occupant.agent_session?.value !== (saved.sessionFile ?? saved.threadId) || exactOwners.length !== 1)) throw new Error("Saved pane is occupied by a different or unknown conversation");
+        const pendingStartup = record.phase === "native-starting" && occupant?.agent === config.runtime.kind && occupant.name === agentName(record.operationId) && (!saved || config.runtime.kind === "codex" && !occupant.agent_session);
+        if (!pendingStartup && (!saved || occupant?.agent !== config.runtime.kind || occupant.agent_session?.value !== (saved.sessionFile ?? saved.threadId) || exactOwners.length !== 1)) throw new Error("Saved pane is occupied by a different or unknown conversation");
         record.pane = pane.pane_id; record.terminalId = pane.terminal_id; persist(); return { pane, occupied: true };
       }
       record.pane = pane.pane_id; record.terminalId = pane.terminal_id; persist(); return { pane, occupied: false };
@@ -104,12 +104,35 @@ export async function nativeLead(config: DoriConfig, saved: Identity | undefined
       if (!THREAD_UUID.test(id) || thread.id !== id || realpathSync(thread.cwd) !== record.cwd || thread.status.type === "notLoaded" || thread.model !== record.model || thread.reasoningEffort !== record.effort) throw new Error("Exact Codex UUID/cwd/effective model/effort mismatch");
       return { threadId: id, pane: record.pane!, terminalId: record.terminalId!, cwd: record.cwd };
     };
+    const nativeArgs = [
+      ...(saved ? ["resume", saved.threadId] : []), "--remote", `unix://${daemon.socketPath}`, "--cd", record.cwd, "--model", record.model, "-c", `model_reasoning_effort=${JSON.stringify(record.effort)}`,
+      ...(!saved ? ["--sandbox", config.runtime.sandbox, "--ask-for-approval", config.runtime.approvalPolicy] : []), "--no-alt-screen",
+    ];
     if (!occupied && record.phase !== "native-starting") {
       record.phase = "native-starting"; persist();
-      await runner(["herdr", "agent", "start", agentName(record.operationId), "--kind", "codex", "--pane", record.pane!, "--timeout", String(timeout), "--",
-        ...(saved ? ["resume", saved.threadId] : []), "--remote", `unix://${daemon.socketPath}`, "--cd", record.cwd, "--model", record.model, "-c", `model_reasoning_effort=${JSON.stringify(record.effort)}`,
-        ...(!saved ? ["--sandbox", config.runtime.sandbox, "--ask-for-approval", config.runtime.approvalPolicy] : []), "--no-alt-screen"], { timeoutMs: timeout + 5000 });
+      await runner(["herdr", "agent", "start", agentName(record.operationId), "--kind", "codex", "--pane", record.pane!, "--timeout", String(timeout), "--", ...nativeArgs], { timeoutMs: timeout + 5000 });
     }
+    // A shared-daemon resume may never emit a session hook before user input.
+    // Only this journal's exact named launch can use read-only process proof.
+    const proveResumeProcess = async () => {
+      if (!saved || record.phase !== "native-starting" && !(record.nativeProcess && ["native-ready", "attached"].includes(record.phase))) throw new Error("Unassociated Codex resume lacks a recorded launcher start intent");
+      const [{ agent }, { pane }, { process_info: info }] = await Promise.all([
+        herdr(runner, ["agent", "get", record.pane!]),
+        herdr(runner, ["pane", "get", record.pane!]),
+        herdr(runner, ["pane", "process-info", "--pane", record.pane!]),
+      ]);
+      if (agent?.agent !== "codex" || agent.pane_id !== record.pane || agent.name !== agentName(record.operationId) ||
+        agent.agent_session && (agent.agent_session.agent !== "codex" || agent.agent_session.kind !== "id" || agent.agent_session.value !== saved.threadId) ||
+        pane?.pane_id !== record.pane || !record.terminalId || pane.terminal_id !== record.terminalId || realpathSync(pane.cwd) !== record.cwd ||
+        info?.pane_id !== record.pane || !Array.isArray(info.foreground_processes) || info.foreground_processes.length !== 1) throw new Error("Recorded Codex resume pane/process ownership mismatch");
+      const process = info.foreground_processes[0];
+      if (!Number.isSafeInteger(process.pid) || process.pid <= 0 || process.pid !== info.foreground_process_group_id || process.pid === info.shell_pid ||
+        process.name !== "codex" || realpathSync(process.cwd) !== record.cwd || !Array.isArray(process.argv) ||
+        !["codex", daemon.binary].includes(process.argv[0]) || JSON.stringify(process.argv.slice(1)) !== JSON.stringify(nativeArgs)) throw new Error("Exact foreground Codex resume command not proven");
+      const pinned = { pid: process.pid, pane: record.pane!, terminalId: record.terminalId };
+      if (record.nativeProcess && (record.nativeProcess.pid !== pinned.pid || record.nativeProcess.pane !== pinned.pane || record.nativeProcess.terminalId !== pinned.terminalId)) throw new Error("Recorded Codex resume process was replaced");
+      if (!record.nativeProcess) { record.nativeProcess = pinned; persist(); }
+    };
     const text = operationText("Iyen runtime startup handshake. Reply READY only. Do not call tools or begin work; await the next operator message.", `launcher:${record.operationId}`);
     if (!saved && !record.handshakeAttempted) {
       const { agent } = await herdr(runner, ["agent", "get", record.pane!]);
@@ -123,7 +146,18 @@ export async function nativeLead(config: DoriConfig, saved: Identity | undefined
       const hooked = agent.agent_session;
       if (saved) {
         if (hooked?.value && (hooked.agent !== "codex" || hooked.kind !== "id" || hooked.value !== saved.threadId)) throw new Error("Resumed Codex association differs from saved UUID");
-        if (hooked?.value === saved.threadId) return await verify(saved.threadId);
+        if (hooked?.value === saved.threadId) { if (record.nativeProcess && !record.nativeProcess.verified) { await proveResumeProcess(); const identity = await verify(saved.threadId); await proveResumeProcess(); record.nativeProcess.verified = true; persist(); return identity; } return await verify(saved.threadId); }
+        if (hooked) throw new Error("Resumed Codex association is malformed; refusing process fallback");
+        await proveResumeProcess();
+        if (!(await readLoadedThreads(observer)).includes(saved.threadId)) throw new Error("Exact resumed Codex UUID is not loaded in the shared observer");
+        const identity = await verify(saved.threadId);
+        await proveResumeProcess();
+        await herdr(runner, ["pane", "report-agent-session", record.pane!, "--source", "iyen:codex", "--agent", "codex", "--agent-session-id", identity.threadId]);
+        await proveResumeProcess();
+        const { agent: reported } = await herdr(runner, ["agent", "get", record.pane!]);
+        if (reported?.agent !== "codex" || reported.pane_id !== record.pane || reported.agent_session?.agent !== "codex" || reported.agent_session.kind !== "id" || reported.agent_session.value !== saved.threadId) throw new Error("Reported Codex resume association unconfirmed; retry exact process reconciliation");
+        record.nativeProcess!.verified = true; persist();
+        return identity;
       } else {
         const matches: string[] = [];
         for (const id of await readLoadedThreads(observer)) if (await receipt(observer, id, text)) matches.push(id);
