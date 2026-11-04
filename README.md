@@ -121,3 +121,87 @@ Run `dori watchdog loop` under a separate supervisor from `dori serve`. It polls
 The watchdog requires Python 3 for a kernel-held interprocess fence. It uses the resolved persistent `DORI_CONFIG`/`IYEN_HOME` installation, follows each current attachment dynamically, and retains up to 100 sanitized incidents in `STATE_DIR/watchdog/state.json` (owner-only permissions). It never records message bodies, credentials or raw CLI/RPC errors. It notifies only the exact currently bound conversation with `codex queue --thread UUID --message ...`, without `--resume`. A validated loaded observer UUID, canonical cwd, daemon socket and coherent active turn are required; approval, input, goal holds, owner pause, done review, detach, handoff and rebind all defer notification. Herdr mapping faults may be reported through this incident-only UUID route; normal owner mail retains strict Herdr verification. Queue acceptance does not prove prompt consumption; a durable exact user-message receipt confirms notification. Pending incidents survive recovery and missing targets. Uncertain attempts are reconciled by receipt and never blindly replayed or redirected to a newer generation.
 
 On macOS, preview `dori watchdog install`, then run `dori watchdog install --apply` to write the versioned LaunchAgent plist. This writes configuration only. Use the returned `launchctl bootstrap gui/$(id -u) ...` command to load it; after updating merged source, use `launchctl kickstart -k gui/$(id -u)/dev.iyen.delivery-watchdog-v1` to restart only the watchdog. Stop it with `launchctl bootout gui/$(id -u)/dev.iyen.delivery-watchdog-v1`. The plist pins the resolved persistent config/state path and installed Bun/source paths; regenerate it after relocating those paths. The normal installer does not automatically activate this agent. On other systems, supervise `dori watchdog loop` with the same installation environment. SIGINT/SIGTERM stop polling and drain any bounded submission before releasing its fence. Neither watchdog installation nor its loop restarts global Herdr/Codex or the serving process.
+
+### Native one-command launcher
+
+After installation, use `iyen codex` or `iyen omp` to open or resume the exact
+native lead and reconnect its Iyen bridge. `dori` remains the service/operator
+CLI. Existing profiles/configuration are required; the launcher does not create
+provider credentials or migrate history between runtimes.
+
+Create `${XDG_CONFIG_HOME:-~/.config}/iyen/launchers.json`:
+
+```json
+{
+  "version": 1,
+  "profiles": {
+    "codex": {
+      "configPath": "~/.dori-codex/config.json",
+      "service": {
+        "start": ["my-supervisor", "start", "iyen-codex"],
+        "stop": ["my-supervisor", "unload", "iyen-codex"],
+        "stopped": ["my-supervisor", "verify-unloaded", "iyen-codex"]
+      }
+    },
+    "omp": {
+      "configPath": "~/.config/iyen/omp/config.json"
+    }
+  }
+}
+```
+
+Replace the example supervisor argv with your own commands. `start` and `stop`
+are paired, optional hooks; `stopped` is an optional additional zero-exit-code
+check proving the supervisor job is unloaded. A stop hook must disable/unload
+KeepAlive or equivalent restart behavior, wait for its job, and return success
+only after that contract is satisfied. The launcher also waits for the pinned
+service PID and its known descendants to exit; it never kills supervisor PIDs.
+Without hooks, the launcher can start an owned service and records its intent,
+but switching away requires explicit service control rather than guessing how
+to stop it. Configure both profiles' hooks for automatic switching in both
+directions.
+
+Each config must exist, match its profile's exact `runtime.kind`, and use an
+isolated state directory. Herdr's canonical `codex`/`omp` executable must match
+the configured native executable (`runtime.externalBinary` for Codex when set).
+The shared Codex daemon must already be available. OMP needs its configured
+isolated settings, extension, provider, model, effort and approval mode. Ensure
+the native executable's environment uses a compatible Bun version. Optional
+profile `leadInstructionsPath` points to existing legacy LEAD instructions;
+without it the launcher supplies the repository Iyen skill and configured
+persona directory. Config and instruction paths may be absolute, home-relative,
+or relative to the registry file.
+
+```sh
+iyen codex
+iyen omp --no-switch
+iyen codex --config /absolute/existing/config.json --registry /absolute/launchers.json
+iyen omp --model MODEL_ID --effort high --json
+iyen --help
+```
+
+Automatic switching is the default for registered receivers with the same
+ingress ID and overlapping owners. It stops only the conflicting service and
+preserves its native TUI. `--no-switch` refuses the conflict. Model/effort
+precedence is explicit flags, saved effective lead values, then configured lead
+values; worker/lane defaults never select the lead model.
+
+Repeated commands reuse an already attached conversation, including a busy
+lead, without another bootstrap. An exited TUI resumes its saved exact UUID
+(and exact OMP JSONL file); a missing old pane creates a dedicated tab without
+changing focus, then uses guarded reconnect after old ownership is proven absent.
+Occupied or ambiguous panes, owner pauses, completion holds, pending restarts,
+and unresolved lead delivery barriers require reconciliation. Unrelated worker
+mail and old attachment histories stay untouched. The launcher never selects
+`--last` or an arbitrary idle agent, clears an owner hold, or posts an activation
+message to a messenger.
+
+`--json` includes the scoped bridge and native identity for automation; ordinary
+output only shows the session and pane. A verified bootstrap receipt confirms
+native delivery, not that the model has finished reading its instructions.
+Durable intent is kept in `stateDir/launcher/launch.json` and service startup
+intent in `stateDir/launcher-service.json`. After an uncertain native start or
+prompt, repeat the same command to reconcile receipts without replay. An
+uncertain service startup needs supervisor/process inspection before clearing
+its startup intent; do not delete journals to force an unverified second start.
+The launcher is operator-only and refuses scoped `DORI_CONTEXT`/lane credentials.
