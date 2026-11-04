@@ -89,3 +89,51 @@ bun run typecheck
 테스트는 fake RPC와 별도 daemon/session-host 프로세스를 사용합니다. 실제 모델·메신저 API는 호출하지 않습니다. 로컬 실제 Codex에서는 초기화, thread 생성, paused goal 조회, 필수 MCP 도구 등록까지 추론 없이 확인했습니다. 실제 모델·메신저·호스트 sandbox를 연결한 운영 전 검증은 별도로 필요합니다. journal 자동 회전은 아직 제공하지 않습니다.
 
 MIT. 설치 스크립트의 upstream URL 이름은 역사적 경로이며 런타임 의존성과 무관합니다.
+
+### 네이티브 한 명령 실행
+
+설치 후 `iyen codex` 또는 `iyen omp`로 해당 네이티브 리드 세션을 열거나
+정확한 기존 UUID로 재개하고 Iyen 브리지를 연결합니다. `dori` CLI는 그대로
+유지됩니다. `${XDG_CONFIG_HOME:-~/.config}/iyen/launchers.json`에 다음처럼
+**이미 존재하는** 설정 파일을 등록하세요.
+
+```json
+{
+  "version": 1,
+  "profiles": {
+    "codex": { "configPath": "~/.dori-codex/config.json" },
+    "omp": { "configPath": "~/.config/iyen/omp/config.json" }
+  }
+}
+```
+
+두 설정의 `runtime.kind`는 이름과 일치해야 하며 상태 디렉터리는 분리해야
+합니다. Codex는 실행 중인 공유 데몬, OMP는 격리된 설정·확장·명시적 모델과
+추론 강도가 필요합니다. Herdr가 실행하는 `codex`/`omp`는 설정된 네이티브
+실행 파일과 같아야 합니다. 레거시 LEAD 파일이 있으면 프로필의 선택 항목
+`leadInstructionsPath`에 지정할 수 있습니다. 생략하면 Iyen 스킬과 설정된
+페르소나 경로를 사용합니다.
+
+같은 메신저 ingress ID와 소유자가 겹치면 기본적으로 수신 서비스만
+전환하고 기존 TUI는 보존합니다. 양방향 자동 전환을 쓰려면 각 프로필에
+`service.start`와 `service.stop`을 **argv 배열**로 지정하세요. stop 명령은
+자동 재시작까지 해제하고 종료를 확인해야 합니다. 선택 항목
+`service.stopped`는 감독 작업이 내려갔는지 추가 검증합니다. 구체적인 JSON
+예제와 감독 명령 계약은 [영문 설정 설명](README.md#native-one-command-launcher)을
+참고하세요. 훅이 없으면 서비스를 시작할 수 있지만 안전한 종료 방법이
+없는 다른 서비스로의 전환은 거부됩니다.
+
+- `iyen codex`: Codex 리드 실행/정확한 세션 재개
+- `iyen omp --no-switch`: 다른 수신 서비스가 있으면 전환하지 않고 거부
+- `--config PATH`, `--registry PATH`: 기존 설정 또는 레지스트리 명시
+- `--model ID --effort LEVEL`: 저장된 리드 값보다 우선하는 명시적 선택
+- `--json`: 브리지와 검증된 세션 정보를 자동화용으로 출력
+
+반복 실행은 정상 연결된 세션에 초기화 프롬프트를 다시 보내지 않습니다.
+종료된 TUI는 정확한 세션을 재개하며, 이전 pane이 사라졌으면 소유권 부재를
+확인한 뒤 포커스를 바꾸지 않는 새 탭에서 재연결합니다. 사용자 일시정지나
+완료 보류를 해제하지 않고, 점유·모호한 pane은 거부합니다. 다른 작업자의
+미확인 메일이나 과거 attachment 기록은 변경하지 않습니다. 불확실한 네이티브
+실행/입력 결과는 같은 명령으로 영수증을 확인하며 재전송하지 않습니다.
+초기화 영수증은 입력 전달 확인이며 모델의 지침 독해 완료를 뜻하지 않습니다.
+실행만으로 메신저에 활성화 알림을 보내지 않습니다.

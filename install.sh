@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs the Iyen and dori-mode skills and the `dori` CLI.
+# Installs the Iyen and dori-mode skills and the `dori` and `iyen` CLIs.
 # Usage: curl -fsSL https://raw.githubusercontent.com/sisyphuslabs/omo-dori-mode-experimental/main/install.sh | bash
 # Needs: git, bun 1.3+, Python 3, Codex CLI, herdr. Optional env: DORI_SRC (clone dir), SKILLS_DIR (skill links), IYEN_HOME or DORI_CONFIG (persistent installation).
 set -euo pipefail
@@ -33,7 +33,9 @@ if [ ! -f "$config" ]; then
   bun -e 'const [template, path] = process.argv.slice(1); const config = await Bun.file(template).json(); config.stateDir = `${(await import("node:path")).dirname(path)}/state`; await Bun.write(path, JSON.stringify(config, null, 2) + "\n")' "$src/skills/dori-mode/references/config.example.json" "$config"
 fi
 
-echo "Installed. Skills: $skills/iyen, $skills/dori-mode  CLI: dori  Config: $config"
+echo "Installed. Skills: $skills/iyen, $skills/dori-mode  CLI: dori, iyen  Config: $config"
 echo "Next: configure or migrate $config; run dori doctor and dori serve with this installation, then ask for iyen mode in your current Codex conversation"
 
 echo "Optional independent watchdog (Python 3 required): preview dori watchdog install, then dori watchdog install --apply; load the returned LaunchAgent separately. Generic supervisors can run dori watchdog loop."
+
+echo "Native launcher: register existing isolated profiles in ${XDG_CONFIG_HOME:-$HOME/.config}/iyen/launchers.json; run iyen codex or iyen omp. See README launcher setup."

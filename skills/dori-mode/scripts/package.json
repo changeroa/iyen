@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "bin": {
-    "dori": "./src/cli.ts"
+    "dori": "./src/cli.ts",
+    "iyen": "./src/iyen.ts"
   },
   "scripts": {
     "test": "bun test",

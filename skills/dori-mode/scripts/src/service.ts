@@ -43,7 +43,8 @@ export type ExternalTransport = { connect: typeof connectObserver; observe: type
 type OwnedFailure = Mail & { leadIntakeInstance?: string };
 const UNOWNED_LEAD = "unattached-lead";
 type HandoffArgs = { sessionFile?: string; terminalId?: string; fromThreadId: string; threadId: string; pane: string; cwd: string; mailIds: string[]; operationId: string };
-type HandoffIntent = { version: 1; status: "prepared" | "committed"; args: HandoffArgs; before: Lane; beforeAttachment: Attachment; after: Lane; afterAttachment: Attachment; result: any; createdAt: string; identityHeld?: boolean; cleanupPending?: boolean; activation?: boolean };
+type ReconnectArgs = { operationId: string; threadId: string; pane: string; cwd: string; sessionFile?: string; terminalId?: string; expectedInstance: string; expectedGeneration: number; expectedRevision: number };
+type HandoffIntent = { reconnectWrites?: { before: Lane; after: Lane }[]; reconnect?: ReconnectArgs; version: 1; status: "prepared" | "committed"; args: HandoffArgs; before: Lane; beforeAttachment: Attachment; after: Lane; afterAttachment: Attachment; result: any; createdAt: string; identityHeld?: boolean; cleanupPending?: boolean; activation?: boolean };
 export type HandoffIO = { removeMarker(path: string): void };
 const durableMarkerRemoval = (path: string): void => {
   // Open before unlink so an open failure leaves the recovery marker intact.
@@ -286,7 +287,7 @@ export class DoriService {
   }
   private blocksPendingMutation(action: string, args: any, caller: Caller): boolean {
     if (["health", "status", "lead-handoff", "lead-activate", "tick", "mail-list", "approval-list", "can-launch"].includes(action)) return false;
-    if (["lead", "lead-attach", "lead-detach", "lead-handoff-preview"].includes(action)) return true;
+    if (["lead", "lead-attach", "lead-detach", "lead-handoff-preview", "lead-reconnect"].includes(action)) return true;
     if (action === "sync") return Boolean(args.write);
     if (action === "mail-resolve") return args.box !== "outbox" && (!this.inbox.get(args.id) || this.inbox.get(args.id)?.target === "lead");
     return (args.key ?? caller.key) === "lead";
@@ -308,12 +309,13 @@ export class DoriService {
     }
     return { eligibleMailIds: eligibleMailIds.sort(), blocked, historicalMailIds: historicalMailIds.sort() };
   }
-  private async validateHandoffTarget(args: HandoffArgs, socketPath: string): Promise<{ daemon: Awaited<ReturnType<typeof discoverExternal>>; snap: Awaited<ReturnType<ExternalCurrentSession["inspect"]>> }> {
+  private async validateHandoffTarget(args: HandoffArgs, socketPath: string, rejectHeld = false): Promise<{ daemon: Awaited<ReturnType<typeof discoverExternal>>; snap: Awaited<ReturnType<ExternalCurrentSession["inspect"]>> }> {
     if (this.config.runtime.kind === "omp") {
       const target = await findOmpTarget(this.config, { sessionId: args.threadId, sessionFile: args.sessionFile!, terminalId: args.terminalId!, pane: args.pane, cwd: args.cwd }, this.runner);
       const controller = await connectOmp(target, { timeoutMs: this.config.runtime.rpcTimeoutMs });
       try {
         const observed = await controller.inspect();
+        if (rejectHeld && observed.held) throw new Error("OMP reconnect target is natively held; explicit owner resume required");
         if (!["idle", "running"].includes(observed.state) || observed.goal?.status === "paused") throw new Error("OMP target is not ready");
         return { daemon: { socketPath: target.socketPath, binaryVersion: target.runtimeVersion, binary: this.config.runtime.binary, omp: target } as any,
           snap: { threadId: target.sessionId, state: observed.state, activeTurnId: observed.activeRunId, goal: observed.goal, model: observed.model, effort: observed.effort } as any };
@@ -328,6 +330,93 @@ export class DoriService {
       return { daemon, snap };
     } finally { observer.close(); }
   }
+  private reconnectArgs(raw: any): ReconnectArgs {
+    if (!exactKeys(raw, ["operationId", "threadId", "pane", "cwd", "expectedInstance", "expectedGeneration", "expectedRevision"], ["sessionFile", "terminalId"]) ||
+      typeof raw.operationId !== "string" || !raw.operationId.trim() || raw.operationId.length > 200 ||
+      typeof raw.threadId !== "string" || !THREAD_UUID.test(raw.threadId) || typeof raw.pane !== "string" || !raw.pane.trim() ||
+      typeof raw.cwd !== "string" || !isAbsolute(raw.cwd) || typeof raw.expectedInstance !== "string" || !raw.expectedInstance.trim() ||
+      !Number.isSafeInteger(raw.expectedGeneration) || raw.expectedGeneration < 1 || !Number.isSafeInteger(raw.expectedRevision) || raw.expectedRevision < 0 ||
+      raw.sessionFile !== undefined && (typeof raw.sessionFile !== "string" || !isAbsolute(raw.sessionFile)) ||
+      raw.terminalId !== undefined && (typeof raw.terminalId !== "string" || !raw.terminalId.trim())) throw new Error("lead-reconnect requires exact target, operationId and expected attachment epoch/revision");
+    return { operationId: raw.operationId, threadId: raw.threadId, pane: raw.pane, cwd: realpathSync(raw.cwd),
+      ...(raw.sessionFile !== undefined ? { sessionFile: realpathSync(raw.sessionFile) } : {}), ...(raw.terminalId !== undefined ? { terminalId: raw.terminalId } : {}),
+      expectedInstance: raw.expectedInstance, expectedGeneration: raw.expectedGeneration, expectedRevision: raw.expectedRevision };
+  }
+  private assertReconnectAllowed(lane: Lane, instance: string): void {
+    if (["owner-pause", "done-review"].includes(lane.holdReason ?? "") || ["paused", "done-claimed", "verified-done", "closed"].includes(statusOf(lane)) || lane.cleanupFence)
+      throw new Error("Lead reconnect cannot clear an owner or completion hold");
+    if (this.inbox.list().some(row => row.target === "lead" && (!row.attachmentInstance || row.attachmentInstance === instance) && ["sending", "unknown"].includes(row.state)))
+      throw new Error("Lead reconnect requires reconciliation of sending or unknown mail for the existing attachment");
+  }
+  private assertReconnectSource(lane: Lane, args: ReconnectArgs): Attachment {
+    this.assertReconnectAllowed(lane, args.expectedInstance);
+    if (lane.runtime?.kind !== this.config.runtime.kind || lane.runtime.hostInstanceId !== args.expectedInstance ||
+      lane.runtime.generation !== args.expectedGeneration || lane.revision !== args.expectedRevision) throw new Error("Lead reconnect expected attachment epoch/revision mismatch");
+    const saved = this.attachment(lane);
+    if (saved.threadId !== args.threadId || saved.cwd !== args.cwd ||
+      saved.omp && (saved.omp.sessionFile !== args.sessionFile || saved.pane === args.pane && saved.omp.terminalId !== args.terminalId) ||
+      !saved.omp && (args.sessionFile !== undefined || args.terminalId !== undefined)) throw new Error("Lead reconnect target mismatch");
+    return saved;
+  }
+  private async assertReconnectOwnership(source: Attachment, args: HandoffArgs): Promise<void> {
+    // Require one exact native owner in both complete collections, even in the
+    // same pane. A move additionally requires the old pane to be absent.
+    const result = await this.runner(["herdr", "api", "snapshot"], { timeoutMs: this.config.runtime.rpcTimeoutMs });
+    const snapshot = result.code === 0 ? JSON.parse(result.out)?.result?.snapshot : undefined;
+    if (!Array.isArray(snapshot?.panes) || !Array.isArray(snapshot?.agents)) throw new Error("Reconnect complete Herdr snapshot unavailable");
+    const kind = source.omp ? "omp" : "codex", value = source.omp?.sessionFile ?? source.threadId;
+    for (const rows of [snapshot.panes, snapshot.agents]) {
+      if (rows.some((row: any) => typeof row?.pane_id !== "string" || !row.pane_id) || new Set(rows.map((row: any) => row.pane_id)).size !== rows.length || source.pane !== args.pane && rows.some((row: any) => row.pane_id === source.pane)) throw new Error("Reconnect old pane absence unverified");
+      if (rows.some((row: any) => row.agent === kind && (row.agent_session?.agent !== kind ||
+        row.agent_session?.kind !== (source.omp ? "path" : "id") || typeof row.agent_session?.value !== "string" ||
+        (source.omp ? row.agent_session.source !== "herdr:omp" : !THREAD_UUID.test(row.agent_session.value))))) throw new Error("Reconnect native ownership snapshot incomplete");
+      const owners = rows.filter((row: any) => row.agent_session?.value === value);
+      if (owners.length !== 1 || owners[0].pane_id !== args.pane || owners[0].agent !== kind || owners[0].agent_session?.agent !== kind || owners[0].agent_session?.kind !== (source.omp ? "path" : "id")) throw new Error("Reconnect exact unique target ownership unverified");
+    }
+    if (snapshot.agents.some((row: any) => !snapshot.panes.some((pane: any) => pane.pane_id === row.pane_id))) throw new Error("Reconnect incomplete Herdr snapshot");
+  }
+  private async reconnectLead(raw: any): Promise<any> {
+    const reconnect = this.reconnectArgs(raw), path = this.handoffPath(reconnect.operationId);
+    if (this.leadRestarts.hasActive()) throw new Error("Lead restart incomplete; reconnect held");
+    const pending = this.pendingHandoff();
+    if (pending && (!pending.reconnect || !sameJson(pending.reconnect, reconnect))) throw new Error("Another handoff or reconnect is pending");
+    let intent: HandoffIntent;
+    if (existsSync(path)) {
+      intent = readJson<HandoffIntent>(path);
+      if (!sameJson(intent.reconnect, reconnect)) throw new Error("Reconnect operationId reused with different arguments");
+      if (intent.status === "committed" && !pending) {
+        this.assertReconnectAllowed(await this.assertHandoffCurrent(intent), intent.afterAttachment.instance);
+        if (!intent.cleanupPending) return this.completedHandoff(intent);
+        await withBindingFence(this.config.stateDir, async () => { await this.assertHandoffCurrent(intent); atomicJson(this.activeHandoffPath(), { operationId: reconnect.operationId }); });
+      }
+    } else {
+      const before = await this.lane("lead"), beforeAttachment = this.assertReconnectSource(before, reconnect);
+      const args: HandoffArgs = { ...reconnect, fromThreadId: reconnect.threadId, mailIds: [] };
+      await this.assertReconnectOwnership(beforeAttachment, args);
+      const { daemon, snap } = await this.validateHandoffTarget(args, beforeAttachment.socketPath, true);
+      if (snap.held || snap.goal?.status === "paused") throw new Error("Reconnect target held; explicit owner resume required");
+      const target = (daemon as any).omp as OmpTarget | undefined;
+      const reused = beforeAttachment.pane === args.pane && (!target || !!beforeAttachment.omp && sameOmpTarget(beforeAttachment.omp, target));
+      if (target && beforeAttachment.omp && sameIdentity(beforeAttachment.omp, target) && !reused) throw new Error("OMP controller endpoints changed without a new instance");
+      const prepared = reused ? { saved: beforeAttachment, lead: { ...before, dispatchBlocked: false, holdReason: undefined,
+        runtime: { ...before.runtime!, held: false, state: snap.state, activeTurnId: snap.activeTurnId,
+          external: { ...before.runtime!.external!, holdReason: undefined, firstHoldReason: undefined, latestHoldReason: undefined, reconnectBlocked: undefined, reconnect: undefined } } } } :
+        this.prepareAttachment(args, args.cwd, before, daemon.binary, daemon, snap,
+          [...new Set([...beforeAttachment.excludedInboxIds, ...this.inbox.list().filter(row => row.target === "lead").map(row => row.id)])]);
+      const after = { ...before, pane: args.pane, model: prepared.lead.model, dispatchBlocked: false, holdReason: undefined,
+        runtime: prepared.lead.runtime, runtimeHistory: prepared.lead.runtimeHistory };
+      intent = { version: 1, status: "prepared", args, reconnect, before, beforeAttachment, after, afterAttachment: prepared.saved, createdAt: new Date().toISOString(),
+        result: { attached: true, bridge: prepared.saved.bridge, ...(reused ? { reused: true } : {}), lead: after } };
+      atomicJson(path, intent);
+    }
+    await withBindingFence(this.config.stateDir, async () => {
+      if (this.leadRestarts.hasActive()) throw new Error("Lead restart incomplete; reconnect held");
+      const active = this.pendingHandoff();
+      if (active && !sameJson(active.reconnect, reconnect)) throw new Error("Another handoff or reconnect is pending");
+      if (!active) { this.assertReconnectSource(await this.lane("lead"), reconnect); atomicJson(this.activeHandoffPath(), { operationId: reconnect.operationId }); }
+    });
+    return this.finishHandoff(intent);
+  }
   private async previewHandoff(raw: any): Promise<any> {
     const args = this.handoffArgs(raw, false), lane = await this.lane("lead");
     if (lane.runtime?.threadId !== args.fromThreadId || lane.runtime.backend !== "external-current-session") throw new Error("Handoff expected source session mismatch");
@@ -341,7 +430,7 @@ export class DoriService {
     let intent: HandoffIntent;
     if (existsSync(path)) {
       intent = readJson<HandoffIntent>(path);
-      if (!sameJson(intent.args, args)) throw new Error("Handoff operationId reused with different arguments");
+      if (intent.reconnect || !sameJson(intent.args, args)) throw new Error("Handoff operationId reused with different arguments");
       if (intent.status === "committed" && !this.pendingHandoff()) {
         await this.assertHandoffCurrent(intent);
         if (!intent.cleanupPending) return this.completedHandoff(intent);
@@ -403,23 +492,51 @@ export class DoriService {
       if (![beforeAttachment.instance, afterAttachment.instance].includes(current.runtime?.hostInstanceId ?? "")) throw new Error("Handoff registry identity changed; operator reconciliation required");
       // Every restart validates the exact recorded target before committing or
       // releasing dispatch. A different focused pane/cwd is never substituted.
-      await this.validateHandoffTarget(args, beforeAttachment.socketPath);
+      if (intent.reconnect) await this.assertReconnectOwnership(beforeAttachment, args);
+      const validated = await this.validateHandoffTarget(args, beforeAttachment.socketPath, !!intent.reconnect);
+      if (intent.reconnect) {
+        if (validated.snap.held || validated.snap.goal?.status === "paused") throw new Error("Reconnect target held; explicit owner resume required");
+        if (afterAttachment.omp && !sameOmpTarget(afterAttachment.omp, (validated.daemon as any).omp)) throw new ExternalSessionError("identity-unverified", "Recorded reconnect controller changed; refusing replacement");
+        await this.assertReconnectOwnership(beforeAttachment, args);
+      }
       // Recheck on every prepared retry, including automatic recovery, immediately
       // before changing routing. A prior preflight cannot authorize a later TUI.
       if (intent.activation && intent.status !== "committed") await this.assertPriorTuiGone(beforeAttachment, args);
       await withBindingFence(this.config.stateDir, async () => {
         const fencedCurrent = await this.lane("lead");
         if (![beforeAttachment.instance, afterAttachment.instance].includes(fencedCurrent.runtime?.hostInstanceId ?? "")) throw new Error("Handoff source changed during validation");
+        if (intent.reconnect) {
+          if (this.leadRestarts.hasActive()) throw new Error("Lead restart incomplete; reconnect held");
+          this.assertReconnectAllowed(fencedCurrent, beforeAttachment.instance);
+          // Only an exact source transition durably planned by this operation
+          // can explain a changed revision. Error/recovery holds are not proof.
+          const ownSourceWrite = intent.reconnectWrites?.some(write => sameJson(write.after, fencedCurrent));
+          if (intent.status !== "committed" && fencedCurrent.runtime?.hostInstanceId === beforeAttachment.instance &&
+            fencedCurrent.revision !== intent.reconnect.expectedRevision && !ownSourceWrite) throw new Error("Reconnect source revision changed during validation");
+          if (fencedCurrent.runtime?.generation !== (fencedCurrent.runtime?.hostInstanceId === beforeAttachment.instance ? beforeAttachment.generation : afterAttachment.generation) ||
+            fencedCurrent.runtime?.threadId !== args.threadId || fencedCurrent.cwd !== args.cwd || ![beforeAttachment.pane, args.pane].includes(fencedCurrent.pane ?? "") || fencedCurrent.runtime?.external?.detachedAt || fencedCurrent.runtime?.state === "stopped") throw new Error("Reconnect source changed during validation");
+        }
         if (intent.identityHeld) { intent = { ...intent, identityHeld: undefined }; atomicJson(path, intent); }
         if (intent.status !== "committed") {
-          await this.registry.update("lead", lane => ({ ...lane, dispatchBlocked: true, holdReason: lane.holdReason ?? "recovery", runtime: { ...lane.runtime!, held: true, state: "recovering" } }));
+          const writeStage = (change: (lane: Lane) => Lane) => this.registry.update("lead", lane => {
+            const next = change(lane);
+            if (intent.reconnect && lane.runtime?.hostInstanceId === beforeAttachment.instance) {
+              // Write ahead under the binding fence. A process death after the
+              // registry WAL append is recoverable even without running catch.
+              const after = { ...next, schemaVersion: 2 as const, revision: (lane.revision ?? 0) + 1 };
+              intent = { ...intent, reconnectWrites: [...(intent.reconnectWrites ?? []), { before: lane, after }] };
+              atomicJson(path, intent);
+            }
+            return next;
+          });
+          await writeStage(lane => ({ ...lane, dispatchBlocked: true, holdReason: lane.holdReason ?? "recovery", runtime: { ...lane.runtime!, held: true, state: "recovering" } }));
           for (const id of args.mailIds) {
             const row = this.inbox.get(id);
             if (!row || row.target !== "lead" || row.state !== "queued" || row.turnId || row.source?.startsWith("reconciled:") || row.attachmentInstance && ![UNOWNED_LEAD, beforeAttachment.instance, afterAttachment.instance].includes(row.attachmentInstance)) throw new Error("Handoff selected mail no longer safe; operator reconciliation required");
             if (row.attachmentInstance !== afterAttachment.instance) this.inbox.mark(id, { attachmentInstance: afterAttachment.instance });
           }
           if (!sameJson(readJson(this.attachmentPath()), afterAttachment)) atomicJson(this.attachmentPath(), afterAttachment);
-          await this.registry.update("lead", lane => ({ ...lane, pane: intent.after.pane, cwd: intent.after.cwd, model: intent.after.model, runtimeHistory: intent.after.runtimeHistory,
+          await writeStage(lane => ({ ...lane, pane: intent.after.pane, cwd: intent.after.cwd, model: intent.after.model, runtimeHistory: intent.after.runtimeHistory,
             dispatchBlocked: true, holdReason: lane.holdReason ?? "recovery", runtime: { ...intent.after.runtime!, held: true, state: "recovering" } }));
           intent = { ...intent, status: "committed" }; atomicJson(path, intent);
         }
@@ -447,7 +564,9 @@ export class DoriService {
         });
         if (error instanceof ExternalSessionError && error.code === "identity-unverified") { intent = { ...intent, identityHeld: true }; atomicJson(path, intent); }
         const lane = await this.registry.read("lead");
-        if (lane?.runtime) {
+        // Reconnect's active marker already fences dispatch. Do not mutate a
+        // refused source, or turn validation failure into recovery authorization.
+        if (lane?.runtime && !intent.reconnect) {
           await this.holdExternal(lane.runtime.hostInstanceId, new ExternalSessionError("handoff-interrupted", "Recorded lead handoff is incomplete; verify its exact target and retry the same operationId."));
           await this.recordRetry(lane.runtime.hostInstanceId);
         }
@@ -1046,7 +1165,7 @@ export class DoriService {
     if (this.leadRestarts.hasActive() && !["lead-restart", "lead-restart-status", "status", "health", "tick", "mail-list", "can-launch"].includes(action) &&
       (this.blocksPendingMutation(action, args, caller) || ["lead-handoff", "lead-activate", "approval-respond"].includes(action))) throw new Error("Lead restart incomplete; lead mutation held");
     if (this.stopping) throw new Error("Service stopping");
-    if (this.pendingHandoff() && this.blocksPendingMutation(action, args, caller)) throw new Error("Lead handoff incomplete; mutations are held until its recorded operation finishes");
+    if (action !== "lead-reconnect" && this.pendingHandoff() && this.blocksPendingMutation(action, args, caller)) throw new Error("Lead handoff incomplete; mutations are held until its recorded operation finishes");
     if (caller.instance) {
       const lead = await this.lane("lead");
       const pending = this.pendingHandoff();
@@ -1075,6 +1194,10 @@ export class DoriService {
         this.assertNoPendingLeadMutation();
         return this.acceptLeadRestart(args.operationId, args.sourceMessageId);
       }));
+    }
+    if (action === "lead-reconnect") {
+      if (caller.role !== "admin") throw new Error("lead-reconnect requires operator capability");
+      return this.launchQueue.run("lead", () => this.dispatchQueue.run("lead", () => this.reconnectLead(args)));
     }
     if (action === "lead-activate") {
       if (caller.role !== "admin") throw new Error("lead-activate requires operator capability");
@@ -1587,6 +1710,20 @@ export class DoriService {
   stop(): void { this.stopping = true; this.setPhase("stopping"); }
 }
 
+/** Keep the service lock and intake alive until producers exit and accepted frames drain. */
+export const drainIngress = async (children: readonly ReturnType<typeof Bun.spawn>[], readers: readonly Promise<void>[], timeoutMs = 2000): Promise<void> => {
+  const settled = Promise.allSettled([...children.map(child => child.exited), ...readers]);
+  const wait = async (): Promise<boolean> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try { return await Promise.race([settled.then(() => true), new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), timeoutMs); })]); }
+    finally { clearTimeout(timer); }
+  };
+  for (const child of children) if (child.exitCode === null && !child.signalCode) child.kill("SIGTERM");
+  if (await wait()) return;
+  for (const child of children) if (child.exitCode === null && !child.signalCode) child.kill("SIGKILL");
+  if (!await wait()) throw new Error("Ingress shutdown drain incomplete; service ownership retained");
+};
+
 const serveService = async (config: DoriConfig): Promise<void> => {
   mkdirSync(config.stateDir, { recursive: true, mode: 0o700 }); chmodSync(config.stateDir, 0o700);
   const socket = serviceSocket(config.stateDir), lockPath = join(config.stateDir, "service.lock");
@@ -1621,9 +1758,11 @@ const serveService = async (config: DoriConfig): Promise<void> => {
     void Promise.all([sampleHost(run).then(s => guardTick(s, config.guard, guard).forEach(console.log)), deadPaneTick(run, config, service.registry).then(lines => lines.forEach(console.log))]).catch(() => console.error("MONITOR_ERROR host")).finally(() => { guardBusy = false; });
   }, 60000);
   const children: ReturnType<typeof Bun.spawn>[] = [];
+  const readers: Promise<void>[] = [];
+  const shutdown = new AbortController();
   for (const ingress of config.ingress) {
     service.setIngressProcess(ingress.id, "starting");
-    void (async () => {
+    readers.push((async () => {
       for (let attempt = 0; !stopping && attempt < 5; attempt++) {
         let producer: ReturnType<typeof Bun.spawn> | undefined;
         try {
@@ -1637,19 +1776,30 @@ const serveService = async (config: DoriConfig): Promise<void> => {
           await child.exited;
         } catch { console.error(`INGRESS_ERROR ${ingress.id}`); }
         finally { producer?.kill(); service.setIngressProcess(ingress.id, stopping ? "stopped" : "failed"); }
-        if (!stopping) await Bun.sleep(1000 * 2 ** attempt);
+        if (!stopping) await new Promise<void>(resolveWait => {
+          const wake = () => { clearTimeout(timer); shutdown.signal.removeEventListener("abort", wake); resolveWait(); };
+          const timer = setTimeout(wake, 1000 * 2 ** attempt);
+          shutdown.signal.addEventListener("abort", wake, { once: true });
+          if (shutdown.signal.aborted) wake();
+        });
       }
       if (!stopping) console.error(`INGRESS_STOPPED ${ingress.id}; restart service after fixing adapter`);
-    })();
+    })());
   }
   service.setPhase("ready"); await service.health();
   console.log("DORI_SERVICE_READY");
   await new Promise<void>(resolveStop => {
-    const stop = () => { stopping = true; resolveStop(); };
+    const stop = () => { stopping = true; shutdown.abort(); resolveStop(); };
     process.once("SIGTERM", stop); process.once("SIGINT", stop);
   });
   clearInterval(timer); clearInterval(monitor);
-  for (const child of children) child.kill();
+  try { await drainIngress(children, readers); }
+  catch (error) {
+    // Keep socket/lock ownership until producer and reader shutdown is proven,
+    // but reject new RPC mutations while accepted receive work can still settle.
+    service.stop();
+    throw error;
+  }
   for (const lane of await service.registry.open()) if (lane.runtime?.backend !== "external-current-session") await service.deps.runtime.hold(lane.key, "automatic").catch(() => {});
   service.stop(); server.stop(true);
   if (existsSync(socket)) unlinkSync(socket);
