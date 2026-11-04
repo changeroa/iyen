@@ -51,6 +51,7 @@ export const unpushedWork = async (deps: FlowDeps, lane: Lane): Promise<string[]
 };
 export const closeLane = async (deps: FlowDeps, lane: Lane, note: string): Promise<{ closed: boolean; lines: string[] }> => {
   if (statusOf(lane) === "closed") return { closed: true, lines: [`CLOSED ${lane.key} already`] };
+  if (lane.retirement) return { closed: false, lines: [`REFUSED ${lane.key}: retirement owns shutdown`] };
   if (lane.role === "lead" || statusOf(lane) === "paused" || lane.holdReason === "owner-pause" || lane.holdReason === "recovery") return { closed: false, lines: [`REFUSED ${lane.key}: lane held`] };
   // Cleanup retries are safe only after the runtime was confirmed stopped and the close fence persisted.
   let fenced = lane.cleanupFence ? lane : undefined;
@@ -112,7 +113,7 @@ export const closeLane = async (deps: FlowDeps, lane: Lane, note: string): Promi
 export const watchTick = async (deps: FlowDeps): Promise<string[]> => {
   const lines: string[] = [];
   for (let lane of await deps.registry.open()) {
-    if (lane.role === "lead") continue;
+    if (lane.role === "lead" || lane.retirement) continue;
     if (statusOf(lane) === "verified-done" && lane.cleanupFence) { lines.push(...(await closeLane(deps, lane, "Cleanup recovery")).lines); continue; }
     if (statusOf(lane) !== "done-claimed" || !lane.claim) continue;
     if (lane.holdReason === "recovery") continue;

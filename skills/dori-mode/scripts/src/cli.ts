@@ -33,6 +33,7 @@ const help = `dori — messenger lead and lanes (Codex default, explicit OMP pro
   object-done KEY --reason TEXT [--reason TEXT]
   pause KEY | resume KEY | close KEY [--note TEXT]
   resume KEY --allow-unknown --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N
+  retire KEY --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N
   recover KEY | reopen KEY [--text-file FILE] [--new-session --handoff-file FILE]
   recover KEY --stop-current --operation-id ID [--text-file FILE] (managed OMP only)
   adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS --transfer-confirmed
@@ -56,7 +57,13 @@ const scopedInvocation = ["DORI_CONTEXT", "DORI_LANE_KEY", "DORI_LANE_TOKEN"].so
 // Scoped executables are service clients, never entrypoints to local lifecycle,
 // migration or messenger utilities. Apply this gate before any local handler,
 // even when the context is missing, malformed or already revoked.
-const scopedCommands = new Set(["", "help", "status", "health", "can-launch", "launch", "adopt", "input", "input-status", "reply", "report", "claim-done", "object-done", "pause", "resume", "close", "reopen", "recover", "sync", "approval", "mail", "work", "lead-detach", "lead-restart", "lead-restart-status", "watch", "freshness", "dead-panes", "guard", "mcp-server"]);
+const scopedCommands: Record<string, true> = {
+  "": true, help: true, status: true, health: true, "can-launch": true, launch: true, adopt: true,
+  input: true, "input-status": true, reply: true, report: true, "claim-done": true, "object-done": true,
+  pause: true, resume: true, close: true, retire: true, reopen: true, recover: true, sync: true,
+  approval: true, mail: true, work: true, "lead-detach": true, "lead-restart": true, "lead-restart-status": true,
+  watch: true, freshness: true, "dead-panes": true, guard: true, "mcp-server": true,
+};
 const scopedHelp = `iyen — scoped service commands
 
   help | status [key] | health | can-launch
@@ -71,6 +78,7 @@ const scopedHelp = `iyen — scoped service commands
   claim-done KEY --evidence TEXT | object-done KEY --reason TEXT
   pause KEY | resume KEY | close KEY [--note TEXT]
   resume KEY --allow-unknown --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N
+  retire KEY --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N
   recover KEY | reopen KEY [--text-file FILE]
   recover KEY --stop-current --operation-id ID [--text-file FILE] (managed OMP only)
   adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS --transfer-confirmed
@@ -95,7 +103,7 @@ const opt = (name: string): string | undefined => typeof values[name] === "strin
 const need = (name: string): string => { const value = opt(name); if (!value) throw new Error(`--${name} required`); return value; };
 const output = (value: unknown) => console.log(typeof value === "string" ? value : JSON.stringify(value, null, 2));
 try {
-  if (scopedInvocation && !scopedCommands.has(command)) throw new Error(`Scoped context cannot invoke local command ${command || "help"}; use service commands only`);
+  if (scopedInvocation && !Object.hasOwn(scopedCommands, command)) throw new Error(`Scoped context cannot invoke local command ${command || "help"}; use service commands only`);
   if (!command || values.help || command === "help") { console.log(scopedInvocation ? scopedHelp : help); process.exit(0); }
   if (command === "paths") { output(await installationPaths()); process.exit(0); }
   if (command === "migrate") { output(await migrate(Boolean(values.apply), undefined, opt("handoff-file") ? await Bun.file(need("handoff-file")).json() : undefined)); process.exit(0); }
@@ -160,6 +168,7 @@ try {
     case "claim-done": result = await call(command, { key, evidence: need("evidence") }); break;
     case "object-done": result = await call(command, { key, reasons: values.reason }); break;
     case "pause": case "close": result = await call(command, { key, note: opt("note") }); break;
+    case "retire": result = await call(command, { key, operationId: need("operation-id"), evidence: need("evidence"), expectedInstance: need("expected-instance"), expectedGeneration: Number(need("expected-generation")) }); break;
     case "resume": result = await call(command, { key, note: opt("note"), ...(values["allow-unknown"] ? {
       allowUnknown: true, operationId: need("operation-id"), evidence: need("evidence"), expectedInstance: need("expected-instance"), expectedGeneration: Number(need("expected-generation")),
     } : {}) }); break;

@@ -10,6 +10,7 @@ import { claimDone, closeLane, objectDone, watchTick, type FlowDeps } from "./do
 import { abandonManagedInput } from "./mail-abandon.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
 import { resumeUncertain } from "./resume-uncertain.ts";
+import { retireManagedLane } from "./retire.ts";
 import { launchLane, quoteForPane, validateLaunch, LaunchError, type LaunchInput } from "./launch.ts";
 import { freshnessTick } from "./freshness.ts";
 import { deadPaneTick } from "./dead-panes.ts";
@@ -1230,6 +1231,7 @@ export class DoriService {
       const lane = await this.lane(args.key);
       if (lane.runtime?.backend === "external-current-session") throw new Error("External current-session cannot register a managed host");
       if (!lane.runtime || lane.runtime.hostInstanceId !== args.instance || args.runtime?.hostInstanceId !== args.instance || args.runtime?.generation !== lane.runtime.generation) throw new Error("Stale host generation");
+      if (lane.retirement) return { accepted: false, retired: true };
       if (lane.runtime.threadId && lane.runtime.threadId !== args.runtime.threadId) throw new Error("Thread identity mismatch");
       if (!args.runtime.threadId || args.runtime.kind !== lane.runtime.kind || args.runtime.kind !== this.config.runtime.kind) throw new Error("Invalid runtime identity");
       if (args.runtime.kind === "omp") {
@@ -1285,6 +1287,8 @@ export class DoriService {
     if (caller.role === "host") throw new Error("Host cannot issue user commands");
     const key = args.key ?? caller.key;
     if (caller.role === "lane" && (!(["report", "claim-done", "status"].includes(action)) || key !== caller.key)) throw new Error("Lane capability does not authorize this command");
+    if (key && key !== "lead" && action !== "status" && action !== "retire" && action !== "close" && (await this.registry.read(key))?.retirement)
+      throw new Error("Retired lane cannot accept new work; use a new lane key");
     if (["pause", "resume", "close", "recover", "reopen", "claim-done", "object-done"].includes(action) && (await this.registry.read(key))?.runtime?.backend === "external-current-session") throw new Error(`External current-session ${action} is unsupported; use lead-detach`);
     if (["work-start", "work-stop", "work-similar"].includes(action)) {
       if (caller.role !== "lead" && caller.role !== "admin") throw new Error("Work timers require lead or operator");
@@ -1359,6 +1363,21 @@ export class DoriService {
       return objectDone(this.deps, await this.lane(key), args.reasons);
     }
     if (action === "close") return closeLane(this.deps, await this.lane(key), args.note ?? "Closed by lead");
+    if (action === "retire") {
+      if (caller.role !== "admin" && !(caller.role === "lead" && caller.key === "lead" && caller.instance))
+        throw new Error("Retirement requires the current attached lead or operator");
+      if (!exactKeys(args, ["key", "operationId", "evidence", "expectedInstance", "expectedGeneration"]))
+        throw new Error("Exact bounded retirement arguments required");
+      const scope = this.attachment(await this.lane("lead"));
+      const assertAuthority = async () => {
+        this.assertNoPendingLeadMutation();
+        const lead = await this.lane("lead"), current = this.attachment(lead);
+        if (current.instance !== scope.instance || current.generation !== scope.generation ||
+          caller.instance && caller.instance !== current.instance || lead.dispatchBlocked || lead.runtime?.held)
+          throw new Error("Lead retirement authority changed or held");
+      };
+      return this.launchQueue.run(key, () => this.dispatchQueue.run(key, () => retireManagedLane(this.deps, args, assertAuthority)));
+    }
     if (action === "input") {
       if (!args.text || !args.operationId) throw new Error("text and operationId required");
       const lane = await this.lane(key);
