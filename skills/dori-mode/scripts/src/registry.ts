@@ -16,6 +16,11 @@ export type LaneStatus = "working" | "paused" | "done-claimed" | "verified-done"
 export type Claim = { readonly at: string; readonly evidence: string; readonly emitted?: boolean };
 export type Objection = { readonly at: string; readonly reasons: readonly string[] };
 export type HistoryEntry = { readonly at: string; readonly status: LaneStatus; readonly note: string };
+export type Retirement = {
+  readonly operationId: string; readonly evidence: string; readonly payloadHash: string; readonly scopeHash: string;
+  readonly requestedAt: string; readonly closedAt?: string; readonly phase: "requested" | "stop-attempted" | "closed";
+  readonly runtimeStop: "confirmed" | "unknown" | "not-addressable";
+};
 
 export type Lane = {
   readonly schemaVersion?: 2;
@@ -32,6 +37,8 @@ export type Lane = {
   readonly baseSha?: string;
   readonly resumeRefs?: Readonly<Record<string, { sha: string; branch?: string }>>;
   readonly cleanupFence?: string;
+  /** Lead retirement is not Done and never deletes work; uncertain process exit stays explicit. */
+  readonly retirement?: Retirement;
   readonly report?: { id: string; kind: string; text: string; at: number };
   readonly legacy?: { sessionId?: string };
   readonly key: string;

@@ -344,3 +344,30 @@ known, timestamps, active/uncertain flags and bounded problem category. It never
 returns tokens, bootstrap contents, full owner input or configured credentials.
 Durable coordinator records remain private service persistence.
 
+## Lead-directed retirement
+
+When the lead judges a managed OMP lane finished or superseded, use:
+
+```text
+retire KEY --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N
+```
+
+Unlike verified `close`, retirement does not require the worker's Done claim
+and accepts an owner-paused lane. Only the current attached lead or operator
+can request it; the target must remain the exact registered managed OMP scope.
+Borrowed leads are excluded.
+
+Retirement blocks dispatch before attempting the existing graceful managed
+stop. `runtimeStop=confirmed` means that stop path proved native process exit
+and Herdr detachment, not merely an acknowledgment. A missing native identity
+retires only the registration with `runtimeStop=not-addressable`; it never
+guesses a PID or target. A failed or interrupted stop stays `unknown`, and
+repeating the same immutable operation does not send stop again.
+
+The record is closed with explicit retirement evidence, never a synthetic
+verified-Done claim. Uncertain inbox rows, source receipts, runtime history,
+worktrees, uncommitted files and panes are retained. No thread-Done hook runs.
+Retired keys reject new work, reopen/recover and late host registration/events;
+new assignments use new lane keys. An uncertain process may still exist even
+though its registration is retired; status reports this distinction.
+
