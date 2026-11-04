@@ -130,12 +130,10 @@ export class ExternalCurrentSession {
     const ready = await verify();
     if (!["idle", "running"].includes(ready.state) || ready.state === "running" && !ready.activeTurnId)
       throw new DeliveryDeferred("Attached session not ready for input; dispatch held");
-    // CLI queue defers until the current turn ends. Herdr submits through the
-    // verified TUI so a working lead receives this input during its active turn.
-    // Choose once: an uncertain submission must never fall back to another path.
-    const command = ready.state === "running"
-      ? ["herdr", "agent", "prompt", this.identity.pane, marked]
-      : [this.binary, "queue", "--thread", this.identity.threadId, "--message", marked];
+    // Use the sole verified TUI writer for both idle starts and active-turn
+    // steering. CLI queue/add can leave a loaded idle thread with no turn.
+    // An uncertain submission never falls back to another delivery path.
+    const command = ["herdr", "agent", "prompt", this.identity.pane, marked];
     let failure: unknown;
     try {
       const result = await this.run(command, { timeoutMs: this.config.rpcTimeoutMs });
