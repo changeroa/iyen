@@ -30,8 +30,14 @@ else if(args[0]==="agent"&&args[1]==="prompt"){
  const externalPath=join(dir,"external-state.json");
  if(existsSync(externalPath)){
   const state=JSON.parse(readFileSync(externalPath,"utf8")),active=state.turns.filter((t:any)=>t.status==="inProgress");
-  if(pane.agent_status!=="working"||pane.agent_session?.value!==state.thread.id||state.thread.status.type!=="active"||state.thread.status.activeFlags.length||active.length!==1)throw new Error("fixture steer requires verified running turn");
-  active[0].items.push({type:"userMessage",content:[{type:"text",text}]});atomicJson(externalPath,state);
+  if(pane?.agent!=="codex"||pane.agent_session?.agent!=="codex"||pane.agent_session?.kind!=="id"||pane.agent_session.value!==state.thread.id)throw new Error("fixture TUI session identity mismatch");
+  const item={type:"userMessage",content:[{type:"text",text}]};
+  if(state.thread.status.type==="active"&&state.thread.status.activeFlags.length===0&&active.length===1&&["working","idle","done"].includes(pane.agent_status))active[0].items.push(item);
+  else if(state.thread.status.type==="idle"&&active.length===0&&["idle","done"].includes(pane.agent_status)){
+   const failed=text.startsWith("fixture-fail-auth");
+   state.turns.push({id:crypto.randomUUID(),status:failed?"failed":"completed",items:[item],error:failed?{codexErrorInfo:"unauthorized",message:"Authorization: Bearer fixture-secret"}:null});
+  }else throw new Error("fixture TUI requires verified idle or active input-ready state");
+  atomicJson(externalPath,state);
  }else if(text==="/goal pause"||text==="/goal resume")await rpc(pane.endpoint,"thread/goal/set",{threadId:pane.thread,status:text.endsWith("pause")?"paused":"active"});
  else await rpc(pane.endpoint,"turn/start",{threadId:pane.thread,input:[{type:"text",text}]});
  output({agent:pane});

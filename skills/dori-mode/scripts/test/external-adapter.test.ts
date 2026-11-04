@@ -22,7 +22,6 @@ function fixture() {
   const agent: any = { agent: "codex", pane_id: "w:p1", agent_status: "idle", agent_session: { agent: "codex", kind: "id", value: threadId } };
   let turns: any[] = [], loaded: any = { data: [threadId], nextCursor: null }, goal: any = { goal: null };
   let failMethod: string | undefined, failCode = -32601, gets = 0, driftAt = Infinity;
-  let onQueue = (_argv: readonly string[]) => {};
   let onPrompt = (_argv: readonly string[]) => {};
   const observer = observerFor(method => {
     if (method === failMethod) throw new RpcError("Bearer secret private response", failCode);
@@ -38,7 +37,7 @@ function fixture() {
       if (++gets >= driftAt) agent.agent_session.value = otherId;
       return ok({ result: { agent } });
     }
-    if (argv[1] === "queue") { onQueue(argv); return ok({}); }
+    if (argv[1] === "queue") return ok({ queued: true });
     if (argv[0] === "herdr" && argv[2] === "prompt") { onPrompt(argv); return ok({}); }
     throw new Error("Unexpected command");
   };
@@ -47,7 +46,7 @@ function fixture() {
   return { session, observer, thread, agent, calls, lost, onLoss: async (error: unknown) => { lost.push(error); },
     setTurns(value: any[]) { turns = value; }, setLoaded(value: any) { loaded = value; }, setGoal(value: any) { goal = value; },
     fail(method: string, code = -32601) { failMethod = method; failCode = code; },
-    driftAt(get: number) { driftAt = get; }, onQueue(fn: typeof onQueue) { onQueue = fn; }, onPrompt(fn: typeof onPrompt) { onPrompt = fn; },
+    driftAt(get: number) { driftAt = get; }, onPrompt(fn: typeof onPrompt) { onPrompt = fn; },
   };
 }
 
@@ -115,11 +114,11 @@ test("saved observation still requires the exact endpoint and observed version",
   expect(acted).toBe(false);
 });
 
-for (const method of ["thread/read", "thread/loaded/list", "thread/turns/list"]) test(`required ${method} capability fails before queue mutation`, async () => {
+for (const method of ["thread/read", "thread/loaded/list", "thread/turns/list"]) test(`required ${method} capability fails before input mutation`, async () => {
   const h = fixture(); h.fail(method);
   await expect(h.session.inspect()).rejects.toMatchObject({ code: "runtime-incompatible" });
   await expect(h.session.input("task", "missing-api", h.onLoss)).rejects.toBeInstanceOf(DeliveryDeferred);
-  expect(h.lost[0]).toMatchObject({ code: "runtime-incompatible" }); expect(h.calls.some(argv => argv[1] === "queue")).toBe(false);
+  expect(h.lost[0]).toMatchObject({ code: "runtime-incompatible" }); expect(h.calls.some(argv => argv[1] === "queue" || argv[2] === "prompt")).toBe(false);
 });
 
 test("required read transport failures are sanitized without labeling them schema incompatibility", async () => {
@@ -142,7 +141,7 @@ for (const corrupt of [
   const h = fixture(); corrupt(h);
   await expect(h.session.inspect()).rejects.toMatchObject({ code: "runtime-incompatible" });
   await expect(h.session.input("task", "bad-schema", h.onLoss)).rejects.toBeInstanceOf(DeliveryDeferred);
-  expect(h.calls.some(argv => argv[1] === "queue")).toBe(false);
+  expect(h.calls.some(argv => argv[1] === "queue" || argv[2] === "prompt")).toBe(false);
 });
 
 test("optional missing, failing or malformed goal data degrades capability while messaging works", async () => {
@@ -152,9 +151,9 @@ test("optional missing, failing or malformed goal data degrades capability while
     else if (broken === "failed") h.fail("thread/goal/get", -32000);
     else h.setGoal({ goal: { status: "unknown", objective: "task", tokenBudget: 1 } });
     expect(await h.session.inspect()).toMatchObject({ state: "idle", goal: null, capabilities: { messaging: true, goal: false } });
-    h.onQueue(argv => h.setTurns([turn("accepted", argv[5])]));
+    h.onPrompt(argv => h.setTurns([turn("accepted", argv[4])]));
     expect(await h.session.input("task", `optional-${broken}`, h.onLoss)).toEqual({ turnId: "accepted" });
-    expect(h.calls.filter(argv => argv[1] === "queue")).toHaveLength(1);
+    expect(h.calls.filter(argv => argv[0] === "herdr" && argv[2] === "prompt")).toHaveLength(1);
   }
 });
 
@@ -201,7 +200,10 @@ test("Codex active turns steer while approval/input flags remain dispatch safety
       h.onPrompt(argv => h.setTurns([{ ...turn("active", argv[4]), status: "inProgress" }]));
       expect(await h.session.input("task", "codex-active", h.onLoss)).toEqual({ turnId: "active" });
       expect(h.calls.filter(argv => argv[2] === "prompt")).toHaveLength(1);
-    } else await expect(h.session.input("task", "codex-active", h.onLoss)).rejects.toBeInstanceOf(DeliveryDeferred);
+    } else {
+      await expect(h.session.input("task", "codex-active", h.onLoss)).rejects.toBeInstanceOf(DeliveryDeferred);
+      expect(h.calls.some(argv => argv[2] === "prompt")).toBe(false);
+    }
     expect(h.calls.some(argv => argv[1] === "queue")).toBe(false);
   }
   const h = fixture(); h.setTurns([{ ...turn("active"), status: "inProgress" }]);
@@ -215,7 +217,7 @@ test("Herdr working and blocked prevent idle dispatch despite idle Codex observe
     const h = fixture(); h.agent.agent_status = herdr;
     expect(await h.session.inspect()).toMatchObject({ state, activeTurnId: undefined });
     await expect(h.session.input("task", "busy", h.onLoss)).rejects.toBeInstanceOf(DeliveryDeferred);
-    expect(h.calls.some(argv => argv[1] === "queue")).toBe(false);
+    expect(h.calls.some(argv => argv[1] === "queue" || argv[2] === "prompt")).toBe(false);
   }
 });
 
@@ -224,7 +226,7 @@ test("unrecognized Herdr statuses and unsafe loaded/turn identities never become
     const h = fixture(); h.agent.agent_status = status;
     await expect(h.session.inspect()).rejects.toMatchObject({ code: "runtime-unavailable" });
     await expect(h.session.input("task", "unknown-status", h.onLoss)).rejects.toBeInstanceOf(DeliveryDeferred);
-    expect(h.calls.some(argv => argv[1] === "queue")).toBe(false);
+    expect(h.calls.some(argv => argv[1] === "queue" || argv[2] === "prompt")).toBe(false);
     h.agent.agent_status = "idle";
     expect(await h.session.inspect()).toMatchObject({ state: "idle" });
   }
@@ -242,7 +244,7 @@ test("missing cwd diagnostics never echo an untrusted path", async () => {
   expect(error.code).toBe("runtime-unavailable"); expect(error.message).not.toMatch(/secret|private/);
 });
 
-test("Herdr done steers a verified Codex active turn and queues only after Codex becomes idle", async () => {
+test("Herdr done steers a verified active turn and starts idle input through the same TUI", async () => {
   const h = fixture(); h.agent.agent_status = "done";
   expect(await h.session.inspect()).toMatchObject({ state: "idle" });
   h.setTurns([{ ...turn("active"), status: "inProgress" }]);
@@ -254,7 +256,7 @@ test("Herdr done steers a verified Codex active turn and queues only after Codex
   h.thread.status = { type: "active", activeFlags: ["waitingOnApproval"] };
   expect(await h.session.inspect()).toMatchObject({ state: "waiting_approval" });
   h.thread.status = { type: "idle" }; h.setTurns([]);
-  h.onQueue(argv => h.setTurns([turn("accepted", argv[5])]));
+  h.onPrompt(argv => h.setTurns([turn("accepted", argv[4])]));
   expect(await h.session.input("task", "done-idle", h.onLoss)).toEqual({ turnId: "accepted" });
   h.agent.agent_status = "idle";
   expect(await h.session.inspect()).toMatchObject({ state: "idle" });
@@ -283,7 +285,7 @@ test("missing Herdr session associations are retryable without dispatch and reva
     const h = fixture(), saved = h.agent.agent_session; h.agent.agent_session = association;
     await expect(h.session.inspect()).rejects.toMatchObject({ code: "runtime-unavailable" });
     await expect(h.session.input("task", "association-gap", h.onLoss)).rejects.toBeInstanceOf(DeliveryDeferred);
-    expect(h.calls.some(argv => argv[1] === "queue")).toBe(false);
+    expect(h.calls.some(argv => argv[1] === "queue" || argv[2] === "prompt")).toBe(false);
     h.agent.agent_session = saved;
     expect(await h.session.inspect()).toMatchObject({ state: "idle" });
   }
@@ -301,7 +303,7 @@ test("concrete pane, thread, agent and cwd mismatches remain identity-unverified
     const h = fixture(); corrupt(h);
     await expect(h.session.inspect()).rejects.toMatchObject({ code: "identity-unverified" });
     await expect(h.session.input("task", "mismatch", h.onLoss)).rejects.toBeInstanceOf(DeliveryDeferred);
-    expect(h.calls.some(argv => argv[1] === "queue")).toBe(false);
+    expect(h.calls.some(argv => argv[1] === "queue" || argv[2] === "prompt")).toBe(false);
   }
 });
 
@@ -316,23 +318,23 @@ test("same saved thread unloaded during restart stays queued and revalidates wit
     expect(h.calls.every(argv => argv[0] === "herdr" && argv.slice(1, 3).join(" ") === "agent get")).toBe(true);
     h.thread.status = { type: "idle" }; h.setLoaded({ data: [threadId], nextCursor: null });
     expect(await h.session.inspect()).toMatchObject({ threadId, state: "idle" });
-    h.onQueue(argv => h.setTurns([turn("accepted", argv[5])]));
+    h.onPrompt(argv => h.setTurns([turn("accepted", argv[4])]));
     expect(await h.session.input("task", "restart-gap", h.onLoss)).toEqual({ turnId: "accepted" });
-    expect(h.calls.filter(argv => argv[1] === "queue")).toHaveLength(1);
+    expect(h.calls.filter(argv => argv[0] === "herdr" && argv[2] === "prompt")).toHaveLength(1);
     expect(h.calls.some(argv => argv.includes("resume") || argv.includes("start") || argv.includes("restart"))).toBe(false);
   }
 });
 
-test("identity drift immediately before send prevents queue mutation", async () => {
+test("identity drift immediately before send prevents TUI prompt mutation", async () => {
   const h = fixture(); h.driftAt(2);
   await expect(h.session.input("task", "drift-before", h.onLoss)).rejects.toBeInstanceOf(DeliveryDeferred);
-  expect(h.lost).toHaveLength(1); expect(h.calls.some(argv => argv[1] === "queue")).toBe(false);
+  expect(h.lost).toHaveLength(1); expect(h.calls.some(argv => argv[1] === "queue" || argv[2] === "prompt")).toBe(false);
 });
 
-test("identity drift after queue refuses even an exact receipt and never replays", async () => {
-  const h = fixture(); h.onQueue(argv => { h.agent.agent_session.value = otherId; h.setTurns([turn("accepted", argv[5])]); });
+test("identity drift after TUI prompt refuses even an exact receipt and never replays", async () => {
+  const h = fixture(); h.onPrompt(argv => { h.agent.agent_session.value = otherId; h.setTurns([turn("accepted", argv[4])]); });
   await expect(h.session.input("task", "drift-after", h.onLoss)).rejects.toThrow("delivery unknown");
-  expect(h.lost).toHaveLength(1); expect(h.calls.filter(argv => argv[1] === "queue")).toHaveLength(1);
+  expect(h.lost).toHaveLength(1); expect(h.calls.filter(argv => argv[0] === "herdr" && argv[2] === "prompt")).toHaveLength(1);
 });
 
 test("only exact user receipts acknowledge delivery; duplicates fail without replay", async () => {
@@ -342,15 +344,15 @@ test("only exact user receipts acknowledge delivery; duplicates fail without rep
   expect(() => receiptInTurns([turn("a", marked), turn("b", marked)] as any, marked)).toThrow("Duplicate operation receipts");
   const h = fixture(); h.setTurns([turn("existing", marked)]);
   expect(await h.session.input("task", "exact", h.onLoss)).toEqual({ turnId: "existing" });
-  expect(h.calls.some(argv => argv[1] === "queue")).toBe(false);
+  expect(h.calls.some(argv => argv[1] === "queue" || argv[2] === "prompt")).toBe(false);
   h.setTurns([turn("a", marked), turn("b", marked)]);
   await expect(h.session.input("task", "exact", h.onLoss)).rejects.toThrow("Duplicate operation receipts");
-  expect(h.calls.some(argv => argv[1] === "queue")).toBe(false);
+  expect(h.calls.some(argv => argv[1] === "queue" || argv[2] === "prompt")).toBe(false);
 });
 
-test("uncertain queue outcomes are sanitized and one submission is never replayed during reconciliation", async () => {
-  const h = fixture(); h.onQueue(() => { throw new Error("Bearer secret /private/command"); });
+test("uncertain TUI prompt outcomes are sanitized and one submission is never replayed during reconciliation", async () => {
+  const h = fixture(); h.onPrompt(() => { throw new Error("Bearer secret /private/command"); });
   const error = await h.session.input("task", "uncertain", h.onLoss).catch(error => error);
   expect(error.message).toContain("outcome unknown"); expect(error.message).not.toMatch(/secret|private/);
-  expect(h.calls.filter(argv => argv[1] === "queue")).toHaveLength(1);
+  expect(h.calls.filter(argv => argv[0] === "herdr" && argv[2] === "prompt")).toHaveLength(1);
 });
