@@ -89,3 +89,21 @@ test("fresh managed OMP launch explicitly selects its per-bootstrap session dire
   expect(other.argv.slice(-2)).toEqual(["--session-dir", "/lanes/b/bootstrap.json.sessions"]);
   expect(fresh.argv).not.toContain("--resume"); expect(fresh.argv).not.toContain("--continue"); expect(fresh.argv).not.toContain("--restore");
 });
+
+test("ordinary exact borrowed lead resume pins native identity without installing an unreleasable hold", async () => {
+  const f = extensionFixture();
+  const file = join(f.directory, "resume-bootstrap.json");
+  durableJson(file, { protocol: 1, registryDir: f.directory, role: "attached-lead", laneKey: "lead", expectedCwd: f.directory,
+    expectedPaneId: f.identity.paneId, expectedTerminalId: f.identity.terminalId, expectedSessionId: f.identity.sessionId, expectedSessionFile: f.identity.sessionFile });
+  f.options.env = { IYEN_OMP_BOOTSTRAP: file, HERDR_PANE_ID: f.identity.paneId };
+  try {
+    await registerOmpExtension(f.api, f.options); f.event("session_start"); await f.ready();
+    const [target] = await discoverOmp(f.directory), client = await connectOmp(target!);
+    try {
+      const snapshot = await client.inspect();
+      expect(snapshot.identity).toMatchObject({ role: "attached-lead", laneKey: "lead", sessionId: f.identity.sessionId, sessionFile: f.identity.sessionFile });
+      expect(snapshot.held).toBe(false); expect(snapshot.capabilities.input).toBe(true); expect(snapshot.capabilities.release).toBe(false);
+      await expect(client.release("automatic", "forbidden-release")).rejects.toThrow("role-forbidden");
+    } finally { client.close(); }
+  } finally { f.cleanup(); }
+});

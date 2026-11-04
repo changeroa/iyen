@@ -107,7 +107,7 @@ export async function registerOmpExtension(native: unknown, options: OmpExtensio
     const sessionsRoot = join(registryDir, "sessions"); privateDirectory(sessionsRoot);
     const sessionDirectory = join(sessionsRoot, payloadHash([sessionId, sessionFile, target.role, target.laneKey].join("\0")));
     const ownedController = new OmpControlServer(target, token, sessionDirectory, () => current!, api, { timeoutMs: options.timeoutMs,
-      startHeld: !!bootstrap?.expectedSessionId,
+      startHeld: !!bootstrap?.expectedSessionId && (bootstrap.role === "managed-lane" || !!bootstrap.restart),
       restart: bootstrap?.restart,
       verifyAssociation,
     });
