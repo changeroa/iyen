@@ -152,7 +152,7 @@ export async function nativeLead(config: DoriConfig, saved: Identity | undefined
         if (!(await readLoadedThreads(observer)).includes(saved.threadId)) throw new Error("Exact resumed Codex UUID is not loaded in the shared observer");
         const identity = await verify(saved.threadId);
         await proveResumeProcess();
-        await herdr(runner, ["pane", "report-agent-session", record.pane!, "--source", "iyen:codex", "--agent", "codex", "--agent-session-id", identity.threadId]);
+        await herdr(runner, ["pane", "report-agent-session", record.pane!, "--source", "herdr:codex", "--agent", "codex", "--agent-session-id", identity.threadId]);
         await proveResumeProcess();
         const { agent: reported } = await herdr(runner, ["agent", "get", record.pane!]);
         if (reported?.agent !== "codex" || reported.pane_id !== record.pane || reported.agent_session?.agent !== "codex" || reported.agent_session.kind !== "id" || reported.agent_session.value !== saved.threadId) throw new Error("Reported Codex resume association unconfirmed; retry exact process reconciliation");
@@ -165,7 +165,7 @@ export async function nativeLead(config: DoriConfig, saved: Identity | undefined
         if (matches[0]) {
           if (hooked?.value && hooked.value !== matches[0]) throw new Error("Codex receipt and TUI association conflict");
           const identity = await verify(matches[0]);
-          await herdr(runner, ["pane", "report-agent-session", record.pane!, "--source", "iyen:codex", "--agent", "codex", "--agent-session-id", identity.threadId]); return identity;
+          await herdr(runner, ["pane", "report-agent-session", record.pane!, "--source", "herdr:codex", "--agent", "codex", "--agent-session-id", identity.threadId]); return identity;
         }
       }
       await Bun.sleep(100);

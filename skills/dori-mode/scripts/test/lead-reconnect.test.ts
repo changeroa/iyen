@@ -29,7 +29,7 @@ async function fixture(omp = true) {
   const runner: Runner = async argv => {
     const ok = (result: unknown) => ({ code: 0, out: JSON.stringify({ result }), err: "" });
     if (argv[0] === "herdr" && argv[1] === "api") {
-      const rows = [row(), ...(snapshotMode === "duplicate" ? [{ ...row(), pane_id: "duplicate:pane" }] : []),
+      const rows = [snapshotMode === "unknown-target" ? { ...row(), agent_session: undefined } : row(), ...(snapshotMode === "unrelated-unassociated" ? [{ pane_id: "other:unassociated", agent: omp ? "omp" : "codex" }] : []), ...(snapshotMode === "duplicate" ? [{ ...row(), pane_id: "duplicate:pane" }] : []), ...(snapshotMode === "mislabelled-duplicate" ? [{ ...row(), pane_id: "duplicate:pane", agent: "unknown", agent_session: { ...row().agent_session, kind: "unknown" } }] : []),
         ...(snapshotMode === "old-present" ? [{ pane_id: "w1:p1" }] : [])];
       return ok({ snapshot: { panes: rows, agents: snapshotMode === "incomplete" ? undefined : rows } });
     }
@@ -180,6 +180,17 @@ for (const omp of [false, true]) test(`${omp ? "OMP" : "Codex"} same native sess
   h.snapshot("valid"); const result = await h.s.handle("lead-reconnect", args, admin);
   expect(result.lead.pane).toBe("w1:p2"); expect(h.saved().generation).toBe(old.generation + 1); expect(h.saved().threadId).toBe(old.threadId);
 });
+for (const omp of [false, true]) test(`${omp ? "OMP" : "Codex"} reconnect requires target identity but tolerates unrelated unassociated agents`, async () => {
+  const h = await fixture(omp), old = h.saved(); if (omp) h.restart(true); else h.moveCodex();
+  const args = await h.args();
+  h.snapshot("mislabelled-duplicate"); await expect(h.s.handle("lead-reconnect", args, admin)).rejects.toThrow("ownership");
+  h.snapshot("unknown-target"); await expect(h.s.handle("lead-reconnect", args, admin)).rejects.toThrow("snapshot incomplete");
+  expect(h.saved()).toEqual(old);
+  h.snapshot("unrelated-unassociated"); const result = await h.s.handle("lead-reconnect", args, admin);
+  expect(result.lead.pane).toBe("w1:p2"); expect(h.saved().threadId).toBe(old.threadId);
+  expect(h.saved().generation).toBe(old.generation + 1);
+});
+
 test("same-pane duplicate UUID ownership is rejected; observer cwd is independently checked", async () => {
   const h = await fixture(false), old = h.saved(), args = await h.args();
   h.snapshot("duplicate"); await expect(h.s.handle("lead-reconnect", args, admin)).rejects.toThrow("ownership");

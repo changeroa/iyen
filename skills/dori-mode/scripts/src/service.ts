@@ -367,7 +367,7 @@ export class DoriService {
     const kind = source.omp ? "omp" : "codex", value = source.omp?.sessionFile ?? source.threadId;
     for (const rows of [snapshot.panes, snapshot.agents]) {
       if (rows.some((row: any) => typeof row?.pane_id !== "string" || !row.pane_id) || new Set(rows.map((row: any) => row.pane_id)).size !== rows.length || source.pane !== args.pane && rows.some((row: any) => row.pane_id === source.pane)) throw new Error("Reconnect old pane absence unverified");
-      if (rows.some((row: any) => row.agent === kind && (row.agent_session?.agent !== kind ||
+      if (rows.some((row: any) => row.pane_id === args.pane && row.agent === kind && (row.agent_session?.agent !== kind ||
         row.agent_session?.kind !== (source.omp ? "path" : "id") || typeof row.agent_session?.value !== "string" ||
         (source.omp ? row.agent_session.source !== "herdr:omp" : !THREAD_UUID.test(row.agent_session.value))))) throw new Error("Reconnect native ownership snapshot incomplete");
       const owners = rows.filter((row: any) => row.agent_session?.value === value);
