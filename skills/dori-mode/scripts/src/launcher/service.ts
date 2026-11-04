@@ -5,6 +5,9 @@ import { atomicJson } from "../journal.ts";
 import { readJson, serviceClient } from "../ipc.ts";
 import { run, type Runner } from "../run.ts";
 import { overlaps, type Profile, type Selection } from "./profiles.ts";
+const ownedServices = new Map<number, ReturnType<typeof Bun.spawn>>();
+/** Services spawned and authenticated by this launcher, not ambient PID files. */
+export const ownedServicePids = () => [...ownedServices].filter(([, child]) => child.exitCode === null && !child.signalCode).map(([pid]) => pid);
 export const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error; } };
 export async function health(config: DoriConfig): Promise<any | undefined> {
   try { return await serviceClient(config)("health", {}, 1500); }
@@ -71,6 +74,7 @@ export async function ensureService(selection: Selection, noSwitch: boolean, run
     throw new Error("Existing service/receiver readiness unconfirmed");
   }
   const { config, profile } = selection;
+  let ownedChild: ReturnType<typeof Bun.spawn> | undefined;
   const intentPath = join(config.stateDir, "launcher-service.json");
   if (existsSync(intentPath) && readJson<any>(intentPath).phase === "starting") throw new Error("Previous service startup outcome unknown; reconcile launcher-service.json before invoking its start hook again");
   if (profile.service?.start) {
@@ -86,14 +90,23 @@ export async function ensureService(selection: Selection, noSwitch: boolean, run
     const log = openSync(join(config.stateDir, "launcher-service.log"), "a", 0o600);
     try {
       const child = Bun.spawn([process.execPath, resolve(import.meta.dir, "../cli.ts"), "serve"], {
-        env: { ...process.env, DORI_CONFIG: profile.configPath }, stdin: "ignore", stdout: log, stderr: log,
+        env: { ...process.env, DORI_CONFIG: profile.configPath }, stdin: "ignore", stdout: log, stderr: log, detached: true,
       });
+      ownedChild = child;
       atomicJson(intentPath, { version: 1, kind: "owned", configPath: profile.configPath, phase: "starting", pid: child.pid }); child.unref();
     } finally { closeSync(log); }
   }
   const deadline = Date.now() + config.runtime.startupTimeoutMs;
   while (Date.now() < deadline) {
-    try { const status = await serviceClient(config)("health", {}, 1000); assertServiceReady(config, status); { atomicJson(intentPath, { ...readJson<any>(intentPath), phase: "ready" }); return; } } catch { /* startup only */ }
+    try {
+      const status = await serviceClient(config)("health", {}, 1000);
+      assertServiceReady(config, status);
+      if (ownedChild) {
+        if (status.pid !== ownedChild.pid) throw new Error("Owned service PID changed");
+        ownedServices.set(ownedChild.pid, ownedChild);
+      }
+      atomicJson(intentPath, { ...readJson<any>(intentPath), phase: "ready" }); return;
+    } catch { /* startup only */ }
     await Bun.sleep(100);
   }
   throw new Error("Authenticated service health not ready; startup intent retained, do not start a duplicate");

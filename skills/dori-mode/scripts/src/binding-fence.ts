@@ -2,13 +2,18 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 type HeldFence = { assertAlive(): void; release(): Promise<void>; command(argv: readonly string[], timeoutMs: number): Promise<{ code: number; out: string; err: string }> };
+const helpers = new Map<number, () => void>();
+/** Exact live helpers owned by this process, never inferred from executable names. */
+export const ownedFencePids = (): number[] => { for (const assertAlive of helpers.values()) assertAlive(); return [...helpers.keys()]; };
 const owned = new AsyncLocalStorage<ReadonlyMap<string, HeldFence>>();
 // A persistent file is only a lock address. The kernel owns exclusivity and
 // owner death closes stdin. A protected child finishes before the helper exits.
 const acquireKernelFence = async (path: string, timeoutMs: number, signal?: AbortSignal): Promise<HeldFence> => {
   if (signal?.aborted) throw new Error("Fence acquisition cancelled");
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const child = Bun.spawn(["python3", join(import.meta.dir, "binding-lock.py"), path, String(timeoutMs)], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
+  // Terminal Ctrl-C belongs to the native TUI, not the exclusivity helper.
+  // A separate session still releases on owner EOF through the private pipe.
+  const child = Bun.spawn(["python3", join(import.meta.dir, "binding-lock.py"), path, String(timeoutMs)], { stdin: "pipe", stdout: "pipe", stderr: "ignore", detached: true });
   const cancel = () => { try { child.kill("SIGKILL"); } catch {} };
   signal?.addEventListener("abort", cancel, { once: true });
   if (signal?.aborted) cancel();
@@ -32,10 +37,11 @@ const acquireKernelFence = async (path: string, timeoutMs: number, signal?: Abor
     process.exit(74);
   };
   const assertAlive = () => { if (child.exitCode !== null || child.signalCode) lost(); };
+  helpers.set(child.pid, assertAlive);
   void child.exited.then(code => { if (!releasing || code !== 0 || child.signalCode) lost(); });
   return {
     assertAlive,
-    release: async () => { assertAlive(); releasing = true; child.stdin.end(); await child.exited; reader.releaseLock(); },
+    release: async () => { assertAlive(); releasing = true; child.stdin.end(); await child.exited; helpers.delete(child.pid); reader.releaseLock(); },
     command: async (argv, timeoutMs) => {
       assertAlive();
       child.stdin.write(JSON.stringify({ argv, timeoutMs }) + "\n"); child.stdin.flush();
