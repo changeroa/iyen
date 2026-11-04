@@ -30,12 +30,14 @@ function fixture() {
     if (argv.slice(0, 3).join(" ") === "herdr agent get") {
       beforeGet(++gets); return { code: 0, out: JSON.stringify({ result: { agent } }), err: "" };
     }
-    if (argv.slice(0, 3).join(" ") === "herdr agent prompt" || argv[1] === "queue") {
-      const steering = argv[0] === "herdr", text = argv[steering ? 4 : 5];
+    if (argv[1] === "queue") return { code: 0, out: "queued-without-turn", err: "" };
+    if (argv.slice(0, 3).join(" ") === "herdr agent prompt") {
+      const text = argv[4];
       if (accept) {
         const item = { type: "userMessage", content: [{ type: "text", text }] };
-        if (steering) turns[0].items.push(item);
-        else turns.push({ id: "queued-turn", status: "completed", items: [item] });
+        const active = turns.find(turn => turn.status === "inProgress");
+        if (active) active.items.push(item);
+        else turns.push({ id: "idle-turn", status: "completed", items: [item] });
       }
       afterSend();
       if (disconnect) throw new Error("private transport failure");
@@ -64,9 +66,9 @@ test("working input steers the verified pane and accepts an exact receipt in the
   expect(h.reads.every(m => ["thread/read", "thread/loaded/list", "thread/turns/list", "thread/goal/get"].includes(m))).toBe(true);
 });
 
-test("idle input retains the CLI queue path", async () => {
-  const h = fixture(); h.idle(); expect(await h.input()).toEqual({ turnId: "queued-turn" });
-  expect(h.sends()).toEqual([["/fixture/codex", "queue", "--thread", h.identity.threadId, "--message", operationText("literal $(x) `x`", "op")]]);
+test("idle input starts a new native turn through the verified TUI", async () => {
+  const h = fixture(); h.idle(); expect(await h.input()).toEqual({ turnId: "idle-turn" });
+  expect(h.sends()).toEqual([["herdr", "agent", "prompt", h.identity.pane, operationText("literal $(x) `x`", "op")]]);
 });
 
 for (const waiting of ["waitingOnApproval", "waitingOnUserInput", "blocked", "failed"])
@@ -95,9 +97,10 @@ for (const change of ["approval", "identity", "unloaded"])
     expect(h.holds).toHaveLength(change === "approval" ? 0 : 1);
   });
 
-test("transport selection uses the last verified state", async () => {
+test("last verified transition to idle starts a fresh TUI turn rather than steering the completed turn", async () => {
   const h = fixture(); h.beforeGet(count => { if (count === 2) h.idle(); });
-  expect(await h.input()).toEqual({ turnId: "queued-turn" }); expect(h.sends()[0]?.[1]).toBe("queue");
+  expect(await h.input()).toEqual({ turnId: "idle-turn" }); expect(h.sends()[0]?.slice(0, 3)).toEqual(["herdr", "agent", "prompt"]);
+  expect(h.turns).toHaveLength(2); expect(h.turns[0].status).toBe("completed"); expect(h.turns[1].id).toBe("idle-turn");
 });
 
 for (const outcome of ["ack", "failure", "disconnect"])

@@ -177,14 +177,14 @@ async function externalFixture(notifications = false) {
   if(argv[1]==="app-server") {if(offline)throw new Error("Bearer secret-token /private/socket");return {code:0,err:"",out:JSON.stringify({status:"running",cliVersion:version,appServerVersion:version,socketPath:reportedSocket})};}
   if(argv[1]==="queue"&&argv[2]==="--help")return {code:0,err:"",out:"queue --thread <ID> --message <TEXT>"};
   if(argv[0]==="herdr"&&argv[2]==="prompt"){
-   if(accept)turns[0].items.push({type:"userMessage",content:[{type:"text",text:argv[4]}]});
+   if(accept){const item={type:"userMessage",content:[{type:"text",text:argv[4]}]},active=turns.find(turn=>turn.status==="inProgress");if(active)active.items.push(item);else turns.push({id:`turn-${turns.length}`,status:"completed",items:[item]});}
    return {code:0,err:"",out:"submitted"};
   }
   if(argv[0]==="herdr"){
    const agent={agent:"codex",pane_id:pane,agent_status:agentStatus,agent_session:{agent:"codex",kind:"id",value:identity}};
    return {code:0,err:"",out:JSON.stringify({result:argv[2]==="list"?{agents:[agent]}:{agent}})};
   }
-  if(argv[1]==="queue"){turns.push({id:`turn-${turns.length}`,status:"completed",items:[{type:"userMessage",content:[{type:"text",text:argv[5]}]}]});return {code:0,err:"",out:"queued"};}
+  if(argv[1]==="queue")return {code:0,err:"",out:"queued-without-turn"};
   throw new Error("Unexpected mutation");
  };
  const transport:import("../src/service.ts").ExternalTransport={connect:async()=>observer,observe:async(run,config,attachment,action)=>{
@@ -329,8 +329,8 @@ test("automatic upgrade reconnect preserves capability and exclusions and delive
  expect(await s.handle("status",{key:"lead"},{role:"admin"})).toMatchObject({readiness:"ready",runtime:{binaryVersion:"0.201.0"}});
  for(const key of ["instance","generation","token","bridge","socketPath","threadId","pane","cwd","excludedInboxIds"])expect(h.attachment()[key]).toEqual(old[key]);
  expect(await s.authorize(old.token)).toMatchObject({instance:old.instance});expect(h.queues()).toHaveLength(0);
- await s.tick();expect(s.inbox.get("queued")?.state).toBe("sent");expect(s.inbox.get("history")?.state).toBe("queued");expect(s.inbox.get("unknown")?.state).toBe("unknown");expect(s.inbox.get("sending")?.state).toBe("sending");expect(h.queues()).toHaveLength(1);
- s=new DoriService(h.config,h.runner,h.transport);await s.tick();expect(s.inbox.get("sending")?.state).toBe("unknown");expect(h.queues()).toHaveLength(1);
+ await s.tick();expect(s.inbox.get("queued")?.state).toBe("sent");expect(s.inbox.get("history")?.state).toBe("queued");expect(s.inbox.get("unknown")?.state).toBe("unknown");expect(s.inbox.get("sending")?.state).toBe("sending");expect(h.prompts()).toHaveLength(1);expect(h.queues()).toHaveLength(0);
+ s=new DoriService(h.config,h.runner,h.transport);await s.tick();expect(s.inbox.get("sending")?.state).toBe("unknown");expect(h.prompts()).toHaveLength(1);expect(h.queues()).toHaveLength(0);
 });
 
 test("offline reconnect retries use durable capped backoff and unchanged polls cause no writes or discovery",async()=>{

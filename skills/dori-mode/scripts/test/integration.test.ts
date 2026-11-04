@@ -161,8 +161,8 @@ test("current-session CLI attaches a busy existing lead, scopes controls, delive
   await call("lead-detach",{threadId});
   const observer=await connectObserver(socketPath,500);try{expect((await observer.read<any>("thread/read",{threadId})).thread.id).toBe(threadId);}finally{observer.close();}
   const calls=readFileSync(join(state.dir,"external-codex-calls.jsonl"),"utf8").trim().split("\n").map(l=>JSON.parse(l));
-  expect(calls.filter(a=>a[0]==="queue"&&a[1]!=="--help")).toHaveLength(1);expect(calls.every(a=>a.join(" ")==="app-server daemon version"||a[0]==="queue")).toBe(true);
-  const herdrCalls=readFileSync(join(state.dir,"fixture-herdr-calls.jsonl"),"utf8").trim().split("\n").map(l=>JSON.parse(l));expect(herdrCalls.every(a=>a[0]==="agent"&&["get","prompt"].includes(a[1]))).toBe(true);expect(herdrCalls.filter(a=>a[1]==="prompt")).toEqual([["agent","prompt","current:p",operationText("literal owner message","ingress")]]);
+  expect(calls.filter(a=>a[0]==="queue"&&a[1]!=="--help")).toHaveLength(0);expect(calls.every(a=>a.join(" ")==="app-server daemon version"||a[0]==="queue")).toBe(true);
+  const herdrCalls=readFileSync(join(state.dir,"fixture-herdr-calls.jsonl"),"utf8").trim().split("\n").map(l=>JSON.parse(l));expect(herdrCalls.every(a=>a[0]==="agent"&&["get","prompt"].includes(a[1]))).toBe(true);expect(herdrCalls.filter(a=>a[1]==="prompt")).toEqual([["agent","prompt","current:p",operationText("literal owner message","ingress")],["agent","prompt","current:p",operationText("fixture-fail-auth","failed-owner-input")]]);
   daemon!.kill("SIGTERM");await daemon!.exited;expect(await logs.err).toBe("");
  }finally{daemon?.kill();if(daemon)await daemon.exited;server.stop(true);state.done();}
 },30000);
@@ -226,7 +226,9 @@ for (const upgradeVersion of ["0.165.0", "0.999.0"]) test(`CLI 163 attachment au
   expect(await call("status", { key: "lead" }, saved.token)).toMatchObject({ readiness: "ready", runtime: { binaryVersion: upgradeVersion } });
   expect((await call("mail-list")).inbox.find((row: any) => row.id === "upgrade-mail").turnId).toBe(delivered.turnId);
   const calls = readFileSync(join(state.dir, "external-codex-calls.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
-  expect(calls.filter(args => args[0] === "queue" && args[1] !== "--help")).toHaveLength(1); expect(calls.every(args => args[0] === "queue" || args.join(" ") === "app-server daemon version")).toBe(true);
+  expect(calls.filter(args => args[0] === "queue" && args[1] !== "--help")).toHaveLength(0); expect(calls.every(args => args[0] === "queue" || args.join(" ") === "app-server daemon version")).toBe(true);
+  const herdrCalls = readFileSync(join(state.dir, "fixture-herdr-calls.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+  expect(herdrCalls.filter(args => args[0] === "agent" && args[1] === "prompt")).toEqual([["agent", "prompt", "current:p", operationText(delivered.text, delivered.id)]]);
   await stop(logs);
  } finally { daemon?.kill(); if (daemon) await daemon.exited; server.stop(true); state.done(); }
 }, 30000);

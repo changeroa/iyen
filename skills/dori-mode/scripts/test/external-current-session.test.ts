@@ -20,7 +20,7 @@ function fixture() {
   const config = { ...defaultConfig(), stateDir: state.dir, defaultCwd: state.dir, hooks: { threadReply: ["notify", "{thread}", "{text}"] }, ingress: [{ id: "test", command: ["fixture"], owners: ["owner"] }], runtime: { ...defaultConfig().runtime, binary: process.execPath, rpcTimeoutMs: 80 } };
   const thread: any = { id: threadId, cwd: realpathSync(state.dir), model: "retained-model", reasoningEffort: "high", status: { type: "idle" } };
   let cliVersion = "0.163.0", serverVersion = "0.163.0", reportedSocket = socketPath, unavailable = false;
-  let turns: any[] = [], loaded = true, accept = true, queueCode = 0, queueThrows = false, loseOnQueue = false, getCount = 0, driftAtGet = Infinity, failQueuedTurn = false;
+  let turns: any[] = [], loaded = true, accept = true, submissionCode = 0, submissionThrows = false, loseOnSubmission = false, getCount = 0, driftAtGet = Infinity, failSubmittedTurn = false;
   const agent: any = { agent: "codex", pane_id: "w:p1", agent_status: "idle", agent_session: { agent: "codex", kind: "id", value: threadId } };
   const server = Bun.serve({ unix: socketPath, fetch(request, server) { if (server.upgrade(request)) return; return new Response(null, { status: 400 }); }, websocket: { message(ws, raw) {
     const m = JSON.parse(String(raw)); reads.push(m.method); if (m.id === undefined) return;
@@ -33,10 +33,16 @@ function fixture() {
     if (argv[0] === "notify") return ok({});
     if (argv[0] === "herdr") {
       if (argv[1] === "agent" && argv[2] === "prompt") {
-        if (accept) turns.find(t => t.status === "inProgress")!.items.push({ type: "userMessage", content: [{ type: "text", text: argv[4] }] });
-        if (loseOnQueue) agent.agent_session.value = otherId;
-        if (queueThrows) throw new Error("transport disconnect");
-        return { code: queueCode, err: "", out: "submitted" };
+        if (accept) {
+          const item = { type: "userMessage", content: [{ type: "text", text: argv[4] }] };
+          const active = turns.find(t => t.status === "inProgress");
+          if (active) active.items.push(item);
+          else turns.push({ id: "real-turn-id", status: failSubmittedTurn ? "failed" : "completed", items: [item],
+            error: failSubmittedTurn ? { codexErrorInfo: "unauthorized", message: "Authorization: Bearer secret-token\nprivate command dump" } : null });
+        }
+        if (loseOnSubmission) agent.agent_session.value = otherId;
+        if (submissionThrows) throw new Error("transport disconnect");
+        return { code: submissionCode, err: "", out: "submitted" };
       }
       if (argv[1] === "agent" && argv[2] === "get") { if (++getCount >= driftAtGet) agent.agent_session.value = otherId; return ok({ result: { agent } }); }
       if (argv[1] === "agent" && argv[2] === "list") return ok({ result: { agents: [agent] } });
@@ -44,27 +50,22 @@ function fixture() {
     }
     if (argv.slice(1).join(" ") === "app-server daemon version") { if (unavailable) throw new Error("Bearer private-token /private/socket"); return ok({ status: "running", cliVersion, appServerVersion: serverVersion, socketPath: reportedSocket }); }
     if (argv[1] === "queue" && argv[2] === "--help") return { code: 0, out: "queue --thread <UUID> --message <TEXT>", err: "" };
-    if (argv[1] === "queue") {
-      if (accept) turns.push({ id: "real-turn-id", status: failQueuedTurn ? "failed" : "completed", items: [{ type: "userMessage", content: [{ type: "text", text: argv[5] }] }],
-        error: failQueuedTurn ? { codexErrorInfo: "unauthorized", message: "Authorization: Bearer secret-token\nprivate command dump" } : null });
-      if (loseOnQueue) agent.agent_session.value = otherId;
-      if (queueThrows) throw new Error("transport disconnect");
-      return { code: queueCode, err: "", out: "submitted" };
-    }
+    // Native queue/add acknowledges enqueueing without creating a user turn.
+    if (argv[1] === "queue") return { code: 0, out: "queued-but-not-started", err: "" };
     throw new Error(`Unexpected mutation: ${argv.join(" ")}`);
   };
   const s = new DoriService(config, run), args = { threadId, pane: agent.pane_id, cwd: state.dir };
   return { state, s, args, config, run, calls, reads, thread, agent, server,
     versions(client: string, daemon = client) { cliVersion = client; serverVersion = daemon; },
-    socket(value: string) { reportedSocket = value; }, unavailable(value = true) { unavailable = value; }, setTurns: (v: any[]) => turns = v, getTurns: () => turns, failQueuedTurn: () => failQueuedTurn = true,
+    socket(value: string) { reportedSocket = value; }, unavailable(value = true) { unavailable = value; }, setTurns: (v: any[]) => turns = v, getTurns: () => turns, failSubmittedTurn: () => failSubmittedTurn = true,
     busy() { agent.agent_status = "working"; thread.status = { type: "active", activeFlags: [] }; turns = [{ id: "owner-turn", status: "inProgress", items: [] }]; },
     idle() { agent.agent_status = "idle"; thread.status = { type: "idle" }; turns = turns.map(t => ({ ...t, status: "completed" })); },
     unloaded() { loaded = false; thread.status = { type: "notLoaded" }; }, noReceipt() { accept = false; },
-    queueFailure() { queueCode = 1; }, queueDisconnect() { queueThrows = true; }, loseOnQueue() { loseOnQueue = true; },
+    submissionFailure() { submissionCode = 1; }, submissionDisconnect() { submissionThrows = true; }, loseOnSubmission() { loseOnSubmission = true; },
     driftBeforeSend() { driftAtGet = getCount + 3; }, done() { s.stop(); server.stop(true); state.done(); } };
 }
 beforeEach(() => { h = fixture(); atomicJson(join(h.state.dir, "control.json"), { token: "admin" }); });
-afterEach(() => h.done());
+afterEach(() => { try { expect(queueCalls()).toHaveLength(0); } finally { h.done(); } });
 const attach = () => h.s.handle("lead-attach", h.args, { role: "admin" });
 const input = (id = "owner-input", text = "literal $(x) `x`") => h.s.handle("input", { key: "lead", text, operationId: id }, { role: "admin" });
 const queueCalls = () => h.calls.filter(a => a[1] === "queue" && a[2] !== "--help");
@@ -108,7 +109,7 @@ test("different attached lead is refused before mutation; concurrent attachment 
 test("user model and effort changes are observed without changing settings or invalidating thread identity", async () => {
   const first = await attach(); h.thread.model = "user-selected-model"; h.thread.reasoningEffort = "medium";
   expect(await h.s.handle("status", { key: "lead" }, { role: "admin" })).toMatchObject({ identityVerified: true, readiness: "ready", runtime: { model: "user-selected-model", effort: "medium" } });
-  expect(await attach()).toMatchObject({ reused: true, bridge: first.bridge }); await input(); expect(queueCalls()).toHaveLength(1);
+  expect(await attach()).toMatchObject({ reused: true, bridge: first.bridge }); await input(); expect(promptCalls()).toHaveLength(1);
   h.thread.reasoningEffort = null;
   expect(await h.s.handle("status", { key: "lead" }, { role: "admin" })).toMatchObject({ identityVerified: true, readiness: "ready" });
   expect(h.thread.model).toBe("user-selected-model"); expect(h.thread.reasoningEffort).toBeNull();
@@ -122,16 +123,16 @@ test("working inputs steer the same active turn with an exact operation receipt 
   await input(); await h.s.tick(); expect(promptCalls()).toHaveLength(1); expect(queueCalls()).toHaveLength(0);
 });
 
-test("unconfirmed queue attempt stays unknown across restart and is never replayed", async () => {
+test("unconfirmed TUI prompt attempt stays unknown across restart and is never replayed", async () => {
   await attach(); h.noReceipt(); await expect(input()).rejects.toThrow("receipt unknown"); expect(h.s.inbox.get("owner-input")?.state).toBe("unknown");
   const restarted = new DoriService(h.config, h.run);
-  await restarted.tick(); expect(restarted.inbox.get("owner-input")?.state).toBe("unknown"); expect(queueCalls()).toHaveLength(1);
+  await restarted.tick(); expect(restarted.inbox.get("owner-input")?.state).toBe("unknown"); expect(promptCalls()).toHaveLength(1);
   await expect(restarted.handle("input", { key: "lead", text: "literal $(x) `x`", operationId: "owner-input" }, { role: "admin" })).rejects.toThrow();
-  expect(queueCalls()).toHaveLength(1);
+  expect(promptCalls()).toHaveLength(1);
 });
 
-test("queue failure or disconnect with exact persisted receipt is sent with the real turn id", async () => {
-  await attach(); h.queueFailure(); h.queueDisconnect(); expect(await input()).toEqual({ turnId: "real-turn-id" }); expect(h.s.inbox.get("owner-input")?.state).toBe("sent");
+test("TUI prompt failure or disconnect with exact persisted receipt is sent with the real turn id", async () => {
+  await attach(); h.submissionFailure(); h.submissionDisconnect(); expect(await input()).toEqual({ turnId: "real-turn-id" }); expect(h.s.inbox.get("owner-input")?.state).toBe("sent");
 });
 
 test("assistant echo is not evidence and duplicate exact receipts block dispatch", async () => {
@@ -140,7 +141,7 @@ test("assistant echo is not evidence and duplicate exact receipts block dispatch
   const user = { type: "userMessage", content: [{ type: "text", text: operationText("literal $(x) `x`", "duplicate") }] };
   h.setTurns([{ id: "duplicate-turn", status: "completed", items: [user, user] }]);
   await h.s.handle("lead-attach", h.args, { role: "admin" }); await expect(input("duplicate")).rejects.toThrow("Duplicate");
-  expect(h.s.inbox.get("duplicate")?.state).toBe("unknown"); expect(queueCalls()).toHaveLength(1);
+  expect(h.s.inbox.get("duplicate")?.state).toBe("unknown"); expect(promptCalls()).toHaveLength(1);
 });
 
 test("identity loss before send holds dispatch with queued mail; restored exact identity automatically recovers", async () => {
@@ -152,15 +153,15 @@ test("identity loss before send holds dispatch with queued mail; restored exact 
   h.agent.agent_session.value = threadId; const restarted = new DoriService(h.config, h.run);
   await restarted.registry.update("lead", l => ({ ...l, runtime: { ...l.runtime!, external: { ...l.runtime!.external!, reconnect: undefined, reconnectBlocked: true } } }));
   expect(await restarted.handle("status", { key: "lead" }, { role: "admin" })).toMatchObject({ identityVerified: true, readiness: "ready", dispatchBlocked: false });
-  await restarted.tick(); expect(queueCalls()).toHaveLength(1); restarted.stop();
+  await restarted.tick(); expect(promptCalls()).toHaveLength(1); restarted.stop();
 });
 
-test("identity is checked again immediately before queue and after submission", async () => {
-  await attach(); h.driftBeforeSend(); expect(await input()).toMatchObject({ queued: true }); expect(queueCalls()).toHaveLength(0);
+test("identity is checked again immediately before TUI prompt and after submission", async () => {
+  await attach(); h.driftBeforeSend(); expect(await input()).toMatchObject({ queued: true }); expect(promptCalls()).toHaveLength(0); expect(queueCalls()).toHaveLength(0);
 });
 
-test("identity lost after queue is unknown and never accepted as a sent receipt", async () => {
-  await attach(); h.loseOnQueue(); await expect(input()).rejects.toThrow("delivery unknown"); expect(h.s.inbox.get("owner-input")?.state).toBe("unknown");
+test("identity lost after TUI prompt is unknown and never accepted as a sent receipt", async () => {
+  await attach(); h.loseOnSubmission(); await expect(input()).rejects.toThrow("delivery unknown"); expect(h.s.inbox.get("owner-input")?.state).toBe("unknown");
   expect(await h.s.registry.read("lead")).toMatchObject({ dispatchBlocked: true });
 });
 
@@ -266,14 +267,14 @@ test("attached failure observed before receipt ACK waits for sent input, then no
 });
 
 test("immediate failed attached input records durable failure while sending and preserves owner notices", async () => {
-  await attach(); h.failQueuedTurn();
+  await attach(); h.failSubmittedTurn();
   const mark = h.s.inbox.mark.bind(h.s.inbox); let recordedBeforeAck = false;
   h.s.inbox.mark = (id, patch) => {
     if (id === "immediate-failure" && patch.state === "sent") { recordedBeforeAck = true; expect(h.s.failures.list()).toHaveLength(1); expect(h.s.outbox.list()).toHaveLength(0); }
     return mark(id, patch);
   };
   await h.s.handle("input", { key: "lead", text: "owner task", operationId: "immediate-failure", thread: "slack:immediate" }, { role: "admin" });
-  expect(recordedBeforeAck).toBe(true); await h.s.notifyFailures(); expect(h.s.outbox.list()[0]).toMatchObject({ target: "slack:immediate", state: "sent" }); expect(queueCalls()).toHaveLength(1);
+  expect(recordedBeforeAck).toBe(true); await h.s.notifyFailures(); expect(h.s.outbox.list()[0]).toMatchObject({ target: "slack:immediate", state: "sent" }); expect(promptCalls()).toHaveLength(1);
 });
 
 test("later terminal failure is observed by the regular sweep and deduplicates across restart", async () => {
@@ -281,7 +282,7 @@ test("later terminal failure is observed by the regular sweep and deduplicates a
   expect(h.s.failures.list()).toHaveLength(0); const turn = h.getTurns()[0]; turn.status = "failed"; turn.error = { codexErrorInfo: "usageLimitExceeded" };
   await h.s.tick(); await h.s.notifyFailures(); expect(h.s.failures.list()).toHaveLength(1); expect(h.s.outbox.list()[0]).toMatchObject({ target: "slack:late", state: "sent" }); expect(h.s.outbox.list()[0]?.text).toContain("limits or quota");
   const restarted = new DoriService(h.config, h.run); await restarted.tick(); await restarted.notifyFailures();
-  expect(restarted.outbox.list()).toHaveLength(1); expect(h.calls.filter(a => a[0] === "notify")).toHaveLength(1); expect(queueCalls()).toHaveLength(1);
+  expect(restarted.outbox.list()).toHaveLength(1); expect(h.calls.filter(a => a[0] === "notify")).toHaveLength(1); expect(promptCalls()).toHaveLength(1);
 });
 
 test("historical, manual, unattempted and previous-generation failed turns cannot notify this attachment", async () => {
@@ -349,11 +350,11 @@ for (const upgradeVersion of ["0.164.0", "0.165.0"]) test(`same-session 163 to $
   await h.s.tick(); expect(queueCalls()).toHaveLength(0); expect(h.s.inbox.get("sending")?.state).toBe("sending");
   h.idle(); const restarted = new DoriService(h.config, h.run); await restarted.tick();
   expect(restarted.inbox.get(id)).toMatchObject({ ...queued, attachmentInstance: saved.instance, state: "sent", turnId: "real-turn-id" });
-  expect(queueCalls()).toHaveLength(1);
+  expect(promptCalls()).toHaveLength(1);
   expect(restarted.inbox.get("history")?.state).toBe("queued"); expect(restarted.inbox.get("queued")?.state).toBe("queued"); expect(restarted.inbox.get("unknown")?.state).toBe("unknown");
   // Existing sending recovery remains unknown; reattach never resets it.
   expect(restarted.inbox.get("sending")?.state).toBe("unknown");
-  const twice = new DoriService(h.config, h.run); await twice.tick(); expect(queueCalls()).toHaveLength(1);
+  const twice = new DoriService(h.config, h.run); await twice.tick(); expect(promptCalls()).toHaveLength(1);
   expect(h.config.runtime.requiredVersion).toBe("0.163.0");
 });
 
@@ -458,7 +459,7 @@ for (const boundary of ["intent", "attachment"] as const) test(`interrupted rebi
   expect(restarted.inbox.list()).toEqual(before); expect(queueCalls()).toHaveLength(0);
   h.idle(); const ready = new DoriService(h.config, h.run); await ready.tick();
   expect(ready.inbox.get("eligible-rebind")).toMatchObject({ state: "sent", turnId: "real-turn-id" });
-  expect(ready.inbox.get("historic-rebind")?.state).toBe("queued"); expect(queueCalls()).toHaveLength(1);
+  expect(ready.inbox.get("historic-rebind")?.state).toBe("queued"); expect(promptCalls()).toHaveLength(1);
 });
 
 
@@ -485,4 +486,49 @@ test("untrusted version output and observer connection failure leave sanitized h
   expect(h.s.outbox.list()).toEqual([]); expect(h.calls.filter(argv => argv[0] === "notify")).toEqual([]);
   expect(await h.s.handle("status", { key: "lead" }, { role: "admin" })).toMatchObject({ readiness: "held", runtime: { external: { holdReason: { code: "runtime-unavailable" } } } });
   expect(queueCalls()).toHaveLength(0);
+});
+
+test("idle attached lead starts a real native turn through exact verified TUI prompt once", async () => {
+  await attach();
+  expect(await input()).toEqual({ turnId: "real-turn-id" });
+  expect(promptCalls()).toEqual([["herdr", "agent", "prompt", h.args.pane, operationText("literal $(x) `x`", "owner-input")]]);
+  expect(h.getTurns()[0]).toMatchObject({ id: "real-turn-id", items: [{ type: "userMessage", content: [{ type: "text", text: operationText("literal $(x) `x`", "owner-input") }] }] });
+  expect(h.s.inbox.get("owner-input")).toMatchObject({ state: "sent", turnId: "real-turn-id" });
+  await input(); await h.s.tick(); expect(promptCalls()).toHaveLength(1); expect(queueCalls()).toHaveLength(0);
+});
+
+test.each(["idle", "running"])("%s TUI prompt error still accepts only the exact persisted native receipt", async state => {
+  if (state === "running") h.busy();
+  await attach(); h.submissionFailure(); h.submissionDisconnect();
+  expect(await input()).toEqual({ turnId: state === "running" ? "owner-turn" : "real-turn-id" });
+  expect(h.s.inbox.get("owner-input")?.state).toBe("sent");
+  await input(); expect(promptCalls()).toHaveLength(1); expect(queueCalls()).toHaveLength(0);
+});
+
+test.each(["idle", "running"])("%s unconfirmed TUI prompt never falls back to native queue or replays after restart", async state => {
+  if (state === "running") h.busy();
+  await attach(); h.noReceipt(); h.submissionFailure(); h.submissionDisconnect();
+  await expect(input()).rejects.toThrow("outcome unknown");
+  expect(h.s.inbox.get("owner-input")?.state).toBe("unknown");
+  const restarted = new DoriService(h.config, h.run);
+  try {
+    await restarted.tick();
+    await expect(restarted.handle("input", { key: "lead", text: "literal $(x) `x`", operationId: "owner-input" }, { role: "admin" })).rejects.toThrow();
+    expect(promptCalls()).toHaveLength(1); expect(queueCalls()).toHaveLength(0);
+  } finally { restarted.stop(); }
+});
+
+test.each(["waitingOnApproval", "waitingOnUserInput"])("native %s holds input without a TUI prompt or queue write", async flag => {
+  await attach(); h.busy(); h.thread.status = { type: "active", activeFlags: [flag] };
+  expect(await input()).toMatchObject({ queued: true });
+  expect(h.s.inbox.get("owner-input")?.state).toBe("queued"); expect(promptCalls()).toHaveLength(0); expect(queueCalls()).toHaveLength(0);
+});
+
+test("owner-held attached lead retains queued input without TUI prompt or queue write", async () => {
+  await attach();
+  await h.s.registry.update("lead", lane => ({ ...lane, status: "paused", holdReason: "owner-pause", dispatchBlocked: true, runtime: { ...lane.runtime!, held: true } }));
+  expect(await input()).toMatchObject({ queued: true });
+  expect(h.s.inbox.get("owner-input")?.state).toBe("queued");
+  expect(await h.s.registry.read("lead")).toMatchObject({ status: "paused", holdReason: "owner-pause", dispatchBlocked: true, runtime: { held: true } });
+  expect(promptCalls()).toHaveLength(0); expect(queueCalls()).toHaveLength(0);
 });

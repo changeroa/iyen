@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { defaultConfig } from "../src/config.ts";
 import { atomicJson } from "../src/journal.ts";
 import { ipc, readJson, serviceSocket, socketDir } from "../src/ipc.ts";
+import { operationText } from "../src/runtime/herdr.ts";
 import { withState } from "./fakes.ts";
 
 const waitFor = async <T>(read: () => Promise<T>, accept: (value: T) => boolean): Promise<T> => {
@@ -85,8 +86,11 @@ test("process handoff transfers only explicit queued input, revokes the old brid
     const afterRestart = await call("mail-list");
     expect(afterRestart.inbox.find((row: any) => row.id === "selected").turnId).toBe(receipt);
     const calls = readFileSync(join(state.dir, "external-codex-calls.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
-    const submissions = calls.filter(args => args[0] === "queue" && args[1] === "--thread");
-    expect(submissions).toHaveLength(1); expect(submissions[0][2]).toBe(newId);
+    expect(calls.filter(args => args[0] === "queue" && args[1] !== "--help")).toHaveLength(0);
+    const herdrCalls = readFileSync(join(state.dir, "fixture-herdr-calls.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const submissions = herdrCalls.filter(args => args[0] === "agent" && args[1] === "prompt");
+    expect(submissions).toEqual([["agent", "prompt", "current:p", operationText("selected", "selected")]]);
+    expect(readJson<any>(statePath).thread.id).toBe(newId);
     await stop(logs);
   } finally { daemon?.kill(); if (daemon) await daemon.exited; server.stop(true); state.done(); }
 }, 30000);
