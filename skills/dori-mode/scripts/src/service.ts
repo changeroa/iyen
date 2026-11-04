@@ -44,7 +44,7 @@ type OwnedFailure = Mail & { leadIntakeInstance?: string };
 const UNOWNED_LEAD = "unattached-lead";
 type HandoffArgs = { sessionFile?: string; terminalId?: string; fromThreadId: string; threadId: string; pane: string; cwd: string; mailIds: string[]; operationId: string };
 type ReconnectArgs = { operationId: string; threadId: string; pane: string; cwd: string; sessionFile?: string; terminalId?: string; expectedInstance: string; expectedGeneration: number; expectedRevision: number };
-type HandoffIntent = { reconnect?: ReconnectArgs; version: 1; status: "prepared" | "committed"; args: HandoffArgs; before: Lane; beforeAttachment: Attachment; after: Lane; afterAttachment: Attachment; result: any; createdAt: string; identityHeld?: boolean; cleanupPending?: boolean; activation?: boolean };
+type HandoffIntent = { reconnectWrites?: { before: Lane; after: Lane }[]; reconnect?: ReconnectArgs; version: 1; status: "prepared" | "committed"; args: HandoffArgs; before: Lane; beforeAttachment: Attachment; after: Lane; afterAttachment: Attachment; result: any; createdAt: string; identityHeld?: boolean; cleanupPending?: boolean; activation?: boolean };
 export type HandoffIO = { removeMarker(path: string): void };
 const durableMarkerRemoval = (path: string): void => {
   // Open before unlink so an open failure leaves the recovery marker intact.
@@ -508,22 +508,35 @@ export class DoriService {
         if (intent.reconnect) {
           if (this.leadRestarts.hasActive()) throw new Error("Lead restart incomplete; reconnect held");
           this.assertReconnectAllowed(fencedCurrent, beforeAttachment.instance);
-          const recoveringTransaction = fencedCurrent.dispatchBlocked && fencedCurrent.holdReason === "recovery" && (fencedCurrent.runtime?.external?.holdReason?.code === "handoff-interrupted" || fencedCurrent.runtime?.external?.latestHoldReason?.code === "handoff-interrupted");
+          // Only an exact source transition durably planned by this operation
+          // can explain a changed revision. Error/recovery holds are not proof.
+          const ownSourceWrite = intent.reconnectWrites?.some(write => sameJson(write.after, fencedCurrent));
           if (intent.status !== "committed" && fencedCurrent.runtime?.hostInstanceId === beforeAttachment.instance &&
-            fencedCurrent.revision !== intent.reconnect.expectedRevision && !recoveringTransaction) throw new Error("Reconnect source revision changed during validation");
+            fencedCurrent.revision !== intent.reconnect.expectedRevision && !ownSourceWrite) throw new Error("Reconnect source revision changed during validation");
           if (fencedCurrent.runtime?.generation !== (fencedCurrent.runtime?.hostInstanceId === beforeAttachment.instance ? beforeAttachment.generation : afterAttachment.generation) ||
             fencedCurrent.runtime?.threadId !== args.threadId || fencedCurrent.cwd !== args.cwd || ![beforeAttachment.pane, args.pane].includes(fencedCurrent.pane ?? "") || fencedCurrent.runtime?.external?.detachedAt || fencedCurrent.runtime?.state === "stopped") throw new Error("Reconnect source changed during validation");
         }
         if (intent.identityHeld) { intent = { ...intent, identityHeld: undefined }; atomicJson(path, intent); }
         if (intent.status !== "committed") {
-          await this.registry.update("lead", lane => ({ ...lane, dispatchBlocked: true, holdReason: lane.holdReason ?? "recovery", runtime: { ...lane.runtime!, held: true, state: "recovering" } }));
+          const writeStage = (change: (lane: Lane) => Lane) => this.registry.update("lead", lane => {
+            const next = change(lane);
+            if (intent.reconnect && lane.runtime?.hostInstanceId === beforeAttachment.instance) {
+              // Write ahead under the binding fence. A process death after the
+              // registry WAL append is recoverable even without running catch.
+              const after = { ...next, schemaVersion: 2 as const, revision: (lane.revision ?? 0) + 1 };
+              intent = { ...intent, reconnectWrites: [...(intent.reconnectWrites ?? []), { before: lane, after }] };
+              atomicJson(path, intent);
+            }
+            return next;
+          });
+          await writeStage(lane => ({ ...lane, dispatchBlocked: true, holdReason: lane.holdReason ?? "recovery", runtime: { ...lane.runtime!, held: true, state: "recovering" } }));
           for (const id of args.mailIds) {
             const row = this.inbox.get(id);
             if (!row || row.target !== "lead" || row.state !== "queued" || row.turnId || row.source?.startsWith("reconciled:") || row.attachmentInstance && ![UNOWNED_LEAD, beforeAttachment.instance, afterAttachment.instance].includes(row.attachmentInstance)) throw new Error("Handoff selected mail no longer safe; operator reconciliation required");
             if (row.attachmentInstance !== afterAttachment.instance) this.inbox.mark(id, { attachmentInstance: afterAttachment.instance });
           }
           if (!sameJson(readJson(this.attachmentPath()), afterAttachment)) atomicJson(this.attachmentPath(), afterAttachment);
-          await this.registry.update("lead", lane => ({ ...lane, pane: intent.after.pane, cwd: intent.after.cwd, model: intent.after.model, runtimeHistory: intent.after.runtimeHistory,
+          await writeStage(lane => ({ ...lane, pane: intent.after.pane, cwd: intent.after.cwd, model: intent.after.model, runtimeHistory: intent.after.runtimeHistory,
             dispatchBlocked: true, holdReason: lane.holdReason ?? "recovery", runtime: { ...intent.after.runtime!, held: true, state: "recovering" } }));
           intent = { ...intent, status: "committed" }; atomicJson(path, intent);
         }
@@ -551,7 +564,9 @@ export class DoriService {
         });
         if (error instanceof ExternalSessionError && error.code === "identity-unverified") { intent = { ...intent, identityHeld: true }; atomicJson(path, intent); }
         const lane = await this.registry.read("lead");
-        if (lane?.runtime) {
+        // Reconnect's active marker already fences dispatch. Do not mutate a
+        // refused source, or turn validation failure into recovery authorization.
+        if (lane?.runtime && !intent.reconnect) {
           await this.holdExternal(lane.runtime.hostInstanceId, new ExternalSessionError("handoff-interrupted", "Recorded lead handoff is incomplete; verify its exact target and retry the same operationId."));
           await this.recordRetry(lane.runtime.hostInstanceId);
         }
@@ -1778,7 +1793,13 @@ const serveService = async (config: DoriConfig): Promise<void> => {
     process.once("SIGTERM", stop); process.once("SIGINT", stop);
   });
   clearInterval(timer); clearInterval(monitor);
-  await drainIngress(children, readers);
+  try { await drainIngress(children, readers); }
+  catch (error) {
+    // Keep socket/lock ownership until producer and reader shutdown is proven,
+    // but reject new RPC mutations while accepted receive work can still settle.
+    service.stop();
+    throw error;
+  }
   for (const lane of await service.registry.open()) if (lane.runtime?.backend !== "external-current-session") await service.deps.runtime.hold(lane.key, "automatic").catch(() => {});
   service.stop(); server.stop(true);
   if (existsSync(socket)) unlinkSync(socket);

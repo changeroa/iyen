@@ -211,7 +211,8 @@ test("native hold acquired after preparation blocks transaction completion", asy
   let calls = 0; h.onInspect(() => { if (++calls === 5) h.held(); });
   await expect(h.s.handle("lead-reconnect", args, admin)).rejects.toThrow("natively held");
   expect(h.saved()).toEqual(old);
-  expect((await h.s.registry.read("lead"))!.dispatchBlocked).toBe(true);
+  expect(existsSync(join(h.config.stateDir, "attachments/handoff.json"))).toBe(true);
+  await expect(h.s.handle("input", { key: "lead", text: "must stay fenced", operationId: "blocked" }, admin)).rejects.toThrow("mutations are held");
 });
 
 test("plain registry revision race after intent publication cannot commit", async () => {
@@ -219,5 +220,66 @@ test("plain registry revision race after intent publication cannot commit", asyn
   let calls = 0;
   h.onInspect(() => { if (++calls === 2) h.race(async () => { await h.s.registry.update("lead", lane => ({ ...lane, brief: "changed concurrently" })); }); });
   await expect(h.s.handle("lead-reconnect", args, admin)).rejects.toThrow("revision changed");
+  const refused = await h.s.registry.read("lead");
+  await expect(h.s.handle("lead-reconnect", args, admin)).rejects.toThrow("revision changed");
+  expect(await h.s.registry.read("lead")).toEqual(refused);
+  h.reload();
+  await expect(h.s.handle("lead-reconnect", args, admin)).rejects.toThrow("revision changed");
+  await expect(h.s.deps.runtime.inspect("lead")).rejects.toThrow("revision changed");
+  expect(await h.s.registry.read("lead")).toEqual(refused);
+  expect(h.saved()).toEqual(old);
+  const intent = readJson<any>(join(h.config.stateDir, "attachments/handoffs", `${payloadHash(args.operationId)}.json`));
+  expect(intent.reconnectWrites).toBeUndefined();
+});
+
+test("process death after its own hold WAL write recovers without any catch handler", async () => {
+  const h = await fixture(), args = await h.args("hard-crash"), old = h.saved(); h.restart();
+  const target = h.f.identity;
+  const row = { agent: "omp", pane_id: target.paneId, terminal_id: target.terminalId, cwd: target.cwd,
+    agent_session: { agent: "omp", kind: "path", source: "herdr:omp", value: target.sessionFile } };
+  const script = `
+    import { DoriService } from ${JSON.stringify(join(import.meta.dir, "../src/service.ts"))};
+    const row = ${JSON.stringify(row)};
+    const runner = async argv => ({code:0,err:"",out:JSON.stringify({result:argv[1] === "api" ? {snapshot:{panes:[row],agents:[row]}} : {agents:[row]}})});
+    const service = new DoriService(${JSON.stringify(h.config)}, runner);
+    const update = service.registry.update.bind(service.registry);
+    service.registry.update = async (key, fn) => {
+      const lane = await update(key, fn);
+      if (key === "lead" && lane.runtime.hostInstanceId === ${JSON.stringify(old.instance)} && lane.dispatchBlocked) process.exit(73);
+      return lane;
+    };
+    await service.handle("lead-reconnect", ${JSON.stringify(args)}, {role:"admin"});
+    throw new Error("crash injection missed");
+  `;
+  const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
+  const code = await child.exited;
+  const stderr = await new Response(child.stderr).text();
+  expect({ code, stderr }).toEqual({ code: 73, stderr: "" });
+  h.reload();
+  const held = (await h.s.registry.read("lead"))!;
+  expect(held.dispatchBlocked).toBe(true);
+  expect(held.runtime!.external!.holdReason).toBeUndefined();
+  const intent = readJson<any>(join(h.config.stateDir, "attachments/handoffs", `${payloadHash(args.operationId)}.json`));
+  expect(intent.reconnectWrites).toHaveLength(1);
+  expect(intent.reconnectWrites[0].before.revision).toBe(args.expectedRevision);
+  expect(intent.reconnectWrites[0].after).toEqual(held);
+  await h.s.deps.runtime.inspect("lead");
+  expect(h.saved().generation).toBe(old.generation + 1);
+  expect((await h.s.handle("lead-reconnect", args, admin)).attached).toBe(true);
+});
+
+test("a recorded own hold cannot authorize a later unrelated source revision", async () => {
+  const h = await fixture(), args = await h.args(), old = h.saved(); h.restart();
+  const update = h.s.registry.update.bind(h.s.registry); let armed = true;
+  h.s.registry.update = async (key, fn) => {
+    const lane = await update(key, fn);
+    if (armed && lane.dispatchBlocked) { armed = false; throw new Error("interrupted own hold"); }
+    return lane;
+  };
+  await expect(h.s.handle("lead-reconnect", args, admin)).rejects.toThrow("interrupted own hold");
+  await h.s.registry.update("lead", lane => ({ ...lane, brief: "unrelated later source update" }));
+  h.reload();
+  await expect(h.s.handle("lead-reconnect", args, admin)).rejects.toThrow("revision changed");
+  await expect(h.s.deps.runtime.inspect("lead")).rejects.toThrow("revision changed");
   expect(h.saved()).toEqual(old);
 });
