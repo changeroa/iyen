@@ -93,6 +93,14 @@ export async function launchLocked(selection: Selection, options: Options, deps:
   current.identity = identity; current.phase = current.phase === "attached" ? "attached" : "native-ready"; persist();
   if (current.attachmentRequest && !current.attachmentRequest.completed || !lead || !lead.identityVerified || lead.pane !== identity.pane || kind === "omp" && !reused) {
     if (!current.attachmentRequest) {
+      // Native startup may take minutes while service recovery updates revision.
+      // Capture a fresh source immediately before fixing the durable request.
+      const freshStatus = await deps.call(selection, "status");
+      if (!Array.isArray(freshStatus)) throw new Error("Public service status unavailable before attachment request");
+      const freshLead = freshStatus.find((lane: any) => lane.key === "lead");
+      if (Boolean(freshLead) !== Boolean(lead) || lead && (freshLead.runtime?.hostInstanceId !== lead.runtime.hostInstanceId || freshLead.runtime?.generation !== lead.runtime.generation || freshLead.runtime?.threadId !== lead.runtime.threadId || freshLead.pane !== lead.pane || realpathSync(freshLead.cwd) !== realpathSync(lead.cwd))) throw new Error("Lead attachment source changed during native startup; reconcile before reconnect");
+      assertLeadResumable(freshLead);
+      lead = freshLead;
       const args = { threadId: identity.threadId, pane: identity.pane, cwd: identity.cwd,
         ...(kind === "omp" ? { sessionFile: identity.sessionFile, terminalId: identity.terminalId } : {}),
         ...(lead ? { operationId: `launcher:${current.operationId}`, expectedInstance: lead.runtime.hostInstanceId, expectedGeneration: lead.runtime.generation, expectedRevision: lead.revision } : {}) };
