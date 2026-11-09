@@ -152,7 +152,7 @@ export const runOmpSessionHost = async (stateDir: string, boot: Bootstrap): Prom
 const runOmpOwnedSessionHost = async (stateDir: string, boot: Bootstrap): Promise<void> => {
   const config = boot.config, omp = config.runtime.omp;
   if (!omp || boot.role !== "lane" || boot.key === "lead") throw new Error("Invalid managed OMP host");
-  const role = { ...config.runtime.roles.lane, ...(boot.model ? { model: boot.model } : {}) };
+  const role = { ...config.runtime.roles.lane, ...(boot.model ? { model: boot.model } : {}), ...(boot.effort ? { effort: boot.effort } : {}) };
   if (!role.model || !role.effort) throw new Error("OMP requires explicit provider/model/effort");
   const version = await run([config.runtime.binary, "--version"], { env: ompProfileEnvironment(config.runtime.settingsHome!) });
   if (version.code !== 0 || !ompVersionMatches(version.out, config.runtime.requiredVersion)) throw new Error("OMP version mismatch");

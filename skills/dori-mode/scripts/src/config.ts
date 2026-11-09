@@ -19,6 +19,7 @@ export type IngressConfig = { id: string; command: string[]; owners: string[] };
 export type DoriConfig = {
   schemaVersion: 2; stateDir: string; personaDir?: string; leadWorkspace?: string; laneWorkspace: string; workspaces: readonly string[];
   ignorePanes: readonly string[]; leadPane: string; defaultCwd: string; runtime: RuntimeConfig;
+  autoPostReports: boolean;
   nudgeAfterMin: number; postAfterMin: number; closeAfterMin: number; workThresholdSec: number; heavySlots: number; heavyMaxLoad: number;
   guard: GuardThresholds; hooks: Hooks; ingress: IngressConfig[];
 };
@@ -27,7 +28,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   runtime: { kind: "codex", binary: "codex", requiredVersion: "0.163.0", startupTimeoutMs: 30000, rpcTimeoutMs: 15000,
     heartbeatIntervalMs: 5000, heartbeatTimeoutMs: 20000, sandbox: "workspace-write", approvalPolicy: "on-request",
     roles: { lead: { model: null, effort: null }, lane: { model: null, effort: null } } },
-  nudgeAfterMin: 15, postAfterMin: 20, closeAfterMin: 5, workThresholdSec: 120, heavySlots: 1, heavyMaxLoad: 80,
+  autoPostReports: false, nudgeAfterMin: 15, postAfterMin: 20, closeAfterMin: 5, workThresholdSec: 120, heavySlots: 1, heavyMaxLoad: 80,
   guard: { loadAlert: 150, loadOk: 80, memFreeMinPct: 20, diskFreeMinGb: 50, panesMax: 20 }, hooks: {}, ingress: [],
 });
 export const configPath = (home = homedir()): string => {
@@ -67,6 +68,7 @@ export const parseConfig = (raw: Record<string, any>, home = homedir()): DoriCon
   }
   for (const n of [cfg.nudgeAfterMin, cfg.postAfterMin, cfg.closeAfterMin, cfg.heavySlots, cfg.heavyMaxLoad]) if (!Number.isFinite(n) || n <= 0) throw new Error("Intervals and limits must be positive");
   if (!Number.isFinite(cfg.workThresholdSec) || cfg.workThresholdSec <= 0) throw new TypeError("workThresholdSec must be a positive number");
+  if (typeof cfg.autoPostReports !== "boolean") throw new Error("autoPostReports must be boolean");
   if (!Number.isInteger(cfg.heavySlots)) throw new Error("heavySlots must be an integer");
   if (Object.values(cfg.guard).some(n => !Number.isFinite(n) || n < 0)) throw new Error("Invalid guard threshold");
   if (new Set(cfg.ingress.map(i => i.id)).size !== cfg.ingress.length) throw new Error("Ingress IDs must be unique");

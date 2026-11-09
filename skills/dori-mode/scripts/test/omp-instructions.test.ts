@@ -24,7 +24,7 @@ test("OMP brief examples work through own scoped service and refuse another lane
     const service = new DoriService(config, fakeRunner(newWorld()));
     await service.registry.write(lane);
     const text = footer(lane), caller = { role: "lane" as const, key: lane.key };
-    for (const label of ["Own-lane status", "Milestone report", "Completion"]) {
+    for (const label of ["Own-lane status", "Milestone report", "Checkpoint", "Completion"]) {
       const { action, args } = example(text, label);
       expect(args.key).toBe(lane.key);
       await expect(service.handle(action, { ...args, key: "another-lane" }, caller)).rejects.toThrow("capability");
@@ -53,7 +53,7 @@ for (const kind of ["omp", "codex"] as const) test(`launch submits the persisted
       return originalRun(argv);
     };
     const brief = join(state.dir, "input.md"); await Bun.write(brief, "Bounded work.\n");
-    const result = await launchLane(deps, { key: lane.key, title: lane.title, brief, done: lane.done }, async registered => {
+    const result = await launchLane(deps, { key: lane.key, title: lane.title, brief, done: lane.done, model: "test", effort: "medium" }, async registered => {
       await deps.registry.update(registered.key, current => ({ ...current, runtime: { ...current.runtime!, threadId: "fixture-native-session" } }));
     });
     const saved = await Bun.file(result.lane.brief).text();

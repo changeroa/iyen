@@ -7,14 +7,14 @@ An attached lead is borrowed: detach revokes its scoped bridge and stops routing
 ## Launch
 
 ```sh
-dori launch fix-login --title "Fix login" --brief ~/briefs/fix-login.md \
+dori launch fix-login --title "Fix login" --model MODEL --effort medium --brief ~/briefs/fix-login.md \
   --done "merged acme/app#412; closed acme/app#398" \
   --thread "telegram:<chat>/<topic>" --cwd ~/code/app --worktree
 ```
 
 Write the objective, evidence, expected behavior, scope and forbidden changes into the brief. The service generates a separate brief with the lane contract, leaving the original intact. --worktree records a base SHA and creates an owned branch/worktree for concurrent writers. Without it, the supplied cwd is used and is never owned for deletion.
 
-STARTUP_OK requires a registered Codex thread and an accepted first input. A missing response yields STARTUP_UNCONFIRMED; inspect status and mail list instead of relaunching. Reusing --operation-id deduplicates a completed launch. Resource HOLD leaves the request queued.
+STARTUP_OK requires a registered Codex thread and an accepted first input. A missing response yields STARTUP_UNCONFIRMED; inspect status and mail list instead of relaunching. Reusing --operation-id deduplicates a completed launch. Resource HOLD leaves a recorded intent, never an unattended queue. The lead chooses when to retry the same operation ID and exact payload; service ticks and restarts never launch it.
 
 **Why the `Done =` line has to be checkable:** the watcher closes lanes on its own, so it can only trust what it can read back itself. `launch` and `adopt` refuse any signal outside this list. Signals are joined with `;`, and every one has to pass.
 
@@ -48,7 +48,7 @@ The service is the only writer. Lane snapshots live in state/lanes; append-only 
 - claim/history/receipt: evidence, deadline and cleanup history.
 - worktrees/resumeRefs: explicit ownership and saved Git resume points.
 
-Use dori report KEY --kind milestone --text-file PATH --event-id ID. The service persists the event and forwards it to the lead; configured threadReply hooks post milestones. Identical event IDs are not reposted. Do not infer progress from terminal text.
+Use dori report KEY --kind milestone --text-file PATH --event-id ID. The service persists the event and forwards it to the lead; there is no immediate raw threadReply post. Only explicitly configured `autoPostReports: true` enables separate freshness-based report posting. The lead normally reads the report and explains it to the owner. Identical event IDs are not reposted. Do not infer progress from terminal text.
 
 ## Pause and recovery
 
@@ -58,4 +58,4 @@ Use dori recover KEY after a host dies. An existing live host/process prevents a
 
 A closed lane is reopened with dori reopen KEY --text-file PATH. It keeps the Codex thread and messenger reference, increments cycle, and removes the old claim deadline from the active cycle. Owned worktrees are restored from saved branch/SHA references. A genuinely missing Codex thread is an error, never silently replaced.
 
-To transfer an existing external Codex thread, stop its other client first and use dori adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS --transfer-confirmed. Adoption starts held. Resume only after verifying ownership and context.
+To transfer an existing external Codex thread, stop its other client first and use dori adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS --model MODEL --effort EFFORT --transfer-confirmed. Model/effort are optional for legacy adoption compatibility, but any supplied selection is persisted through bootstrap and checked by the runtime; omitting them uses existing role defaults. New launch requires both explicitly. Existing legacy private-RPC recovery barriers remain in force; adoption does not authorize bypassing them. Adoption starts held. Resume only after verifying ownership and context.

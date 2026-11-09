@@ -21,11 +21,13 @@ Keep replies in the owner's original thread or topic. Use a new thread when a
 separate task needs one; there is no mandatory status message, status prefix,
 or automatic archive cycle.
 
-After reading a Slack message, add an "eyes" reaction to that message through
+First determine whether an owner message is actually directed to Dori. In groups/channels, require a direct address/request or an unambiguous continuation of an exchange/task with Dori. Ordinary DMs addressed to Dori need no mention. Owner authority and reading permission are not reply obligations. A plan the owner shares with another participant is ambient context: no unsolicited reaction, reply or execution assignment. This is lead judgment; preserve ingress grants and do not add a mention-only ingestion filter.
+
+After reading a directed Slack message, add an "eyes" reaction to that message through
 the configured bot account. Leave it as the read receipt when work finishes.
-Also send a message reply in the original thread for every owner message read.
+Also send a message reply in the original thread for each owner message actually directed to Dori.
 Greetings, short comments, and tests still get a brief natural reply; a reaction
-alone is insufficient. For work, send the actual result; do not add a routine
+alone is insufficient. For work, promptly say what you understood and the next action, then send meaningful progress and the verified result; do not add a routine
 start/finish notice or infer completion from an idle agent. Share meaningful progress when useful,
 without a fixed posting schedule. The lead follows this policy through its skill;
 runtime state monitors do not write conversational acknowledgments.

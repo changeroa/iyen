@@ -21,6 +21,11 @@ import { run, realClock, type Runner } from "./run.ts";
 import { backendSocket, bootstrapPath, type Bootstrap } from "./runtime/session-host.ts";
 import type { RuntimeInputReceipt, ExternalHoldCode, RuntimeControl, RuntimeRef, RuntimeSnapshot } from "./runtime/types.ts";
 import { WorkTimers } from "./work.ts";
+import { RequestWorklog } from "./worklog.ts";
+import { Checkpoints } from "./checkpoints.ts";
+import { Lessons, lessonRepository } from "./lessons.ts";
+import { recordReport } from "./reports.ts";
+import { supervisionTick } from "./supervision.ts";
 import { turnFailure, ompFailureGuidance } from "./turn-failure.ts";
 import { DeliveryDeferred, Mailbox, postHook, type Mail } from "./mailbox.ts";
 import { ExternalCurrentSession, ExternalSessionError, discoverExternal, observeExternal, sharedDaemon, THREAD_UUID, type Attachment as CodexAttachment } from "./runtime/external-current-session.ts";
@@ -1115,7 +1120,7 @@ export class DoriService {
       lane = await this.registry.update(lane.key, l => ({ ...l, runtime: l.runtime && { ...l.runtime, threadId: checkpoint.threadId } }));
     }
     const instance = crypto.randomUUID();
-    const boot: Bootstrap = { key: lane.key, role: lane.role ?? "lane", pane, instance, generation: (lane.runtime?.generation ?? 0) + 1, hostToken: crypto.randomUUID(), laneToken: crypto.randomUUID(), cwd: lane.cwd ?? this.config.defaultCwd, threadId: lane.runtime?.threadId, model: lane.model, blocked: Boolean(lane.dispatchBlocked), config: this.config };
+    const boot: Bootstrap = { key: lane.key, role: lane.role ?? "lane", pane, instance, generation: (lane.runtime?.generation ?? 0) + 1, hostToken: crypto.randomUUID(), laneToken: crypto.randomUUID(), cwd: lane.cwd ?? this.config.defaultCwd, threadId: lane.runtime?.threadId, model: lane.model ?? lane.runtime?.model, effort: lane.effort ?? lane.runtime?.effort, blocked: Boolean(lane.dispatchBlocked), config: this.config };
     if (this.config.runtime.kind === "omp" && lane.runtime?.omp && existsSync(path)) {
       const old = readJson<Bootstrap>(path);
       // The existing native extension's MCP helper already loaded this scoped
@@ -1296,10 +1301,33 @@ export class DoriService {
     }
     if (caller.role === "host") throw new Error("Host cannot issue user commands");
     const key = args.key ?? caller.key;
-    if (caller.role === "lane" && (!(["report", "claim-done", "status"].includes(action)) || key !== caller.key)) throw new Error("Lane capability does not authorize this command");
+    if (caller.role === "lane" && (!(["report", "claim-done", "status", "checkpoint-record", "checkpoint-list", "lesson-add", "lesson-list"].includes(action)) || key !== caller.key)) throw new Error("Lane capability does not authorize this command");
     if (key && key !== "lead" && action !== "status" && action !== "retire" && action !== "close" && (await this.registry.read(key))?.retirement)
       throw new Error("Retired lane cannot accept new work; use a new lane key");
     if (["pause", "resume", "close", "recover", "reopen", "claim-done", "object-done"].includes(action) && (await this.registry.read(key))?.runtime?.backend === "external-current-session") throw new Error(`External current-session ${action} is unsupported; use lead-detach`);
+    if (action.startsWith("worklog-")) {
+      if (caller.role !== "lead" && caller.role !== "admin") throw new Error("Worklog requires lead or operator");
+      this.assertNoPendingLeadMutation();
+      const log = new RequestWorklog(this.config.stateDir, this.deps.clock);
+      if (action === "worklog-list") return log.list();
+      if (action === "worklog-show") return log.read(args.requestId);
+      if (action === "worklog-render") return { markdown: log.render() };
+      if (action === "worklog-record") return log.record(args.eventId, args);
+      if (action === "worklog-update") return log.update(args.eventId, args.requestId, args.patch);
+      throw new Error("Unknown worklog operation");
+    }
+    if (action === "checkpoint-record" || action === "checkpoint-list") {
+      const lane = await this.lane(key), checkpoints = new Checkpoints(this.config.stateDir, this.deps.clock);
+      return action === "checkpoint-list" ? checkpoints.list(key) : checkpoints.record(lane, args);
+    }
+    if (action === "lesson-add" || action === "lesson-list") {
+      const lane = args.key || caller.role === "lane" ? await this.lane(key) : undefined;
+      // A worker cannot select another repository or write to arbitrary files.
+      const repository = lane?.repository ?? lane?.cwd ?? (caller.role !== "lane" ? args.repository : undefined);
+      if (!repository || args.repository && lessonRepository(args.repository) !== lessonRepository(repository)) throw new Error("Lesson repository scope mismatch");
+      const lessons = new Lessons(this.config.stateDir, repository, this.deps.clock);
+      return action === "lesson-list" ? lessons.list() : lessons.add(args.eventId, args.text, args.evidence);
+    }
     if (["work-start", "work-stop", "work-similar"].includes(action)) {
       if (caller.role !== "lead" && caller.role !== "admin") throw new Error("Work timers require lead or operator");
       const timers = new WorkTimers(this.config.stateDir, this.deps.clock);
@@ -1335,6 +1363,13 @@ export class DoriService {
         const mail = this.operations.put({ id, target: key, text: JSON.stringify(args), state: "queued", at: new Date().toISOString() });
         if (mail.state === "sent") return { lane: await this.lane(key), startup: `STARTUP_OK ${key} (recorded)` };
         if (mail.state !== "queued") throw new Error("Launch outcome unknown; inspect status, do not replay");
+        // Legacy queued HOLD intents can lack today's explicit model/effort.
+        // Validate before any attempted mutation; preserve their exact stable payload.
+        try { await validateLaunch(this.deps, args as LaunchInput); }
+        catch (error) {
+          this.operations.mark(id, { metadata: { type: "launch-preflight-rejection", attempted: false } });
+          throw new LaunchError(`${error instanceof Error ? error.message : "Launch preflight refused"}; unattempted intent retained. Use a new operation ID for a corrected payload`);
+        }
         this.operations.mark(id, { state: "sending" });
         try {
           const result = await launchLane(this.deps, args as LaunchInput, l => this.boot(l));
@@ -1346,9 +1381,10 @@ export class DoriService {
       });
     }
     if (action === "adopt") {
+      if (this.config.runtime.kind === "omp") throw new LaunchError("OMP adopt is unsupported; managed lanes require the verified OMP bootstrap");
       if (!args.threadId || args.transferConfirmed !== true) throw new Error("adopt requires thread-id and confirmed exclusive ownership transfer");
-      await validateLaunch(this.deps, args);
-      const lane: Lane = { key, title: args.title, thread: args.thread ?? "none", brief: args.brief, done: args.done, pane: args.pane, cwd: args.cwd ?? this.config.defaultCwd, role: "lane", openedAt: new Date().toISOString(), status: "paused", pausedFrom: "working", dispatchBlocked: true, holdReason: "owner-pause", runtime: { kind: "codex", threadId: args.threadId, hostInstanceId: "", generation: 0, state: "stopped", binaryVersion: this.config.runtime.requiredVersion } };
+      await validateLaunch(this.deps, args, false);
+      const lane: Lane = { key, title: args.title, thread: args.thread ?? "none", brief: args.brief, done: args.done, pane: args.pane, cwd: args.cwd ?? this.config.defaultCwd, role: "lane", model: args.model, effort: args.effort, openedAt: new Date().toISOString(), status: "paused", pausedFrom: "working", dispatchBlocked: true, holdReason: "owner-pause", runtime: { kind: "codex", threadId: args.threadId, hostInstanceId: "", generation: 0, state: "stopped", binaryVersion: this.config.runtime.requiredVersion } };
       await this.registry.write(lane); await this.boot((await this.lane(key))); return this.lane(key);
     }
     if (action === "pause") return pauseLane(this.deps, await this.lane(key), args.note ?? "Owner requested pause");
@@ -1404,15 +1440,7 @@ export class DoriService {
       catch (error) { if (error instanceof DeliveryDeferred) return { queued: true, operationId: mail.id }; throw error; }
     }
     if (action === "report") {
-      if (!["milestone", "blocker", "question", "done"].includes(args.kind) || !args.text || !args.eventId) throw new Error("Invalid report");
-      const id = `report:${key}:${args.eventId}`;
-      const report = this.putInbox({ id, target: "lead", text: `[REPORT] ${key} | ${args.kind} | ${args.text}`, state: "queued", at: new Date().toISOString() });
-      await this.registry.update(key, l => ({ ...l, report: { id: args.eventId, kind: args.kind, text: args.text, at: Date.parse(report.at) } }));
-      const lane = await this.lane(key);
-      if (this.config.hooks.threadReply && lane.thread !== "none") {
-        await this.deps.post!(id, this.config.hooks.threadReply, { key, thread: lane.thread, text: args.text });
-        await this.registry.update(key, l => ({ ...l, lastReplyAt: Date.now(), lastPostedReport: args.eventId }));
-      }
+      await recordReport(this.registry, mail => this.putInbox(mail), { ...args, key });
       return { recorded: true };
     }
     if (action === "reply") {
@@ -1690,7 +1718,7 @@ export class DoriService {
       await this.deps.runtime.inspect("lead").catch(() => {}); await this.health(); return;
     }
     const once = async (name: string, fn: () => Promise<unknown>) => {
-      const interval = ["inbox", "failures", "external-observation", "native-interactions"].includes(name) ? 1000 : name === "done" ? 30000 : name === "launch-queue" ? 10000 : 60000;
+      const interval = ["inbox", "failures", "external-observation", "native-interactions"].includes(name) ? 1000 : name === "done" ? 30000 : 60000;
       if (this.ticks.has(name) || Date.now() - (this.lastTick.get(name) ?? 0) < interval) return;
       this.lastTick.set(name, Date.now()); this.ticks.add(name);
       try { await fn(); } catch { console.error(`MONITOR_ERROR ${name}`); } finally { this.ticks.delete(name); }
@@ -1704,6 +1732,7 @@ export class DoriService {
       once("failures", () => this.notifyFailures()),
       once("done", () => watchTick(this.deps).then(lines => lines.forEach(l => console.log(l)))),
       once("freshness", () => freshnessTick(this.deps, process.env.HOME ?? "")),
+      once("supervision", () => supervisionTick(this.deps, mail => this.putInbox(mail))),
       once("runtime-health", async () => {
         for (const lane of await this.registry.open()) {
           if (!lane.runtime || lane.runtime.state === "stopped" || lane.cleanupFence) continue;
@@ -1713,14 +1742,6 @@ export class DoriService {
           if (age <= timeout || lane.holdReason === "recovery") continue;
           await this.registry.update(lane.key, l => ({ ...l, dispatchBlocked: true, holdReason: l.holdReason ?? "recovery", runtime: l.runtime && { ...l.runtime, state: "recovering" } }));
           if (lane.role !== "lead") this.putInbox({ id: `host-unreachable:${lane.key}:${lane.runtime.hostInstanceId}`, target: "lead", text: `Host unreachable for ${lane.key}; dispatch held. Reconcile before recovery.`, state: "queued", at: new Date().toISOString() });
-        }
-      }),
-      once("launch-queue", async () => {
-        for (const row of this.operations.list().filter(r => r.state === "queued")) {
-          const args = JSON.parse(row.text);
-          if (row.target === "lead" || args.role === "lead") continue;
-          if ((await this.registry.read(row.target))?.runtime?.backend === "external-current-session") continue;
-          if (args.operationId) await this.handle("launch", args, { role: "admin" }).catch(() => {});
         }
       }),
       once("inbox", async () => {

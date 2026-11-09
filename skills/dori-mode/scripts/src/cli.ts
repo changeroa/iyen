@@ -24,10 +24,10 @@ const help = `dori — messenger lead and lanes (Codex default, explicit OMP pro
   lead-handoff --from-thread-id UUID --thread-id UUID --pane ID --cwd DIR --operation-id ID (--mail-id ID ... | --no-mail)
   lead-restart --operation-id ID --source-message-id ID
   lead-restart-status --operation-id ID
-  launch KEY --title T --brief FILE --done SIGNALS [--thread REF] [--cwd DIR] [--model M] [--worktree]
+  launch KEY --title T --brief FILE --done SIGNALS [--thread REF] [--cwd DIR] --model M --effort E [--worktree]
   input KEY --text-file FILE [--operation-id ID]
   input-status KEY --operation-id ID [--text-file FILE]
-  report KEY --kind milestone|blocker|question|done --text-file FILE --event-id ID
+  report KEY --kind milestone|blocker|question|halted|done --text-file FILE --event-id ID
   reply --thread REF --text-file FILE [--operation-id ID]
   claim-done [KEY] --evidence TEXT
   object-done KEY --reason TEXT [--reason TEXT]
@@ -36,7 +36,7 @@ const help = `dori — messenger lead and lanes (Codex default, explicit OMP pro
   retire KEY --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N
   recover KEY | reopen KEY [--text-file FILE] [--new-session --handoff-file FILE]
   recover KEY --stop-current --operation-id ID [--text-file FILE] (managed OMP only)
-  adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS --transfer-confirmed
+  adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS [--model M --effort E] --transfer-confirmed
   sync [--write] | can-launch | watch | freshness | dead-panes | guard
   approval list | approval respond ID --response-file FILE [--operation-id ID (required for native OMP)]
   approval respond ID --response-file FILE --source-message-id ID (current attached lead)
@@ -45,6 +45,11 @@ const help = `dori — messenger lead and lanes (Codex default, explicit OMP pro
   migrate --dry-run | migrate --apply
   work start --title T [--tag TAG ...] [--thread REF] [--operation-id UUID]
   work stop ID | work similar [--title T] [--tag TAG ...]
+  worklog record --request-id ID --title T --request TEXT --source REF --next-action TEXT --event-id ID
+  worklog update --request-id ID [--state received|active|waiting|completed|cancelled] [--notes TEXT] [--next-action TEXT] [--outcome TEXT] --event-id ID
+  worklog list|show --request-id ID|render
+  checkpoint record KEY --stage STAGE --evidence TEXT --next-action TEXT --event-id ID | checkpoint list KEY
+  lesson add|list [KEY | --repository DIR] [--text-file FILE --evidence TEXT --event-id ID]
   heavy LABEL -- COMMAND ...
   send slack|telegram|discord --to TARGET --text TEXT [--thread ID] [--edit ID]
   presence slack|discord | transcribe FILE | inbound slack [--loop MIN]
@@ -61,7 +66,7 @@ const scopedCommands: Record<string, true> = {
   "": true, help: true, status: true, health: true, "can-launch": true, launch: true, adopt: true,
   input: true, "input-status": true, reply: true, report: true, "claim-done": true, "object-done": true,
   pause: true, resume: true, close: true, retire: true, reopen: true, recover: true, sync: true,
-  approval: true, mail: true, work: true, "lead-detach": true, "lead-restart": true, "lead-restart-status": true,
+  approval: true, mail: true, work: true, worklog: true, checkpoint: true, lesson: true, "lead-detach": true, "lead-restart": true, "lead-restart-status": true,
   watch: true, freshness: true, "dead-panes": true, guard: true, "mcp-server": true,
 };
 const scopedHelp = `iyen — scoped service commands
@@ -70,29 +75,34 @@ const scopedHelp = `iyen — scoped service commands
   lead-detach --thread-id UUID
   lead-restart --operation-id ID --source-message-id ID
   lead-restart-status --operation-id ID
-  launch KEY --title T --brief FILE --done SIGNALS [--thread REF] [--cwd DIR] [--model M] [--worktree]
+  launch KEY --title T --brief FILE --done SIGNALS [--thread REF] [--cwd DIR] --model M --effort E [--worktree]
   input KEY --text-file FILE [--operation-id ID]
   input-status KEY --operation-id ID [--text-file FILE]
   reply --thread REF --text-file FILE [--operation-id ID]
-  report KEY --kind milestone|blocker|question|done --text-file FILE --event-id ID
+  report KEY --kind milestone|blocker|question|halted|done --text-file FILE --event-id ID
   claim-done KEY --evidence TEXT | object-done KEY --reason TEXT
   pause KEY | resume KEY | close KEY [--note TEXT]
   resume KEY --allow-unknown --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N
   retire KEY --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N
   recover KEY | reopen KEY [--text-file FILE]
   recover KEY --stop-current --operation-id ID [--text-file FILE] (managed OMP only)
-  adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS --transfer-confirmed
+  adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS [--model M --effort E] --transfer-confirmed
   sync [--write] | approval list | mail list
   approval respond ID --response-file FILE --source-message-id ID
   mail resolve ID --box inbox --state sent --evidence TEXT
   mail abandon ID --operation-id ID --evidence TEXT
   work start --title T [--tag TAG ...] [--thread REF] [--operation-id UUID]
   work stop ID | work similar [--title T] [--tag TAG ...]
+  worklog record --request-id ID --title T --request TEXT --source REF --next-action TEXT --event-id ID
+  worklog update --request-id ID [--state received|active|waiting|completed|cancelled] [--notes TEXT] [--next-action TEXT] [--outcome TEXT] --event-id ID
+  worklog list|show --request-id ID|render
+  checkpoint record KEY --stage STAGE --evidence TEXT --next-action TEXT --event-id ID | checkpoint list KEY
+  lesson add|list [KEY | --repository DIR] [--text-file FILE --evidence TEXT --event-id ID]
 
 Service authorization applies to every operation. Attached lead lifecycle uses lead-detach.
 Unknown deliveries are never automatically replayed.`;
 const flags = parseArgs({ args: rest, allowPositionals: true, strict: true, options: Object.fromEntries([
-  ...["title", "brief", "done", "thread", "model", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "from-thread-id", "session-file", "terminal-id", "response-file", "source-message-id", "state-dir", "handoff-file", "key", "box", "state", "expected-instance", "expected-generation"].map(k => [k, { type: "string" }]),
+  ...["title", "brief", "done", "thread", "model", "effort", "repository", "request-id", "request", "source", "next-action", "notes", "outcome", "stage", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "from-thread-id", "session-file", "terminal-id", "response-file", "source-message-id", "state-dir", "handoff-file", "key", "box", "state", "expected-instance", "expected-generation"].map(k => [k, { type: "string" }]),
   ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help", "new-session", "stop-current", "no-mail", "json", "allow-unknown"].map(k => [k, { type: "boolean" }]),
   ["mail-id", { type: "string", multiple: true }],
   ["reason", { type: "string", multiple: true }],
@@ -154,6 +164,18 @@ try {
         ...(command === "lead-handoff" ? { operationId: need("operation-id"), mailIds: mailIds ?? [] } : mailIds ? { mailIds } : {}) });
       break;
     }
+    case "worklog":
+      if (key === "record") result = await call("worklog-record", { requestId: need("request-id"), title: need("title"), request: need("request"), source: need("source"), nextAction: need("next-action"), eventId: need("event-id") });
+      else if (key === "update") result = await call("worklog-update", { requestId: need("request-id"), eventId: need("event-id"), patch: { status: opt("state"), nextAction: opt("next-action"), notes: opt("notes"), outcome: opt("outcome") } });
+      else if (["list", "show", "render"].includes(key ?? "")) result = await call(`worklog-${key}`, { requestId: opt("request-id") });
+      else throw new Error("worklog record|update|list|show|render required");
+      break;
+    case "checkpoint":
+      if (key !== "record" && key !== "list") throw new Error("checkpoint record|list required");
+      result = await call(`checkpoint-${key}`, { key: flags.positionals[1] ?? process.env.DORI_LANE_KEY, ...(key === "record" ? { stage: need("stage"), evidence: need("evidence"), nextAction: need("next-action"), eventId: need("event-id") } : {}) }); break;
+    case "lesson":
+      if (key !== "add" && key !== "list") throw new Error("lesson add|list required");
+      result = await call(`lesson-${key}`, { key: flags.positionals[1] ?? (opt("repository") ? undefined : process.env.DORI_LANE_KEY), repository: opt("repository"), ...(key === "add" ? { text, evidence: need("evidence"), eventId: need("event-id") } : {}) }); break;
     case "work":
       if (key === "start") result = await call("work-start", { title: need("title"), tags: values.tag ?? [], thread: opt("thread"), operationId });
       else if (key === "stop") result = await call("work-stop", { id: flags.positionals[1] ?? (() => { throw new Error("work stop needs a work id"); })() });
@@ -161,7 +183,7 @@ try {
       else throw new Error("usage: dori work start --title T | stop ID | similar [--title T] [--tag TAG ...]");
       break;
     case "launch": case "adopt":
-      result = await call(command, { key, title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), cwd: opt("cwd"), model: opt("model"), worktree: Boolean(values.worktree), operationId, pane: opt("pane"), threadId: opt("thread-id"), transferConfirmed: Boolean(values["transfer-confirmed"]) }); break;
+      result = await call(command, { key, title: need("title"), brief: need("brief"), done: need("done"), thread: opt("thread"), cwd: opt("cwd"), model: opt("model"), effort: opt("effort"), worktree: Boolean(values.worktree), operationId, pane: opt("pane"), threadId: opt("thread-id"), transferConfirmed: Boolean(values["transfer-confirmed"]) }); break;
     case "input": case "reply": result = await call(command, { key, text, thread: opt("thread"), operationId }); break;
     case "input-status": result = await call(command, { key, text, operationId: need("operation-id") }); break;
     case "report": result = await call(command, { key, text, kind: need("kind"), eventId: need("event-id") }); break;
