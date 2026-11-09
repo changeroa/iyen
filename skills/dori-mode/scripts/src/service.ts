@@ -11,6 +11,7 @@ import { abandonManagedInput } from "./mail-abandon.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
 import { resumeUncertain } from "./resume-uncertain.ts";
 import { retireManagedLane } from "./retire.ts";
+import { retireFailedCodex } from "./retire-codex.ts";
 import { launchLane, quoteForPane, validateLaunch, LaunchError, type LaunchInput } from "./launch.ts";
 import { freshnessTick } from "./freshness.ts";
 import { deadPaneTick } from "./dead-panes.ts";
@@ -1412,7 +1413,7 @@ export class DoriService {
     if (action === "retire") {
       if (caller.role !== "admin" && !(caller.role === "lead" && caller.key === "lead" && caller.instance))
         throw new Error("Retirement requires the current attached lead or operator");
-      if (!exactKeys(args, ["key", "operationId", "evidence", "expectedInstance", "expectedGeneration"]))
+      if (!exactKeys(args, ["key", "operationId", "evidence", "expectedInstance", "expectedGeneration"], ["expectedTerminalId"]))
         throw new Error("Exact bounded retirement arguments required");
       const scope = this.attachment(await this.lane("lead"));
       const assertAuthority = async () => {
@@ -1422,7 +1423,8 @@ export class DoriService {
           caller.instance && caller.instance !== current.instance || lead.dispatchBlocked || lead.runtime?.held)
           throw new Error("Lead retirement authority changed or held");
       };
-      return this.launchQueue.run(key, () => this.dispatchQueue.run(key, () => retireManagedLane(this.deps, args, assertAuthority)));
+      return this.launchQueue.run(key, () => this.dispatchQueue.run(key, async () => (await this.lane(key)).runtime?.kind === "codex"
+        ? retireFailedCodex(this.deps, args, assertAuthority) : retireManagedLane(this.deps, args, assertAuthority)));
     }
     if (action === "input") {
       if (!args.text || !args.operationId) throw new Error("text and operationId required");

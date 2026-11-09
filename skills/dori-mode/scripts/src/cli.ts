@@ -33,7 +33,7 @@ const help = `dori — messenger lead and lanes (Codex default, explicit OMP pro
   object-done KEY --reason TEXT [--reason TEXT]
   pause KEY | resume KEY | close KEY [--note TEXT]
   resume KEY --allow-unknown --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N
-  retire KEY --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N
+  retire KEY --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N [--expected-terminal-id ID|absent]
   recover KEY | reopen KEY [--text-file FILE] [--new-session --handoff-file FILE]
   recover KEY --stop-current --operation-id ID [--text-file FILE] (managed OMP only)
   adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS [--model M --effort E] --transfer-confirmed
@@ -83,7 +83,7 @@ const scopedHelp = `iyen — scoped service commands
   claim-done KEY --evidence TEXT | object-done KEY --reason TEXT
   pause KEY | resume KEY | close KEY [--note TEXT]
   resume KEY --allow-unknown --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N
-  retire KEY --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N
+  retire KEY --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N [--expected-terminal-id ID|absent]
   recover KEY | reopen KEY [--text-file FILE]
   recover KEY --stop-current --operation-id ID [--text-file FILE] (managed OMP only)
   adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS [--model M --effort E] --transfer-confirmed
@@ -102,7 +102,7 @@ const scopedHelp = `iyen — scoped service commands
 Service authorization applies to every operation. Attached lead lifecycle uses lead-detach.
 Unknown deliveries are never automatically replayed.`;
 const flags = parseArgs({ args: rest, allowPositionals: true, strict: true, options: Object.fromEntries([
-  ...["title", "brief", "done", "thread", "model", "effort", "repository", "request-id", "request", "source", "next-action", "notes", "outcome", "stage", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "from-thread-id", "session-file", "terminal-id", "response-file", "source-message-id", "state-dir", "handoff-file", "key", "box", "state", "expected-instance", "expected-generation"].map(k => [k, { type: "string" }]),
+  ...["title", "brief", "done", "thread", "model", "effort", "repository", "request-id", "request", "source", "next-action", "notes", "outcome", "stage", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "from-thread-id", "session-file", "terminal-id", "response-file", "source-message-id", "state-dir", "handoff-file", "key", "box", "state", "expected-instance", "expected-generation", "expected-terminal-id"].map(k => [k, { type: "string" }]),
   ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help", "new-session", "stop-current", "no-mail", "json", "allow-unknown"].map(k => [k, { type: "boolean" }]),
   ["mail-id", { type: "string", multiple: true }],
   ["reason", { type: "string", multiple: true }],
@@ -190,7 +190,7 @@ try {
     case "claim-done": result = await call(command, { key, evidence: need("evidence") }); break;
     case "object-done": result = await call(command, { key, reasons: values.reason }); break;
     case "pause": case "close": result = await call(command, { key, note: opt("note") }); break;
-    case "retire": result = await call(command, { key, operationId: need("operation-id"), evidence: need("evidence"), expectedInstance: need("expected-instance"), expectedGeneration: Number(need("expected-generation")) }); break;
+    case "retire": result = await call(command, { key, operationId: need("operation-id"), evidence: need("evidence"), expectedInstance: need("expected-instance"), expectedGeneration: Number(need("expected-generation")), ...(opt("expected-terminal-id") ? { expectedTerminalId: opt("expected-terminal-id") } : {}) }); break;
     case "resume": result = await call(command, { key, note: opt("note"), ...(values["allow-unknown"] ? {
       allowUnknown: true, operationId: need("operation-id"), evidence: need("evidence"), expectedInstance: need("expected-instance"), expectedGeneration: Number(need("expected-generation")),
     } : {}) }); break;

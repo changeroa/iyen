@@ -4,7 +4,7 @@ import { type Lane, type Retirement, statusOf, withStatus } from "./registry.ts"
 import { payloadHash } from "./runtime/omp/contract.ts";
 import { iso } from "./run.ts";
 
-export type RetireArgs = { key: string; operationId: string; evidence: string; expectedInstance: string; expectedGeneration: number };
+export type RetireArgs = { key: string; operationId: string; evidence: string; expectedInstance: string; expectedGeneration: number; expectedTerminalId?: string };
 const scope = (lane: Lane) => ({ key: lane.key, role: lane.role, pane: lane.pane, cwd: lane.cwd,
   kind: lane.runtime?.kind, backend: lane.runtime?.backend, instance: lane.runtime?.hostInstanceId,
   generation: lane.runtime?.generation, threadId: lane.runtime?.threadId, target: lane.runtime?.omp?.target });

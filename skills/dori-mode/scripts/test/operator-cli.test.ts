@@ -5,6 +5,28 @@ import { atomicJson } from "../src/journal.ts";
 import { serviceSocket } from "../src/ipc.ts";
 import { withState } from "./fakes.ts";
 
+test("scoped retirement CLI forwards exact terminal without altering legacy OMP arguments", async () => {
+  const state = withState(), requests: any[] = [];
+  const server = Bun.serve({ unix: serviceSocket(state.dir), async fetch(request) {
+    requests.push(await request.json()); return Response.json({ result: { retired: true } });
+  } });
+  try {
+    const config = join(state.dir, "config.json"), context = join(state.dir, "context.json");
+    atomicJson(config, { ...defaultConfig(), stateDir: state.dir });
+    atomicJson(context, { token: "fixture-lead", key: "lead", stateDir: state.dir });
+    for (const terminal of [undefined, "exact-terminal", "absent"]) {
+      const child = Bun.spawn([process.execPath, join(import.meta.dir, "../src/cli.ts"), "retire", "failed-lane",
+        "--operation-id", "cleanup", "--evidence", "owner cleanup", "--expected-instance", "host", "--expected-generation", "1",
+        ...(terminal ? ["--expected-terminal-id", terminal] : [])], {
+        env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: state.dir, DORI_CONFIG: config, DORI_CONTEXT: context }, stdout: "pipe", stderr: "pipe",
+      });
+      expect(await child.exited).toBe(0);
+      expect(requests.at(-1)).toMatchObject({ action: "retire", args: { expectedInstance: "host", expectedGeneration: 1 } });
+      expect(requests.at(-1).args.expectedTerminalId).toBe(terminal);
+    }
+  } finally { server.stop(true); state.done(); }
+});
+
 test("operator CLI forwards explicit handoff selections and refuses an implicit or scoped transfer", async () => {
   const state = withState(), requests: any[] = [];
   const server = Bun.serve({ unix: serviceSocket(state.dir), async fetch(request) {
