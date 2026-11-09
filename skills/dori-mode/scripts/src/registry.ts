@@ -23,6 +23,7 @@ export type Retirement = {
 };
 
 export type Lane = {
+  readonly hcTerminal?: string;
   readonly schemaVersion?: 2;
   readonly revision?: number;
   readonly runtime?: RuntimeRef;

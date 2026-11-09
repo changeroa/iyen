@@ -14,6 +14,7 @@ import { retireManagedLane } from "./retire.ts";
 import { launchLane, quoteForPane, validateLaunch, LaunchError, type LaunchInput } from "./launch.ts";
 import { freshnessTick } from "./freshness.ts";
 import { deadPaneTick } from "./dead-panes.ts";
+import { startLaneEvents, type LaneEventSource } from "./lane-events.ts";
 import { syncRegistry } from "./sync.ts";
 import { sampleHost, guardTick } from "./host-guard.ts";
 import { canLaunch } from "./routing.ts";
@@ -1803,14 +1804,17 @@ const serveService = async (config: DoriConfig): Promise<void> => {
   chmodSync(socket, 0o600);
   let stopping = false;
   const timer = setInterval(() => { void service.tick(); }, 1000);
+  let laneEvents: LaneEventSource | null = null;
+  void startLaneEvents(service.registry, process.env.DORI_HC_EVENTS === "1").then(source => { laneEvents = source; });
   const guard = { alerting: false }; let guardBusy = false;
   const monitor = setInterval(() => {
     if (guardBusy) return; guardBusy = true;
-    void Promise.all([sampleHost(run).then(s => guardTick(s, config.guard, guard).forEach(console.log)), deadPaneTick(run, config, service.registry).then(lines => lines.forEach(console.log))]).catch(() => console.error("MONITOR_ERROR host")).finally(() => { guardBusy = false; });
+    void Promise.all([sampleHost(run).then(s => guardTick(s, config.guard, guard).forEach(console.log)), deadPaneTick(run, config, service.registry, Date.now(), laneEvents?.live ?? false).then(lines => lines.forEach(console.log))]).catch(() => console.error("MONITOR_ERROR host")).finally(() => { guardBusy = false; });
   }, 60000);
   const children: ReturnType<typeof Bun.spawn>[] = [];
   const readers: Promise<void>[] = [];
   const shutdown = new AbortController();
+  shutdown.signal.addEventListener("abort", () => laneEvents?.stop());
   for (const ingress of config.ingress) {
     service.setIngressProcess(ingress.id, "starting");
     readers.push((async () => {
