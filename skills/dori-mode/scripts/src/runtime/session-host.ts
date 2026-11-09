@@ -107,7 +107,15 @@ export const runSessionHost = async (stateDir: string, key: string): Promise<voi
     const failures = new Set(prior?.failures ?? []);
     let blockedNotice = prior?.blockedNotice, blockedCycle = prior?.blockedCycle ?? 0;
     session.persist = () => atomicJson(checkpoint, { threadId: session.threadId, instance: boot.instance, held: session.held, goalWasActive: session.goalWasActive, pausedGoal: session.pausedGoal, lastControl: session.lastControl, failures: [...failures], blockedNotice, blockedCycle });
-    await session.open(boot.cwd, role, `unix://${endpoint}`, boot.instance, boot.threadId);
+    await session.open(boot.cwd, role, `unix://${endpoint}`, boot.instance, boot.threadId, async () => {
+      if (child.exitCode !== null) throw new Error("Private backend exited while awaiting startup input");
+      phase("waiting-startup-input");
+      const result = await ipc<{ accepted: boolean }>(serviceSocket(stateDir), boot.hostToken, "host-starting", {
+        key, instance: boot.instance, pane: boot.pane,
+        runtime: { kind: "codex", backend: "herdr-tui", threadId: boot.threadId, state: "starting", hostInstanceId: boot.instance, generation: boot.generation },
+      }, config.runtime.rpcTimeoutMs);
+      if (!result.accepted) throw new Error("Startup lease revoked; dispatch remains held");
+    });
     phase("registering-runtime");
     const queue = new SerialQueue();
     const service = <T = any>(action: string, args: any) => ipc<T>(serviceSocket(stateDir), boot.hostToken, action, { ...args, key, instance: boot.instance }, config.runtime.rpcTimeoutMs);

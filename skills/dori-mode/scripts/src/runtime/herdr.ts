@@ -9,9 +9,15 @@ import { readGoal, readLoadedThreads, readTurns, receipt, type Observer } from "
 import { verifyTurnPolicy, PolicyPending } from "./policy.ts";
 import { RpcError } from "./protocol.ts";
 
-export type Agent = { agent?: string; pane_id: string; name?: string; interactive_ready?: boolean; agent_status: string; agent_session?: { agent: string; kind: string; value: string } };
+export type Agent = { agent?: string; pane_id: string; name?: string; terminal_id?: string; launch_pending?: boolean; interactive_ready?: boolean; agent_status: string; agent_session?: { agent: string; kind: string; value: string } };
 export const operationText = (text: string, id: string): string => `${text}\n\n[DORI_OPERATION:${createHash("sha256").update(id).digest("hex")}]`;
 class ReadinessPending extends Error {}
+class HerdrCommandError extends Error {
+  constructor(readonly code: string, group: string, action: string) {
+    super(`Herdr ${group} ${action} failed (${code}); outcome unknown`);
+  }
+}
+export const STARTUP_INPUT_WAIT_MS = 10 * 60_000;
 export class HerdrSession {
   threadId = "";
   held = false;
@@ -36,7 +42,7 @@ export class HerdrSession {
     if (result.code !== 0) {
       let code = "unknown";
       try { code = JSON.parse(result.err || result.out).error?.code ?? code; } catch { /* no raw terminal/error text in diagnostics */ }
-      throw new Error(code === "agent_not_ready" ? "Herdr TUI startup blocked; inspect its pane for folder trust or required input" : `Herdr ${args[0]} ${args[1]} failed (${code}); outcome unknown`);
+      throw new HerdrCommandError(code, args[0]!, args[1]!);
     }
     return args[0] === "agent" && args[1] === "read" ? { text: result.out } : result.out ? JSON.parse(result.out).result : {};
   }
@@ -46,17 +52,38 @@ export class HerdrSession {
     if (this.threadId && (agent.agent_session?.kind !== "id" || agent.agent_session.value !== this.threadId)) throw new Error("TUI thread identity changed");
     return agent;
   }
-  async open(cwd: string, role: RoleConfig, endpoint: string, instance: string, threadId?: string): Promise<void> {
-    const deadline = this.clock.now() + this.config.startupTimeoutMs;
+  async waitForStartupInput(threadId?: string, heartbeat: () => Promise<void> = async () => {}): Promise<void> {
+    const deadline = this.clock.now() + STARTUP_INPUT_WAIT_MS;
+    let terminal: string | undefined;
+    for (;;) {
+      const agent = await this.agent();
+      if (!agent.terminal_id || (terminal && agent.terminal_id !== terminal)) throw new Error("Startup terminal identity changed");
+      terminal = agent.terminal_id;
+      if (threadId && agent.agent_session && (agent.agent_session.kind !== "id" || agent.agent_session.value !== threadId)) throw new Error("Startup thread identity changed");
+      await heartbeat();
+      if (agent.interactive_ready === true && !agent.launch_pending && agent.agent_status === "idle") return;
+      if (this.clock.now() >= deadline) throw new Error("Startup input timed out; no approval or task was sent");
+      await this.clock.sleep(1000);
+    }
+  }
+  async open(cwd: string, role: RoleConfig, endpoint: string, instance: string, threadId?: string, startupHeartbeat?: () => Promise<void>): Promise<void> {
+    let deadline = this.clock.now() + this.config.startupTimeoutMs;
     if (!role.model || !role.effort) throw new Error("Visible runtime requires an explicit model and reasoning effort");
     const models: any[] = []; let cursor: string | null = null;
     do { const page: any = await this.observeReady(deadline, () => this.observer.read("model/list", { cursor })); models.push(...page.data); cursor = page.nextCursor; } while (cursor);
     const model = models.find(m => m.model === role.model || m.id === role.model);
     if (!model || !model.supportedReasoningEfforts.some((e: any) => e.reasoningEffort === role.effort)) throw new Error("Configured model/effort unavailable");
     if (threadId && this.held && (await readGoal(this.observer, threadId)).goal?.status === "active") throw new Error("Recovery goal is still active; operator must reconcile before TUI resume");
-    await this.command(["agent", "start", this.name, "--kind", "codex", "--pane", this.pane, "--timeout", String(this.config.startupTimeoutMs), "--",
+    try { await this.command(["agent", "start", this.name, "--kind", "codex", "--pane", this.pane, "--timeout", String(this.config.startupTimeoutMs), "--",
       ...(threadId ? ["resume", threadId] : []), "--remote", endpoint, "--cd", cwd, "--model", role.model, "-c", `model_reasoning_effort=${JSON.stringify(role.effort)}`,
-      ...(!threadId ? ["--sandbox", this.config.sandbox, "--ask-for-approval", this.config.approvalPolicy] : []), "--no-alt-screen"]);
+      ...(!threadId ? ["--sandbox", this.config.sandbox, "--ask-for-approval", this.config.approvalPolicy] : []), "--no-alt-screen"]); }
+    catch (error) {
+      if (!(error instanceof HerdrCommandError) || error.code !== "agent_not_ready") throw error;
+      // The original TUI may be waiting for an owner's trust decision. Keep
+      // its backend alive and only observe; never start twice or answer it.
+      await this.waitForStartupInput(threadId, startupHeartbeat);
+    }
+    deadline = this.clock.now() + this.config.startupTimeoutMs;
     // Permission/MCP/developer settings belong to the private backend. Remote
     // resume explicitly rejects CLI permission overrides.
     await this.command(["agent", "read", this.pane, "--source", "recent-unwrapped", "--lines", "20"]);
