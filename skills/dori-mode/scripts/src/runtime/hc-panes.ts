@@ -58,7 +58,8 @@ export const withHcPanes = (run: Runner): Runner => async (argv, opts) => {
       const split = rest.indexOf("--"), kind = flag("--kind")!, name = rest[0]!;
       const labelled = await hc("label", target, `dori.agent-kind=${kind}`, `dori.agent-name=${name}`);
       if (labelled.code !== 0) return labelled;
-      const sent = await hc("send", target, "--", [kind, ...rest.slice(split + 1)].map(shellQuote).join(" "));
+      const program = Bun.which(flag("--binary") ?? kind) ?? kind; // A bare name can resolve to a different install in the login shell.
+      const sent = await hc("send", target, "--", [program, ...rest.slice(split + 1)].map(shellQuote).join(" "));
       if (sent.code !== 0) return sent;
       const deadline = Date.now() + Number(flag("--timeout") ?? 30000);
       for (;;) {

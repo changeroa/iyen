@@ -92,8 +92,8 @@ test("a non-reporting process such as a sign-in or trust screen is not ready", a
 test("agent start types a quoted command and returns once Codex reports idle", async () => {
   const calls: string[][] = [];
   const run = fakeHc({ ...codex, reported: true, status: { app: "codex", state: "idle" } }, calls);
-  expect((await run(["herdr", "agent", "start", "n", "--kind", "codex", "--pane", "t3", "--timeout", "1000", "--", "--cd", "/a b"])).code).toBe(0);
-  expect(calls.find(c => c[1] === "send")).toEqual(["herdr-core", "send", "t3", "--", "'codex' '--cd' '/a b'"]);
+  expect((await run(["herdr", "agent", "start", "n", "--kind", "codex", "--pane", "t3", "--binary", "/bin/sh", "--timeout", "1000", "--", "--cd", "/a b"])).code).toBe(0);
+  expect(calls.find(c => c[1] === "send")).toEqual(["herdr-core", "send", "t3", "--", "'/bin/sh' '--cd' '/a b'"]);
 });
 test("pane run forwards text and closing an already removed terminal succeeds", async () => {
   const calls: string[][] = [], run = fakeHc(codex, calls);

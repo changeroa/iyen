@@ -8,6 +8,7 @@ import type { Thread } from "./generated/v2/Thread.ts";
 import { readGoal, readLoadedThreads, readTurns, receipt, type Observer } from "./observer.ts";
 import { verifyTurnPolicy, PolicyPending } from "./policy.ts";
 import { RpcError } from "./protocol.ts";
+import { isHcTerminal } from "./hc-panes.ts";
 
 export type Agent = { agent?: string; pane_id: string; name?: string; terminal_id?: string; launch_pending?: boolean; interactive_ready?: boolean; agent_status: string; agent_session?: { agent: string; kind: string; value: string } };
 export const operationText = (text: string, id: string): string => `${text}\n\n[DORI_OPERATION:${createHash("sha256").update(id).digest("hex")}]`;
@@ -74,7 +75,7 @@ export class HerdrSession {
     const model = models.find(m => m.model === role.model || m.id === role.model);
     if (!model || !model.supportedReasoningEfforts.some((e: any) => e.reasoningEffort === role.effort)) throw new Error("Configured model/effort unavailable");
     if (threadId && this.held && (await readGoal(this.observer, threadId)).goal?.status === "active") throw new Error("Recovery goal is still active; operator must reconcile before TUI resume");
-    try { await this.command(["agent", "start", this.name, "--kind", "codex", "--pane", this.pane, "--timeout", String(this.config.startupTimeoutMs), "--",
+    try { await this.command(["agent", "start", this.name, "--kind", "codex", "--pane", this.pane, ...(isHcTerminal(this.pane) ? ["--binary", this.config.binary] : []), "--timeout", String(this.config.startupTimeoutMs), "--",
       ...(threadId ? ["resume", threadId] : []), "--remote", endpoint, "--cd", cwd, "--model", role.model, "-c", `model_reasoning_effort=${JSON.stringify(role.effort)}`,
       ...(!threadId ? ["--sandbox", this.config.sandbox, "--ask-for-approval", this.config.approvalPolicy] : []), "--no-alt-screen"]); }
     catch (error) {
