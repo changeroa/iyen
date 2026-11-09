@@ -11,11 +11,13 @@ export type Observer = { read<T = any>(method: ObserverMethod, params: unknown):
 const reads = new Set<ObserverMethod>(["thread/read", "thread/goal/get", "thread/turns/list", "thread/loaded/list", "model/list", "mcpServerStatus/list"]);
 export class ObserverCompatibilityError extends Error {
   readonly code = "runtime-incompatible";
-  constructor() { super("Shared Codex runtime lacks required read capabilities or returned an incompatible response; delivery is held."); }
+  constructor(readonly method?: ObserverMethod, readonly reason = "response-shape", readonly rpcCode?: number) {
+    super(`Shared Codex runtime lacks required read capabilities or returned an incompatible response; delivery is held.${method ? ` Read: ${method}; check: ${reason}${rpcCode === undefined ? "" : `; RPC code: ${rpcCode}`}.` : ""}`);
+  }
 }
 const record = (value: unknown): value is Record<string, any> => value !== null && typeof value === "object" && !Array.isArray(value);
 const nonempty = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
-const requireShape: (valid: unknown) => asserts valid = valid => { if (!valid) throw new ObserverCompatibilityError(); };
+const requireShape: (valid: unknown, reason?: string) => asserts valid = (valid, reason) => { if (!valid) throw new ObserverCompatibilityError(undefined, reason); };
 const turnStatuses = new Set(["completed", "interrupted", "failed", "inProgress"]);
 const inputTypes = new Set(["text", "image", "localImage", "audio", "localAudio", "skill", "mention"]);
 const goalStatuses = new Set(["active", "paused", "blocked", "usageLimited", "budgetLimited", "complete"]);
@@ -25,7 +27,7 @@ const validateTurn = (turn: unknown): void => {
   requireShape(record(turn) && nonempty(turn.id) && turnStatuses.has(turn.status) && Array.isArray(turn.items) && turn.items.length <= MAX_ENTRIES);
   // Older releases omit itemsView. A declared partial view cannot establish
   // that an operation receipt is absent, even if its visible items look valid.
-  requireShape(turn.itemsView === undefined || turn.itemsView === "full");
+  requireShape(turn.itemsView === undefined || turn.itemsView === "full", "full-turn-items");
   for (const item of turn.items) {
     requireShape(record(item) && nonempty(item.type));
     if (item.type === "userMessage") {
@@ -64,12 +66,17 @@ const checkedRead = async <T>(observer: Pick<Observer, "read">, method: Observer
   let value: unknown;
   try { value = await observer.read(method, params); }
   catch (error) {
-    if (error instanceof ObserverCompatibilityError || error instanceof RpcError && (error.code === -32601 || error.code === -32602)) throw new ObserverCompatibilityError();
+    if (error instanceof ObserverCompatibilityError) throw error.method ? error : new ObserverCompatibilityError(method, error.reason, error.rpcCode);
+    if (error instanceof RpcError && (error.code === -32601 || error.code === -32602)) throw new ObserverCompatibilityError(method, "rpc-capability-or-params", error.code);
     // RPC diagnostics can contain server-supplied private data. Preserve codes
     // for managed-session readiness retries, never the server's message.
     throw new RpcError("Codex observer read unavailable", error instanceof RpcError ? error.code : undefined);
   }
-  validateRead(method, value);
+  try { validateRead(method, value); }
+  catch (error) {
+    if (error instanceof ObserverCompatibilityError) throw new ObserverCompatibilityError(method, error.reason);
+    throw error;
+  }
   return value as T;
 };
 export const connectObserver = async (socket: string, timeoutMs: number): Promise<Observer> => {
@@ -124,7 +131,11 @@ export const receiptInTurns = (turns: Turn[], text: string): string | undefined 
 export const receipt = async (observer: Observer, threadId: string, text: string): Promise<string | undefined> => receiptInTurns(await readTurns(observer, threadId), text);
 export const readGoal = async (observer: Observer, threadId: string): Promise<{ goal: Goal | null }> => {
   const value = await observer.read<{ goal: Goal | null }>("thread/goal/get", { threadId });
-  validateRead("thread/goal/get", value);
+  try { validateRead("thread/goal/get", value); }
+  catch (error) {
+    if (error instanceof ObserverCompatibilityError) throw new ObserverCompatibilityError("thread/goal/get", error.reason);
+    throw error;
+  }
   return value;
 };
 // Goal observation is optional only for borrowed sessions. Managed sessions

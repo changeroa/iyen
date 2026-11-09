@@ -356,3 +356,17 @@ test("uncertain TUI prompt outcomes are sanitized and one submission is never re
   expect(error.message).toContain("outcome unknown"); expect(error.message).not.toMatch(/secret|private/);
   expect(h.calls.filter(argv => argv[0] === "herdr" && argv[2] === "prompt")).toHaveLength(1);
 });
+
+test("observer compatibility diagnostics identify the read without exposing server content", async () => {
+  for (const code of [-32601, -32602]) {
+    const observer = observerFor(() => { throw new RpcError("Bearer SECRET /private/customer", code); });
+    const error = await readTurns(observer, threadId).catch(e => e);
+    expect(error).toMatchObject({ method: "thread/turns/list", reason: "rpc-capability-or-params", rpcCode: code });
+    expect(error.message).toContain(String(code));
+    expect(error.message).not.toMatch(/SECRET|customer|Bearer/);
+  }
+  const observer = observerFor(() => ({data:[{...turn("t"), itemsView:"summary"}],nextCursor:null}));
+  const error = await readTurns(observer, threadId).catch(e => e);
+  expect(error).toMatchObject({method:"thread/turns/list",reason:"full-turn-items"});
+  expect(error.message).not.toContain("manual");
+});
