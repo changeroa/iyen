@@ -93,3 +93,13 @@ test("bootstrap requires explicit paths and activated identity; no implicit home
   expect(() => ompLeadBootstrap({ ...context, attachmentInstanceId: "" })).toThrow("identity");
   expect(() => ompLeadBootstrap({ ...context, sessionId: "" })).toThrow("identity");
 });
+
+test("launch refuses OMP lanes before writing any lane state", async () => {
+  const state = withState(), world = newWorld();
+  try {
+    const config = defaultConfig();
+    const deps = depsFor(world, fakeClock(0), state.dir, { defaultCwd: state.dir, runtime: { ...config.runtime, kind: "omp" } });
+    await expect(launchLane(deps, { key: lane.key, title: lane.title, brief: join(state.dir, "none.md"), done: lane.done, model: "m", effort: "medium" }, async () => {})).rejects.toThrow("OMP lanes are not supported");
+    expect(await deps.registry.read(lane.key)).toBeNull();
+  } finally { state.done(); }
+});

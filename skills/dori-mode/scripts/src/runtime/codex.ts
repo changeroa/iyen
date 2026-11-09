@@ -16,7 +16,7 @@ import type { ModelListResponse } from "./generated/v2/ModelListResponse.ts";
 
 export const safeEnvironment = (env: NodeJS.ProcessEnv): Record<string, string> => {
   const out: Record<string, string> = {};
-  for (const name of ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "TERM", "CODEX_HOME", "OPENAI_API_KEY", "DORI_CONFIG", "DORI_STATE_DIR", "DORI_LANE_KEY", "DORI_LANE_TOKEN", "DORI_CONTEXT"]) if (env[name]) out[name] = env[name]!;
+  for (const name of ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "TERM", "CODEX_HOME", "HC_SOCKET", "HC_SESSION", "OPENAI_API_KEY", "DORI_CONFIG", "DORI_STATE_DIR", "DORI_LANE_KEY", "DORI_LANE_TOKEN", "DORI_CONTEXT"]) if (env[name]) out[name] = env[name]!;
   return out;
 };
 export class CodexSession {

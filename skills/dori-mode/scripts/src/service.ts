@@ -14,7 +14,7 @@ import { retireManagedLane } from "./retire.ts";
 import { launchLane, quoteForPane, validateLaunch, LaunchError, type LaunchInput } from "./launch.ts";
 import { freshnessTick } from "./freshness.ts";
 import { deadPaneTick } from "./dead-panes.ts";
-import { createLaneTerminal } from "./runtime/hc-panes.ts";
+import { createLaneTerminal, isHcTerminal } from "./runtime/hc-panes.ts";
 import { startLaneEvents, type LaneEventSource } from "./lane-events.ts";
 import { syncRegistry } from "./sync.ts";
 import { sampleHost, guardTick } from "./host-guard.ts";
@@ -1100,6 +1100,10 @@ export class DoriService {
       try { await verifyOmpHerdr(target, this.runner); const c = await connectOmp(target); try { await c.inspect(); } finally { c.close(); } return; }
       catch { /* existing controller unavailable; require absence checks below */ }
     }
+    if (isHcTerminal(lane.pane)) {
+      const held = await this.runner(["herdr", "agent", "get", lane.pane]);
+      if (held.code === 0 && JSON.parse(held.out).result.agent?.agent) throw new Error("A live TUI already owns this pane or thread");
+    }
     const live = await this.runner(["herdr", "agent", "list"]);
     if (live.code !== 0) throw new Error("Cannot prove exclusive TUI ownership");
     const agents = JSON.parse(live.out).result.agents as { pane_id: string; agent_session?: { value: string } }[];
@@ -1611,8 +1615,17 @@ export class DoriService {
           } catch { /* boot must prove prior process exit before any session resume */ }
         }
         if (!reconnectOmp) {
-          const terminal = await createLaneTerminal(this.runner, key, lane.cwd ?? this.config.defaultCwd);
-          lane = await this.registry.update(key, l => ({ ...l, pane: terminal, tab: undefined, hcTerminal: terminal }));
+          if (this.config.runtime.kind === "omp") {
+            // The OMP extension binds to a Herdr pane identity, so existing OMP lanes recover in Herdr.
+            const workspace = workspaceForRole(this.config, lane.role);
+            const created = await this.runner(["herdr", "tab", "create", ...(workspace ? ["--workspace", workspace] : []), "--cwd", lane.cwd ?? this.config.defaultCwd, "--label", key, "--no-focus"]);
+            if (created.code !== 0) throw new Error("Cannot create recovery tab");
+            const made = JSON.parse(created.out).result;
+            lane = await this.registry.update(key, l => ({ ...l, pane: made.root_pane.pane_id, tab: made.tab_id ?? made.root_pane.tab_id }));
+          } else {
+            const terminal = await createLaneTerminal(this.runner, key, lane.cwd ?? this.config.defaultCwd);
+            lane = await this.registry.update(key, l => ({ ...l, pane: terminal, tab: undefined, hcTerminal: terminal }));
+          }
         }
         await this.boot(lane);
         const text = args.text ?? (!lane.runtime?.threadId ? await Bun.file(lane.brief).text() : undefined);

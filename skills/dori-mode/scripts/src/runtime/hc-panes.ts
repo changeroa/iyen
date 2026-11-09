@@ -28,6 +28,8 @@ export const withHcPanes = (run: Runner): Runner => async (argv, opts) => {
     const t = JSON.parse(got.out), fg = t.foreground?.name, running = t.state === "live" && Boolean(fg) && !SHELLS.has(fg);
     return { t, kind: running ? t.labels?.["dori.agent-kind"] as string | undefined : undefined };
   };
+  // Codex reports idle over OSC 7501 only once its composer is up; sign-in and dialogs report nothing.
+  const ready = (d: { t: any; kind?: string }) => Boolean(d.kind) && d.t.reported === true && statusWord(d.t.status) === "idle";
   const key = `${group} ${action}`;
   switch (key) {
     case "pane get": case "agent get": {
@@ -36,22 +38,23 @@ export const withHcPanes = (run: Runner): Runner => async (argv, opts) => {
       const base = { pane_id: target, terminal_id: target, tab_id: target, workspace_id: "hc", cwd: d.t.foreground?.cwd ?? d.t.cwd, agent: d.kind };
       if (key === "pane get") return ok({ pane: base });
       const session = d.t.labels?.["dori.agent-session"];
-      return ok({ agent: { ...base, name: d.t.labels?.["dori.agent-name"], interactive_ready: Boolean(d.kind), launch_pending: !d.kind, agent_status: statusWord(d.t.status) ?? "idle", ...(session ? { agent_session: { agent: d.kind, kind: "id", value: session } } : {}) } });
+      return ok({ agent: { ...base, name: d.t.labels?.["dori.agent-name"], interactive_ready: ready(d), launch_pending: !ready(d), agent_status: statusWord(d.t.status) ?? "idle", ...(session ? { agent_session: { agent: d.kind, kind: "id", value: session } } : {}) } });
     }
-    case "pane run": case "agent prompt": return hc("send", target, rest[1]!);
+    case "pane run": case "agent prompt": return hc("send", target, "--", rest[1]!);
     case "agent send-keys": return hc("keys", target, ...rest.slice(1));
     case "agent read": { const r = await hc("read", target, "--lines", flag("--lines") ?? "20"); return r.code === 0 ? { ...r, out: r.out } : r; }
     case "pane report-agent-session": { const r = await hc("label", target, `dori.agent-session=${flag("--agent-session-id")}`); return r.code === 0 ? ok({}) : r; }
-    case "pane close": { await hc("kill", target); return hc("rm", target); }
+    case "pane close": { await hc("kill", target); const removed = await hc("rm", target); return removed.code === 3 ? ok({}) : removed; }
     case "agent start": {
       const split = rest.indexOf("--"), kind = flag("--kind")!, name = rest[0]!;
       const labelled = await hc("label", target, `dori.agent-kind=${kind}`, `dori.agent-name=${name}`);
       if (labelled.code !== 0) return labelled;
-      const sent = await hc("send", target, [kind, ...rest.slice(split + 1)].map(shellQuote).join(" "));
+      const sent = await hc("send", target, "--", [kind, ...rest.slice(split + 1)].map(shellQuote).join(" "));
       if (sent.code !== 0) return sent;
       const deadline = Date.now() + Number(flag("--timeout") ?? 30000);
       for (;;) {
-        if ((await describe())?.kind) return ok({});
+        const d = await describe();
+        if (d && ready(d)) return ok({});
         if (Date.now() >= deadline) return { code: 1, out: "", err: JSON.stringify({ error: { code: "agent_not_ready" } }) };
         await Bun.sleep(100);
       }

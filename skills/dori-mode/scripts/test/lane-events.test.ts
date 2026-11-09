@@ -69,17 +69,37 @@ test("a bound terminal that vanished while nobody listened is reported dead once
 });
 test("herdr verbs on an hc terminal go to hc; herdr panes do not", async () => {
   const calls: string[][] = [];
-  const run = withHcPanes(async argv => { calls.push([...argv]); return { code: 0, err: "", out: argv[1] === "get" ? JSON.stringify({ state: "live", labels: { "dori.agent-kind": "codex", "dori.agent-name": "n", "dori.agent-session": "th" }, status: { state: "idle" }, foreground: { name: "codex", cwd: "/w" } }) : "{}" }; });
+  const run = withHcPanes(async argv => { calls.push([...argv]); return { code: 0, err: "", out: argv[1] === "get" ? JSON.stringify({ state: "live", reported: true, labels: { "dori.agent-kind": "codex", "dori.agent-name": "n", "dori.agent-session": "th" }, status: { state: "idle" }, foreground: { name: "codex", cwd: "/w" } }) : "{}" }; });
   await run(["herdr", "agent", "prompt", "t3", "hi"]);
   await run(["herdr", "agent", "send-keys", "t3", "esc"]);
   await run(["herdr", "pane", "list"]);
   await run(["herdr", "agent", "get", "w:p1"]);
-  expect(calls).toEqual([["herdr-core", "send", "t3", "hi"], ["herdr-core", "keys", "t3", "esc"], ["herdr", "pane", "list"], ["herdr", "agent", "get", "w:p1"]]);
+  expect(calls).toEqual([["herdr-core", "send", "t3", "--", "hi"], ["herdr-core", "keys", "t3", "esc"], ["herdr", "pane", "list"], ["herdr", "agent", "get", "w:p1"]]);
   const got = JSON.parse((await run(["herdr", "agent", "get", "t3"])).out).result.agent;
   expect(got).toMatchObject({ agent: "codex", pane_id: "t3", name: "n", agent_status: "idle", agent_session: { value: "th" } });
 });
-test("OMP lanes and missing hc are refused at terminal creation", async () => {
+test("missing hc is refused at terminal creation", async () => {
   await expect(createLaneTerminal(async () => ({ code: 127, out: "", err: "not found" }), "k", "/w")).rejects.toThrow("herdr-core is required");
+});
+const fakeHc = (terminal: any, calls: string[][] = []) => withHcPanes(async argv => { calls.push([...argv]); if (argv[1] === "rm") return { code: 3, out: "", err: "gone" }; return { code: 0, err: "", out: argv[1] === "get" ? JSON.stringify(terminal) : "{}" }; });
+const codex = { state: "live", foreground: { name: "codex", cwd: "/w" }, labels: { "dori.agent-kind": "codex", "dori.agent-name": "n" } };
+test("a non-reporting process such as a sign-in or trust screen is not ready", async () => {
+  const run = fakeHc({ ...codex, reported: false, status: null });
+  expect(JSON.parse((await run(["herdr", "agent", "get", "t3"])).out).result.agent).toMatchObject({ interactive_ready: false, launch_pending: true });
+  const started = await run(["herdr", "agent", "start", "n", "--kind", "codex", "--pane", "t3", "--timeout", "0", "--", "--cd", "/w"]);
+  expect(JSON.parse(started.err).error.code).toBe("agent_not_ready");
+});
+test("agent start types a quoted command and returns once Codex reports idle", async () => {
+  const calls: string[][] = [];
+  const run = fakeHc({ ...codex, reported: true, status: { app: "codex", state: "idle" } }, calls);
+  expect((await run(["herdr", "agent", "start", "n", "--kind", "codex", "--pane", "t3", "--timeout", "1000", "--", "--cd", "/a b"])).code).toBe(0);
+  expect(calls.find(c => c[1] === "send")).toEqual(["herdr-core", "send", "t3", "--", "'codex' '--cd' '/a b'"]);
+});
+test("pane run forwards text and closing an already removed terminal succeeds", async () => {
+  const calls: string[][] = [], run = fakeHc(codex, calls);
+  await run(["herdr", "pane", "run", "t3", "-x"]);
+  expect(calls[0]).toEqual(["herdr-core", "send", "t3", "--", "-x"]);
+  expect((await run(["herdr", "pane", "close", "t3"])).code).toBe(0);
 });
 test("object-shaped hc status is compared by its state word", () => {
   const k = new LaneEventTracker(); k.reconcile([t("t1")], 1);
