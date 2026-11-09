@@ -1,3 +1,4 @@
+import { createLaneTerminal } from "./runtime/hc-panes.ts";
 import { existsSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { FlowDeps } from "./done-flow.ts";
@@ -48,11 +49,10 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, boot: (lane
   mkdirSync(join(deps.config.stateDir, "briefs"), { recursive: true, mode: 0o700 });
   await Bun.write(brief, briefText + new Lessons(deps.config.stateDir, original, deps.clock).reference() + footer(lane));
   await deps.registry.write(lane);
-  const workspace = workspaceForRole(deps.config, lane.role);
-  const created = await deps.run(["herdr", "tab", "create", ...(workspace ? ["--workspace", workspace] : []), "--cwd", cwd, "--label", input.key, "--no-focus"]);
-  if (created.code !== 0) throw new LaunchError("Herdr tab creation failed; lane intent retained");
-  const made = JSON.parse(created.out).result;
-  lane = await deps.registry.update(input.key, l => ({ ...l, pane: made.root_pane.pane_id, tab: made.tab_id ?? made.root_pane.tab_id }));
+    if (deps.config.runtime.kind === "omp") throw new LaunchError("OMP lanes are not supported on herdr-core: the OMP extension binds to a Herdr pane identity");
+  let terminal: string;
+  try { terminal = await createLaneTerminal(deps.run, input.key, cwd); } catch (error) { throw new LaunchError(`${error instanceof Error ? error.message : "hc run failed"}; lane intent retained`); }
+  lane = await deps.registry.update(input.key, l => ({ ...l, pane: terminal, hcTerminal: terminal }));
   await boot(lane);
   const deadline = deps.clock.now() + deps.config.runtime.startupTimeoutMs;
   for (let attempts = 0; deps.clock.now() < deadline && attempts < 120; attempts++) {

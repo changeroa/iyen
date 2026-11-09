@@ -41,7 +41,7 @@ test("OMP brief examples work through own scoped service and refuse another lane
   } finally { state.done(); }
 });
 
-for (const kind of ["omp", "codex"] as const) test(`launch submits the persisted ${kind} brief with the correct runtime footer`, async () => {
+for (const kind of ["codex"] as ("codex" | "omp")[]) test(`launch submits the persisted ${kind} brief with the correct runtime footer`, async () => {
   const state = withState(), world = newWorld();
   try {
     const config = defaultConfig();
@@ -49,7 +49,7 @@ for (const kind of ["omp", "codex"] as const) test(`launch submits the persisted
     const originalRun = deps.run;
     deps.run = async argv => {
       if (argv[0] === "df") return { code: 0, err: "", out: "disk 1 1 104857600 /" };
-      if (argv[0] === "herdr" && argv[1] === "tab" && argv[2] === "create") return { code: 0, err: "", out: JSON.stringify({ result: { root_pane: { pane_id: "w:p1" }, tab_id: "w:t1" } }) };
+      if (argv[0] === "herdr-core" && argv[1] === "run") return { code: 0, err: "", out: JSON.stringify({ address: "t1" }) };
       return originalRun(argv);
     };
     const brief = join(state.dir, "input.md"); await Bun.write(brief, "Bounded work.\n");

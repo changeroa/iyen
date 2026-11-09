@@ -62,6 +62,7 @@ Managed MCP clients use `dori_runtime.control` actions `work-start` (`title,tags
 - reopen KEY: new cycle on the same recorded thread, restoring an owned worktree when necessary.
 - sync [--write]: read runtime/pane drift; write refreshes verified runtime state, never replaces a conflicting identity.
 - watch/freshness/dead-panes/guard: compatibility status queries. The daemon owns the actual schedules; these do not launch duplicate loops.
+- herdr-core (`hc`) is required: the service refuses to start without a working `herdr-core connect` event subscription, and Codex lanes launch in labelled hc terminals (`dori.managed=1`, `dori.lane=<key>`). OMP lanes cannot launch on hc yet and are refused.
 - approval list: current pending server requests and generation-qualified IDs.
 - approval respond ID --response-file FILE: legacy structured host requests only. Interactive TUI requests must be answered by the owner in the real Herdr pane; the observer never answers them.
 - mail list: inbox, outbox, launch operations and sanitized failed-turn metadata. Unknown delivery is visible and is not replayed automatically.

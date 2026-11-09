@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { HcLaneEvents, LaneEventTracker, laneEventSink, startLaneEvents, type HcTransport, type LaneEvent } from "../src/lane-events.ts";
-import { deadPaneTick } from "../src/dead-panes.ts";
+import { createLaneTerminal, withHcPanes } from "../src/runtime/hc-panes.ts";
 
 const t = (address: string, state = "live", status: string | null = null) => ({ address, state, status, labels: { "dori.lane": "a" } });
 const kinds = (e: LaneEvent[]) => e.map(x => x.kind);
@@ -56,18 +56,30 @@ test("heartbeat silence forces a reconnect", async () => {
   const started = s.start(() => {}); a.push(reply(0, [])); await started; await reconnected;
   expect(a.closed).toBe(true); s.stop();
 });
-test("unavailable hc falls back and logs once", async () => {
-  const lines: string[] = [];
-  expect(await startLaneEvents({} as never, true, () => { throw new Error("ENOENT"); }, l => lines.push(l))).toBeNull();
-  expect(lines).toEqual(["LANE_EVENTS_FALLBACK polling: herdr-core unavailable"]);
-  expect(await startLaneEvents({} as never, false)).toBeNull();
+test("unavailable hc fails fast with a clear error", async () => {
+  await expect(startLaneEvents({} as never, () => { throw new Error("ENOENT"); })).rejects.toThrow("herdr-core is required");
 });
-test("pane polling yields to hc only for bound lanes while hc is live", async () => {
-  const run = async () => ({ code: 0, out: JSON.stringify({ result: { panes: [] } }), err: "" });
-  const lanes = [{ key: "bound", pane: "p1", hcTerminal: "t1", openedAt: new Date().toISOString() }, { key: "plain", pane: "p2", openedAt: new Date().toISOString() }];
-  const reg = { open: async () => lanes } as never, cfg = { runtime: { heartbeatTimeoutMs: 1 } } as never;
-  expect(await deadPaneTick(run as never, cfg, reg, Date.now(), x => x === "t1")).toEqual(["DEAD_PANE plain p2"]);
-  expect(await deadPaneTick(run as never, cfg, reg, Date.now(), () => false)).toEqual(["DEAD_PANE bound p1", "DEAD_PANE plain p2"]);
+test("a bound terminal that vanished while nobody listened is reported dead once", async () => {
+  const f = new Fake(), lines: string[] = []; let lane: any = { key: "a", openedAt: "x", hcTerminal: "t9" };
+  const reg = { open: async () => [lane], read: async () => lane, update: async (_: string, u: (l: any) => any) => (lane = u(lane)) } as never;
+  const started = startLaneEvents(reg, () => f, l => lines.push(l));
+  f.push(reply(0, [])); (await started).stop();
+  expect(lines).toEqual(["DEAD_PANE a t9"]);
+  expect(lane.hcTerminal).toBeUndefined();
+});
+test("herdr verbs on an hc terminal go to hc; herdr panes do not", async () => {
+  const calls: string[][] = [];
+  const run = withHcPanes(async argv => { calls.push([...argv]); return { code: 0, err: "", out: argv[1] === "get" ? JSON.stringify({ state: "live", labels: { "dori.agent-kind": "codex", "dori.agent-name": "n", "dori.agent-session": "th" }, status: { state: "idle" }, foreground: { name: "codex", cwd: "/w" } }) : "{}" }; });
+  await run(["herdr", "agent", "prompt", "t3", "hi"]);
+  await run(["herdr", "agent", "send-keys", "t3", "esc"]);
+  await run(["herdr", "pane", "list"]);
+  await run(["herdr", "agent", "get", "w:p1"]);
+  expect(calls).toEqual([["herdr-core", "send", "t3", "hi"], ["herdr-core", "keys", "t3", "esc"], ["herdr", "pane", "list"], ["herdr", "agent", "get", "w:p1"]]);
+  const got = JSON.parse((await run(["herdr", "agent", "get", "t3"])).out).result.agent;
+  expect(got).toMatchObject({ agent: "codex", pane_id: "t3", name: "n", agent_status: "idle", agent_session: { value: "th" } });
+});
+test("OMP lanes and missing hc are refused at terminal creation", async () => {
+  await expect(createLaneTerminal(async () => ({ code: 127, out: "", err: "not found" }), "k", "/w")).rejects.toThrow("herdr-core is required");
 });
 test("object-shaped hc status is compared by its state word", () => {
   const k = new LaneEventTracker(); k.reconcile([t("t1")], 1);

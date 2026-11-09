@@ -59,14 +59,14 @@ export class LaneEventTracker {
   }
 }
 
-export type HcOptions = { heartbeatTimeoutMs?: number; retryMs?: number };
+export type HcOptions = { heartbeatTimeoutMs?: number; retryMs?: number; onSync?: () => void | Promise<void> };
 export class HcLaneEvents implements LaneEventSource {
   live = false;
   private stopped = false;
   private transport?: HcTransport;
   private tracker = new LaneEventTracker();
   constructor(private connect: () => HcTransport | Promise<HcTransport>, private opts: HcOptions = {}) {}
-  /** Rejects when the first subscription cannot be established, so callers can stay on polling. */
+  /** Rejects when the first subscription cannot be established, so the service can fail fast. */
   start(sink: LaneEventSink): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       void (async () => {
@@ -96,9 +96,11 @@ export class HcLaneEvents implements LaneEventSource {
         if (message.id === 1) {
           if (message.error) throw new Error("hc events.subscribe failed");
           await emit(this.tracker.reconcile(message.result.terminals, message.result.seq));
-          this.live = true; ready();
+          this.live = true;
+          await this.opts.onSync?.();
+          ready();
         } else if (message.method === "event") await emit(this.tracker.apply(message.params));
-        else if (message.method === "missed") await emit(this.tracker.reconcile(message.params.terminals, message.params.seq));
+        else if (message.method === "missed") { await emit(this.tracker.reconcile(message.params.terminals, message.params.seq)); await this.opts.onSync?.(); }
       }
     } finally { clearTimeout(timer); transport.close(); }
   }
@@ -130,12 +132,15 @@ export const laneEventSink = (registry: Registry, log: (line: string) => void): 
   } else if (e.status === "blocked" || e.status === "error") log(`LANE_STATUS ${e.lane} ${e.status}`);
 };
 
-/** hc is opt-in. Without it, or when it is unreachable, the existing pane polling remains authoritative. */
-export const startLaneEvents = async (registry: Registry, enabled: boolean, connect: () => HcTransport | Promise<HcTransport> = () => spawnHcTransport(), log: (line: string) => void = console.log): Promise<LaneEventSource | null> => {
-  if (!enabled) return null;
-  const source = new HcLaneEvents(connect);
-  try {
-    await source.start(laneEventSink(registry, log));
-    return source;
-  } catch { log("LANE_EVENTS_FALLBACK polling: herdr-core unavailable"); return null; }
+/** herdr-core is required: the service refuses to start without a working event subscription. */
+export const startLaneEvents = async (registry: Registry, connect: () => HcTransport | Promise<HcTransport> = () => spawnHcTransport(), log: (line: string) => void = console.log): Promise<LaneEventSource> => {
+  const source: HcLaneEvents = new HcLaneEvents(connect, { onSync: async () => {
+    for (const lane of await registry.open()) if (lane.hcTerminal && !source.tracks(lane.hcTerminal)) {
+      const dead = lane.hcTerminal;
+      await registry.update(lane.key, l => ({ ...l, hcTerminal: undefined }));
+      log(`DEAD_PANE ${lane.key} ${dead}`);
+    }
+  } });
+  try { await source.start(laneEventSink(registry, log)); return source; }
+  catch (error) { throw new Error(`herdr-core is required for lane events and is unavailable: ${error instanceof Error ? error.message : String(error)}. Install it from https://herdr.dev/core/`); }
 };

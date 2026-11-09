@@ -1,5 +1,6 @@
 import type { FlowDeps } from "./done-flow.ts";
 import { listPanes } from "./panes.ts";
+import { isHcTerminal } from "./runtime/hc-panes.ts";
 import { statusOf } from "./registry.ts";
 export type SyncRow = { key: string; thread: string; pane: string; session: string; status: string };
 export type SyncResult = { rows: SyncRow[]; drift: string[]; unregistered: SyncRow[] };
@@ -8,7 +9,7 @@ export const syncRegistry = async (deps: FlowDeps, write: boolean): Promise<Sync
   const rows: SyncRow[] = [], drift: string[] = [];
   const lanes = await deps.registry.open();
   for (const lane of lanes) {
-    if (lane.pane && !live.has(lane.pane)) drift.push(`${lane.key}: pane missing`);
+    if (lane.pane && !isHcTerminal(lane.pane) && !live.has(lane.pane)) drift.push(`${lane.key}: pane missing`);
     const snap = await deps.runtime.inspect(lane.key).catch(() => null);
     if (!snap) drift.push(`${lane.key}: runtime unreachable`);
     else if (snap.threadId !== lane.runtime?.threadId) drift.push(`${lane.key}: runtime identity mismatch; not replaced`);

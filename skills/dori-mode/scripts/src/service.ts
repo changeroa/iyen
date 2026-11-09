@@ -14,6 +14,7 @@ import { retireManagedLane } from "./retire.ts";
 import { launchLane, quoteForPane, validateLaunch, LaunchError, type LaunchInput } from "./launch.ts";
 import { freshnessTick } from "./freshness.ts";
 import { deadPaneTick } from "./dead-panes.ts";
+import { createLaneTerminal } from "./runtime/hc-panes.ts";
 import { startLaneEvents, type LaneEventSource } from "./lane-events.ts";
 import { syncRegistry } from "./sync.ts";
 import { sampleHost, guardTick } from "./host-guard.ts";
@@ -1610,11 +1611,8 @@ export class DoriService {
           } catch { /* boot must prove prior process exit before any session resume */ }
         }
         if (!reconnectOmp) {
-          const workspace = workspaceForRole(this.config, lane.role);
-          const created = await this.runner(["herdr", "tab", "create", ...(workspace ? ["--workspace", workspace] : []), "--cwd", lane.cwd ?? this.config.defaultCwd, "--label", key, "--no-focus"]);
-          if (created.code !== 0) throw new Error("Cannot create recovery tab");
-          const made = JSON.parse(created.out).result;
-          lane = await this.registry.update(key, l => ({ ...l, pane: made.root_pane.pane_id, tab: made.tab_id ?? made.root_pane.tab_id }));
+          const terminal = await createLaneTerminal(this.runner, key, lane.cwd ?? this.config.defaultCwd);
+          lane = await this.registry.update(key, l => ({ ...l, pane: terminal, tab: undefined, hcTerminal: terminal }));
         }
         await this.boot(lane);
         const text = args.text ?? (!lane.runtime?.threadId ? await Bun.file(lane.brief).text() : undefined);
@@ -1804,17 +1802,16 @@ const serveService = async (config: DoriConfig): Promise<void> => {
   chmodSync(socket, 0o600);
   let stopping = false;
   const timer = setInterval(() => { void service.tick(); }, 1000);
-  let laneEvents: LaneEventSource | null = null;
-  void startLaneEvents(service.registry, process.env.DORI_HC_EVENTS === "1").then(source => { laneEvents = source; if (stopping) source?.stop(); });
+  const laneEvents: LaneEventSource = await startLaneEvents(service.registry);
   const guard = { alerting: false }; let guardBusy = false;
   const monitor = setInterval(() => {
     if (guardBusy) return; guardBusy = true;
-    void Promise.all([sampleHost(run).then(s => guardTick(s, config.guard, guard).forEach(console.log)), deadPaneTick(run, config, service.registry, Date.now(), terminal => laneEvents?.tracks(terminal) ?? false).then(lines => lines.forEach(console.log))]).catch(() => console.error("MONITOR_ERROR host")).finally(() => { guardBusy = false; });
+    void Promise.all([sampleHost(run).then(s => guardTick(s, config.guard, guard).forEach(console.log)), deadPaneTick(config, service.registry).then(lines => lines.forEach(console.log))]).catch(() => console.error("MONITOR_ERROR host")).finally(() => { guardBusy = false; });
   }, 60000);
   const children: ReturnType<typeof Bun.spawn>[] = [];
   const readers: Promise<void>[] = [];
   const shutdown = new AbortController();
-  shutdown.signal.addEventListener("abort", () => laneEvents?.stop());
+  shutdown.signal.addEventListener("abort", () => laneEvents.stop());
   for (const ingress of config.ingress) {
     service.setIngressProcess(ingress.id, "starting");
     readers.push((async () => {
