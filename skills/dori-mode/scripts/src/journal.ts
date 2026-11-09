@@ -22,6 +22,9 @@ const atomicFile = (path: string, write: (fd: number) => void): void => {
 export const atomicJson = (path: string, value: unknown): void =>
   atomicFile(path, fd => writeFileSync(fd, JSON.stringify(value, null, 2)));
 
+export const atomicText = (path: string, value: string): void =>
+  atomicFile(path, fd => writeFileSync(fd, value));
+
 export class Journal {
   readonly path: string;
   constructor(dir: string) { mkdirSync(dir, { recursive: true, mode: 0o700 }); this.path = join(dir, "events.jsonl"); }

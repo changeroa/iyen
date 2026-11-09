@@ -18,7 +18,7 @@ Use ~/.dori/config.json or DORI_CONFIG. DORI_STATE_DIR overrides state placement
 |---|---|
 | runtime.kind / binary / requiredVersion | codex / codex / 0.163.0 |
 | runtime.externalBinary | optional CLI path for the borrowed shared daemon; defaults to runtime.binary |
-| runtime.roles.lead / lane | explicit available model ID and reasoning effort required for launch |
+| runtime.roles.lead / lane | compatibility defaults for existing workers; each new launch requires explicit model and effort |
 | runtime.sandbox / approvalPolicy | workspace-write / on-request |
 | runtime.startupTimeoutMs / rpcTimeoutMs | 30000 / 15000 |
 | runtime.heartbeatIntervalMs / heartbeatTimeoutMs | 5000 / 20000 |
@@ -26,6 +26,7 @@ Use ~/.dori/config.json or DORI_CONFIG. DORI_STATE_DIR overrides state placement
 | workThresholdSec | 120 seconds; historical duration at or above this means delegate next time |
 | defaultCwd / laneWorkspace | home / current Herdr workspace |
 | leadWorkspace | optional lead workspace; falls back to laneWorkspace when omitted; also applies to recovery |
+| autoPostReports | false; explicitly opt in to freshness-based raw report posting |
 | nudgeAfterMin / postAfterMin / closeAfterMin | 15 / 20 / 5 |
 | heavySlots / heavyMaxLoad | 1 / 80 |
 | guard | load 150/80, free memory 20%, disk 50GB, 20 panes |
@@ -42,7 +43,7 @@ Run dori help for all flags.
 - `work stop ID`: persist `endedAt` and `elapsedSec`, returning the record and threshold. Unknown or already-stopped ids fail without changing the record.
 - `work similar [--title T] [--tag TAG ...]`: require a title or tag; return `{workThresholdSec,matches}` across completed direct tasks and completed lane cycles. Matching uses normalized words, character bigrams and tags. Running direct timers are excluded. Completed cycles remain discoverable after a lane reopens; execution ends at the final done claim when recorded, excluding the review window. Legacy lanes without claims use open-to-close time. History reads do not modify lane records.
 
-Timers are private readable JSON at `<stateDir>/work/<id>.json` and survive service restarts. The service serializes timer writes. Start after the intake lookup and before work; stop immediately before the final reply and include start/end timestamps and elapsed seconds. Similarity supplies duration facts, not a routing verdict: delegate if similar work took at least the configured threshold; otherwise use the skill’s direct/complex-work rules. Resource HOLD still means queue.
+Timers are private readable JSON at `<stateDir>/work/<id>.json` and survive service restarts. The service serializes timer writes. Start after the intake lookup and before work; stop immediately before the final reply and include start/end timestamps and elapsed seconds. Similarity supplies duration facts, not a routing verdict: delegate if similar work took at least the configured threshold; otherwise use the skill’s direct/complex-work rules. Resource HOLD is a recorded intent; only a deliberate identical lead retry can start it.
 
 Managed MCP clients use `dori_runtime.control` actions `work-start` (`title,tags?,thread?,operationId` with a stable UUID), `work-stop` (`id`), and `work-similar` (`title?,tags?`). These are lead/operator-only; lanes cannot read or change direct-task timers. Operators use the CLI above, which calls the same service. No sandbox CLI or extra network permission is needed.
 
@@ -51,8 +52,8 @@ Managed MCP clients use `dori_runtime.control` actions `work-start` (`title,tags
 - lead / lead-attach --thread-id UUID --pane ID --cwd DIR: attach the verified current Codex session as the lead. Returns its absolute generation-scoped bridge. No new lead TUI or backend is created. Repeating the same identity is idempotent.
 - lead-detach --thread-id UUID: detach only the expected lead, revoke its bridge, and preserve the user session and daemon.
 - After a supported daemon update, repeat lead-attach for the same UUID, pane, cwd and socket. It verifies the new binary/version while preserving attachment credentials, historical exclusions and eligible queued messages. Unknown delivery is never replayed. Public runtime.external.holdReason explains a hold; the ingress adapter's internal ACK confirms storage, not receipt by the lead.
-- An attached lead receives queued messages only when idle; exact persisted user-message receipts confirm delivery. Unknown results are not replayed. Startup revalidates attachments without launching Codex. Managed pause/resume/close/recover commands do not apply to attached leads.
-- launch KEY: validate Done, enforce resources, optionally create an owned worktree, create tab/host, persist thread.id, submit brief. Supply --operation-id when callers may replay requests.
+- An attached lead receives eligible queued messages while idle or working, with approval/input/hold barriers; exact persisted user-message receipts confirm delivery. Unknown results are not replayed. Startup revalidates attachments without launching Codex. Managed pause/resume/close/recover commands do not apply to attached leads.
+- launch KEY: validate Done, enforce resources, optionally create an owned worktree, create tab/host, persist thread.id, submit brief. Supply explicit --model and --effort and a stable --operation-id. Held launches never retry from service ticks or restart.
 - input KEY --text-file FILE: structured input; active turns are steered. Paused inputs remain queued.
 - report KEY --kind KIND --text-file FILE --event-id ID: milestone/blocker/question/done event. A done report alone does not claim completion.
 - reply --thread REF --text-file FILE --operation-id ID: durable messenger hook send, available to lead/operator.
@@ -67,9 +68,9 @@ Managed MCP clients use `dori_runtime.control` actions `work-start` (`title,tags
 - mail resolve ID --box inbox|outbox --state sent|queued --evidence TEXT: operator reconciliation after checking external state. queued is for a proven non-execution.
 - migrate --dry-run / --apply [--handoff-file FILE]: state migration with backups, no runtime launch.
 - send/presence/transcribe/heavy: existing standalone utilities.
-- inbound slack: existing read-only diagnostic polling output. Use a replayable adapter for supervised ingestion.
+- inbound slack: optional read-only diagnostic polling output, separate from active configured ingress. Raw INBOUND stdout is not an authenticated service event. Counts are hints only; fetch actual full messages/context and preserve owner/channel/source validation and durable ACK/cursor semantics before ingestion. A safe optional poller-to-ingress adapter is not implemented here.
 
-Exit codes: 0 success, 1 configuration/transport/request error, 2 refused lifecycle or failed doctor, 3 unconfirmed runtime operation, 4 queued launch HOLD. A Herdr prompt acknowledgement or idle status is not a delivery receipt. Input is sent with a durable operation marker and acknowledged only after the exact persisted userMessage maps to a real turn ID. A timeout remains unknown and is never automatically replayed.
+Exit codes: 0 success, 1 configuration/transport/request error, 2 refused lifecycle or failed doctor, 3 unconfirmed runtime operation, 4 recorded launch HOLD (lead retries explicitly). A Herdr prompt acknowledgement or idle status is not a delivery receipt. Input is sent with a durable operation marker and acknowledged only after the exact persisted userMessage maps to a real turn ID. A timeout remains unknown and is never automatically replayed.
 
 ## Ingress adapter contract
 
@@ -91,7 +92,7 @@ The delivered owner-message envelope carries `Source message ID: <id>` separatel
 from the reply thread. Slack adapters use `slack:CHANNEL:TIMESTAMP` so the lead can
 react to the exact source message. The protocol ACK above only confirms durable
 storage; it never posts a messenger acknowledgment. Read receipts and actual
-replies are chosen by the lead following the `iyen` skill, not by Herdr status
+replies are chosen by the lead following the `iyen` skill only for messages actually directed to Iyen (ambient group conversation creates no reply/reaction obligation), not by Herdr status
 changes or a service reaction timer.
 
 New ordinary owner messages always target the lead, even when an active, paused or closed worker lane shares the same messenger thread. A lane's `thread` is its report destination, not ownership of the conversation. The lead forwards deliberate worker instructions through scoped `input`. Explicit owner UI controls below retain their existing lane/thread validation. Already accepted inbox entries retain their recorded target, payload, attachment and delivery outcome across retries; this cutover does not reroute or replay old queued or unknown messages.
@@ -171,3 +172,7 @@ dori resume WORKER_KEY
 The handoff must identify the old thread/history path, confirmed work, pending work and unknown operations. Recovery preserves `runtimeHistory`, old bootstrap/checkpoints and the handoff under `hosts/history/`; the original Codex history remains in its established home. The new session starts held and the handoff queues durably until explicit resume. This is a new identity, not claimed thread continuity. Existing unknown inbox/outbox rows still require explicit reconciliation.
 
 Untrusted working directories retain Codex’s real folder-trust UI. Startup reports a blocked TUI; Dori does not accept trust or write global project trust on the owner’s behalf. Use an already trusted workspace or resolve the visible trust UI explicitly before launch.
+
+## Prompt-led commitments and recovery
+
+See [prompt-led.md](prompt-led.md) for worklog, checkpoint and repository lesson operations, stable event IDs, observation, migration and the explicit owner-response loop. These records never schedule work.

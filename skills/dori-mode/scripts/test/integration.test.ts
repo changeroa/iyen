@@ -27,7 +27,7 @@ test("CLI service and private backends manage visible Herdr agents with exact re
   const token=readJson<{token:string}>(join(state.dir,"control.json")).token;
   const call=(action:string,args:any={})=>ipc<any>(serviceSocket(state.dir),token,action,args,20000);
   await waitFor(()=>call("status"),Array.isArray);
-  const launched=await call("launch",{key:"test-lane",title:"Test",brief:join(state.dir,"brief.md"),done:`file ${join(state.dir,"ready.json")} json:.ready=true`,cwd:state.dir,operationId:"launch-1"});
+  const launched=await call("launch",{key:"test-lane",title:"Test",brief:join(state.dir,"brief.md"),done:`file ${join(state.dir,"ready.json")} json:.ready=true`,cwd:state.dir,model:"test",effort:"medium",operationId:"launch-1"});
   expect(launched.startup).toStartWith("STARTUP_OK");const threadId=launched.lane.runtime.threadId;
   const createdPanes=JSON.parse(readFileSync(join(state.dir,"fixture-panes.json"),"utf8"));
   expect(createdPanes.find((p:any)=>p.pane_id===launched.lane.pane).workspace_id).toBe("worker-space");
@@ -49,11 +49,17 @@ test("CLI service and private backends manage visible Herdr agents with exact re
     {jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"control",arguments:{action:"pause",args:{key:"lead"}}}},
     {jsonrpc:"2.0",id:4,method:"tools/call",params:{name:"control",arguments:{action:"work-similar",args:{tags:["docs"]}}}},
     {jsonrpc:"2.0",id:5,method:"tools/list"},
+    {jsonrpc:"2.0",id:6,method:"tools/call",params:{name:"control",arguments:{action:"checkpoint-record",args:{key:"test-lane",stage:"accepted",evidence:"Verified fixture task",nextAction:"Inspect",eventId:"transport-checkpoint"}}}},
+    {jsonrpc:"2.0",id:7,method:"tools/call",params:{name:"control",arguments:{action:"worklog-record",args:{requestId:"denied",title:"Denied",request:"Not worker-owned",source:"fixture",nextAction:"None",eventId:"denied"}}}},
   ].map(x=>JSON.stringify(x)).join("\n")+"\n");mcp.stdin.end();
   const replies=(await new Response(mcp.stdout).text()).trim().split("\n").map(x=>JSON.parse(x));
   expect(await mcp.exited).toBe(0);expect(replies.find(x=>x.id===2)?.result.isError).toBe(false);expect(replies.find(x=>x.id===3)?.result.isError).toBe(true);
   expect(replies.find(x=>x.id===4)?.result.isError).toBe(true);
   expect(replies.find(x=>x.id===5)?.result.tools[0].inputSchema.properties.action.enum).toContain("work-start");
+  expect(replies.find(x=>x.id===6)?.result.isError).toBe(false); expect(replies.find(x=>x.id===7)?.result.isError).toBe(true);
+  const checkpointCli = Bun.spawn([wrapper,"checkpoint","list"],{env:{PATH:env.PATH,HOME:state.dir},stdout:"pipe",stderr:"pipe"});
+  const checkpointOutput = await new Response(checkpointCli.stdout).text(); expect(await checkpointCli.exited).toBe(0);
+  expect(JSON.parse(checkpointOutput)[0].payload).toMatchObject({key:"test-lane",stage:"accepted",evidence:"Verified fixture task"});
   if(process.env.DORI_LIVE_PROTOCOL==="1") {
     mkdirSync(join(state.dir,"real-codex"));
     const actual=await startCodex(defaultConfig().runtime,{PATH:process.env.PATH,HOME:state.dir,CODEX_HOME:join(state.dir,"real-codex"),DORI_STATE_DIR:state.dir,DORI_CONTEXT:join(state.dir,"clients/test-lane/context.json"),DORI_CONFIG:join(state.dir,"clients/test-lane/config.json")});
@@ -129,6 +135,12 @@ test("current-session CLI attaches a busy existing lead, scopes controls, delive
   const call=(action:string,args:any={})=>ipc<any>(serviceSocket(state.dir),token,action,args,15000);
   const workId=crypto.randomUUID(),work=await exec([bridge,"work","start","--title","Attached direct work","--tag","docs","--operation-id",workId]);expect(work.code).toBe(0);expect(JSON.parse(work.out).work.id).toBe(workId);
   const stopped=await exec([bridge,"work","stop",workId]);expect(stopped.code).toBe(0);expect(JSON.parse(stopped.out).work.elapsedSec).toBeGreaterThanOrEqual(0);
+  const recorded=await exec([bridge,"worklog","record","--request-id","req-fixture","--title","Fixture request","--request","Inspect the fixture","--source","slack:C:1","--next-action","Check fixture","--event-id","req-fixture-intake"]);
+  expect(recorded.code).toBe(0); expect(JSON.parse(recorded.out).status).toBe("received");
+  const completed=await exec([bridge,"worklog","update","--request-id","req-fixture","--state","completed","--outcome","Verified fixture result","--event-id","req-fixture-outcome"]);
+  expect(completed.code).toBe(0); expect(JSON.parse(completed.out).status).toBe("completed");
+  const lesson=await exec([bridge,"lesson","add","--repository",state.dir,"--text","Fixture reference only","--evidence","Fixture evidence","--event-id","fixture-lesson"]);
+  expect(lesson.code).toBe(0); expect(JSON.parse(lesson.out).payload.text).toBe("Fixture reference only");
   const forged=join(state.dir,"forged.json");atomicJson(forged,{key:"lead",stateDir:state.dir});
   expect((await exec([process.execPath,cli,"status"],{DORI_CONTEXT:forged})).code).toBe(1);
   expect((await exec([bridge,"lead-attach","--thread-id",threadId,"--pane","current:p","--cwd",state.dir])).code).toBe(1);

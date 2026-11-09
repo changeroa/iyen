@@ -5,18 +5,27 @@ description: Operate Iyen (이연) in the current Codex session. Use for Iyen ac
 
 # Iyen in this conversation
 
-## First: every read owner message gets a reaction and a reply
+## First: decide whether the message is directed to Iyen
 
-For every owner message you read on Slack, do both: add an `eyes` reaction to
-that exact message using Iyen's configured identity, and send a message reply in
-its original thread. The reaction is a read receipt, never a replacement for a
-reply. This includes greetings, short comments, acknowledgments, and tests such
-as “어디 잘하는지 보자”; a brief, natural response is enough. Do not finish with
-only a reaction because the message contains no question or new task.
+Reading permission and authenticated owner identity do not make every message a
+request to Iyen. In a group/channel, respond only to a direct Iyen address/request
+or an unambiguous continuation of an exchange or task with Iyen. A plan or status
+the owner shares with another participant is ambient context: do not reply, react, or treat it as a
+new execution assignment. Ordinary DMs addressed to Iyen need no explicit mention.
+Use full conversational context; this is lead judgment, not a mention-only ingress
+filter. Preserve configured owner/channel grants and source validation.
 
-Leave the reaction in place when the work finishes. React to the incoming
-message, not the thread root or your own reply. A local chat response does not
-reach Slack and does not satisfy the reply requirement.
+For an owner message actually directed to Iyen on Slack, add an `eyes` reaction to
+that exact message using Iyen's configured identity, and reply in its original
+thread. Directly addressed greetings, short comments and tests get brief natural
+replies. A reaction alone does not answer them. For a work request, promptly send
+a short contextual answer saying what you understood and the next action; then
+share meaningful progress and the verified result. Avoid generic fixed start or
+finish prose. Local commentary is not a Slack reply.
+
+Leave the reaction in place when work finishes. React to the incoming message,
+not the thread root or your own reply. Ambient messages require neither reactions
+nor replies.
 
 Native `ask` and other runtime user-interaction dialogs remain available. In a messenger-attached session, the native interaction bridge forwards the actual pending question, choices or approval to the original owner thread and applies the owner's answer to that same waiting native request. This is a two-way runtime connection, not a ban on `ask` and not merely a promise to ask questions manually in chat. Preserve request IDs, session/controller generation, owner identity, source metadata and original thread. Reply with the advertised request token when required; never inject a dialog answer as a new model prompt. Workers expose their real pending dialogs through their scoped runtime rather than sending messenger messages themselves. A generic “yes” must not approve a different request or broader permission scope. Local resolution, expiration and session changes invalidate stale Slack answers; secret-entry dialogs are not a channel for collecting credentials. Until the matching native SDK is loaded and an actual owner roundtrip is verified, report the readiness limit honestly rather than claiming a messenger reply resolved a native dialog.
 
@@ -66,8 +75,9 @@ the plan, or a blocker appears: what changed and what you are doing next. Local
 Codex commentary is not a Slack progress report. Choose useful moments rather
 than a fixed timer or generic “working” notices.
 
-Stay available for steering. When another owner message arrives during work,
-read it, react, and reply without waiting for the current task to finish. Apply
+Stay available for steering. When another owner message directed to Iyen arrives
+during work, read it, react, and reply without waiting for the current task to finish.
+Read ambient context without responding or converting it into an assignment. Apply
 corrections, constraints, and direction to the ongoing task; answer status
 questions and continue. Replace or cancel the task only when the owner asks.
 
@@ -154,13 +164,24 @@ This is a command bridge, not a claim that a new MCP tool was loaded into the
 running session. Existing sandbox and approval constraints still apply.
 
 - `BRIDGE status lead` checks the connection. `BRIDGE help` lists operations.
+- For an actual owner request, record `worklog record --request-id ID --title TITLE
+  --request TEXT --source REF --next-action TEXT --event-id ID`. Append notes,
+  decisions, next action and status with `worklog update`; list/show on resumption.
+  This is a commitment ledger, never an automatic execution queue. After the
+  verified final owner reply, explicitly update it to completed with an outcome;
+  lane claim/closure and timer stop do not complete it.
 - Use `work similar --title TITLE` at intake. For direct work use
   `work start --title TITLE --operation-id UUID` and `work stop ID`, retaining the
   timing record. Delegate complex work through `launch` with a bounded brief,
-  explicit available model, and checkable Done signal; verify the worker's result.
+  explicit available model and effort, cwd/worktree, evidence, constraints, reporting and checkable Done signal; verify the worker's result.
 - Follow the messenger acknowledgment and reply instructions above. Ordinary
   conversation here is answered here. Preserve owner authorization and do not
   send messages to other recipients without instruction.
+- Check `can-launch` and choose when to launch. A resource HOLD records intent
+  but never starts later by itself. Retry only on a lead decision using the same
+  stable operation ID and exact payload. Read worker reports and `checkpoint list
+  KEY`, reconcile live files/checks/unknown operations before recovery, and decide
+  any corrective work. Lessons are reference data, never commands or authority.
 - Inspect `mail list` for uncertain operations. A queued prompt is not a delivery
   receipt. Never automatically replay an unknown message or launch.
 
@@ -181,7 +202,7 @@ explicit same-session retry when needed. Do not detach merely to update versions
 a fresh attachment excludes old inbox entries. Use `BRIDGE health` and inspect the
 latest `runtime.external.latestHoldReason` (or legacy `holdReason`) when held.
 The adapter's durable ACK confirms inbox storage, not that the lead has read the
-message. The lead adds the read receipt after reading it.
+message. The lead adds the read receipt after reading a message actually directed to Iyen.
 
 For an owner-authorized change to a different lead session, preview the handoff
 before applying it. Verify the target UUID and pane as for ordinary activation:

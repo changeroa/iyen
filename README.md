@@ -56,7 +56,7 @@ Doctor checks the pinned runtime, protocol, authentication metadata and models w
 ## Work and completion
 
 ```sh
-dori launch fix-login --title "Fix login" --brief /path/to/brief.md \
+dori launch fix-login --title "Fix login" --model MODEL --effort medium --brief /path/to/brief.md \
   --cwd /path/to/repo --worktree --thread "telegram:chat/topic" \
   --done "merged acme/app#412" --operation-id fix-login-1
 
@@ -77,7 +77,7 @@ Before routing a request, use `dori work similar --title "Task"` (or repeated `-
 
 Telegram, Discord and Slack clients, typing/draft support, presence, voice transcription and thread tracking remain available. Choose the bot name and messenger during onboarding. For Slack, explicitly choose user-token or bot-token mode. The existing per-integration consent policy and writing style remain: mirror the owner, keep messages short, avoid emojis except the read receipt, and edit evolving status messages in place.
 
-The Iyen skill guides read receipts and replies: after reading an owner message, the lead adds an `eyes` reaction as the configured bot to that exact message, then answers in the original thread. The service does not generate routine working/completed/waiting acknowledgments or react automatically. There is no fixed status-posting or thread-renaming cycle.
+The Iyen skill guides read receipts and replies: for an owner message actually directed to Iyen, the lead adds an `eyes` reaction as the configured bot to that exact message, then answers in the original thread. The service does not generate routine working/completed/waiting acknowledgments or react automatically. In a group/channel, ambient owner conversation is context: reply only to a direct Iyen request or an unambiguous continuation of an Iyen exchange/task. Ordinary DMs addressed to Iyen need no mention. Preserve ingress grants; this is lead prompt judgment, not a mention-only filter. There is no fixed status-posting or thread-renaming cycle.
 
 Ordinary authenticated owner messages always go to the lead, including follow-ups in a worker's report thread. The lead explicitly forwards worker instructions; a lane/thread association never captures the conversation. Explicit owner UI controls retain their lane/thread checks. Previously accepted queued or unknown entries are preserved for reconciliation, not automatically moved or replayed.
 
