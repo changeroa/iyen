@@ -62,7 +62,7 @@ Managed MCP clients use `dori_runtime.control` actions `work-start` (`title,tags
 - reopen KEY: new cycle on the same recorded thread, restoring an owned worktree when necessary.
 - sync [--write]: read runtime/pane drift; write refreshes verified runtime state, never replaces a conflicting identity.
 - watch/freshness/dead-panes/guard: compatibility status queries. The daemon owns the actual schedules; these do not launch duplicate loops.
-- herdr-core (`hc`) is required: the service refuses to start without a working `herdr-core connect` event subscription, and Codex lanes launch in labelled hc terminals (`dori.managed=1`, `dori.lane=<key>`). OMP lanes cannot launch on hc yet and are refused.
+- herdr-core (`hc`) is required: the service refuses to start without a working `herdr-core connect` event subscription, and Codex lanes launch in labelled hc terminals (`dori.managed=1`, `dori.lane=<key>`). OMP worker lanes have been removed; attached OMP leads remain supported.
 - approval list: current pending server requests and generation-qualified IDs.
 - approval respond ID --response-file FILE: legacy structured host requests only. Interactive TUI requests must be answered by the owner in the real Herdr pane; the observer never answers them.
 - mail list: inbox, outbox, launch operations and sanitized failed-turn metadata. Unknown delivery is visible and is not replayed automatically.
@@ -133,9 +133,6 @@ A successful `turn/start` response is retained as a known input receipt. Later o
 The socket directory is a private /tmp/dori-UID-HASH directory derived from stateDir. Control tokens are never command-line arguments. This is local-user isolation, not a security boundary against arbitrary code running as that same OS user.
 
 Host connection loss holds its goal and turn; failed stop confirmation terminates the owned Codex process. Reconnect does not silently resume a held lane. Inspect status/mail, then explicitly resume. For unknown external sends, inspect the actual messenger before marking sent or retrying through the original reply command.
-
-The current attached lead can reconcile a managed OMP worker's unknown input using its own scoped bridge: `BRIDGE mail resolve EXACT_ID --box inbox --state sent --evidence TEXT`. This is a read-only native operation-receipt lookup followed by a fenced inbox update, not a resend. It requires the originally recorded target, payload hash and exact durable native receipt; both the worker epoch and the lead attachment are revalidated before committing. The lead cannot requeue unknown input, mark outbox sends or resolve a missing receipt. A worker's `resume` remains blocked until all unknown/sending input is reconciled. After successful reconciliation, explicitly resume the same registered lane; do not type “continue” into a held native session or create a replacement worker.
-
 
 A final failed Codex turn is recorded even while the host remains healthy. Each host-instance/turn pair produces one actionable lane-to-lead notice, or a direct owner-thread notice for a failed lead. Lead notices wait for the sent input receipt to identify the originating thread, including when completion arrived before the receipt. Only fixed error categories and guidance are retained; raw error messages and command output are excluded. Notices use the durable outbox and configured threadReply hook, and uncertain notice delivery is never automatically retried. Without a hook the notice remains queued in the outbox. Failed tasks are not replayed.
 

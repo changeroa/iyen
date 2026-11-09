@@ -32,16 +32,12 @@ const help = `dori — messenger lead and lanes (Codex default, explicit OMP pro
   claim-done [KEY] --evidence TEXT
   object-done KEY --reason TEXT [--reason TEXT]
   pause KEY | resume KEY | close KEY [--note TEXT]
-  resume KEY --allow-unknown --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N
-  retire KEY --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N
   recover KEY | reopen KEY [--text-file FILE] [--new-session --handoff-file FILE]
-  recover KEY --stop-current --operation-id ID [--text-file FILE] (managed OMP only)
   adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS [--model M --effort E] --transfer-confirmed
   sync [--write] | can-launch | watch | freshness | dead-panes | guard
   approval list | approval respond ID --response-file FILE [--operation-id ID (required for native OMP)]
   approval respond ID --response-file FILE --source-message-id ID (current attached lead)
   mail list | mail resolve ID --box inbox|outbox --state queued|sent --evidence TEXT
-  mail abandon ID --operation-id ID --evidence TEXT
   migrate --dry-run | migrate --apply
   work start --title T [--tag TAG ...] [--thread REF] [--operation-id UUID]
   work stop ID | work similar [--title T] [--tag TAG ...]
@@ -65,7 +61,7 @@ const scopedInvocation = ["DORI_CONTEXT", "DORI_LANE_KEY", "DORI_LANE_TOKEN"].so
 const scopedCommands: Record<string, true> = {
   "": true, help: true, status: true, health: true, "can-launch": true, launch: true, adopt: true,
   input: true, "input-status": true, reply: true, report: true, "claim-done": true, "object-done": true,
-  pause: true, resume: true, close: true, retire: true, reopen: true, recover: true, sync: true,
+  pause: true, resume: true, close: true, reopen: true, recover: true, sync: true,
   approval: true, mail: true, work: true, worklog: true, checkpoint: true, lesson: true, "lead-detach": true, "lead-restart": true, "lead-restart-status": true,
   watch: true, freshness: true, "dead-panes": true, guard: true, "mcp-server": true,
 };
@@ -82,15 +78,11 @@ const scopedHelp = `iyen — scoped service commands
   report KEY --kind milestone|blocker|question|halted|done --text-file FILE --event-id ID
   claim-done KEY --evidence TEXT | object-done KEY --reason TEXT
   pause KEY | resume KEY | close KEY [--note TEXT]
-  resume KEY --allow-unknown --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N
-  retire KEY --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N
   recover KEY | reopen KEY [--text-file FILE]
-  recover KEY --stop-current --operation-id ID [--text-file FILE] (managed OMP only)
   adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS [--model M --effort E] --transfer-confirmed
   sync [--write] | approval list | mail list
   approval respond ID --response-file FILE --source-message-id ID
   mail resolve ID --box inbox --state sent --evidence TEXT
-  mail abandon ID --operation-id ID --evidence TEXT
   work start --title T [--tag TAG ...] [--thread REF] [--operation-id UUID]
   work stop ID | work similar [--title T] [--tag TAG ...]
   worklog record --request-id ID --title T --request TEXT --source REF --next-action TEXT --event-id ID
@@ -102,8 +94,8 @@ const scopedHelp = `iyen — scoped service commands
 Service authorization applies to every operation. Attached lead lifecycle uses lead-detach.
 Unknown deliveries are never automatically replayed.`;
 const flags = parseArgs({ args: rest, allowPositionals: true, strict: true, options: Object.fromEntries([
-  ...["title", "brief", "done", "thread", "model", "effort", "repository", "request-id", "request", "source", "next-action", "notes", "outcome", "stage", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "from-thread-id", "session-file", "terminal-id", "response-file", "source-message-id", "state-dir", "handoff-file", "key", "box", "state", "expected-instance", "expected-generation"].map(k => [k, { type: "string" }]),
-  ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help", "new-session", "stop-current", "no-mail", "json", "allow-unknown"].map(k => [k, { type: "boolean" }]),
+  ...["title", "brief", "done", "thread", "model", "effort", "repository", "request-id", "request", "source", "next-action", "notes", "outcome", "stage", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "from-thread-id", "session-file", "terminal-id", "response-file", "source-message-id", "state-dir", "handoff-file", "key", "box", "state"].map(k => [k, { type: "string" }]),
+  ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help", "new-session", "no-mail", "json"].map(k => [k, { type: "boolean" }]),
   ["mail-id", { type: "string", multiple: true }],
   ["reason", { type: "string", multiple: true }],
   ["tag", { type: "string", multiple: true }],
@@ -189,21 +181,16 @@ try {
     case "report": result = await call(command, { key, text, kind: need("kind"), eventId: need("event-id") }); break;
     case "claim-done": result = await call(command, { key, evidence: need("evidence") }); break;
     case "object-done": result = await call(command, { key, reasons: values.reason }); break;
-    case "pause": case "close": result = await call(command, { key, note: opt("note") }); break;
-    case "retire": result = await call(command, { key, operationId: need("operation-id"), evidence: need("evidence"), expectedInstance: need("expected-instance"), expectedGeneration: Number(need("expected-generation")) }); break;
-    case "resume": result = await call(command, { key, note: opt("note"), ...(values["allow-unknown"] ? {
-      allowUnknown: true, operationId: need("operation-id"), evidence: need("evidence"), expectedInstance: need("expected-instance"), expectedGeneration: Number(need("expected-generation")),
-    } : {}) }); break;
-    case "reopen": case "recover": result = await call(command, { key, text, operationId: values["stop-current"] ? need("operation-id") : operationId, stopCurrent: Boolean(values["stop-current"]), threadId: opt("thread-id"), newSession: Boolean(values["new-session"]), handoff: opt("handoff-file") ? await Bun.file(need("handoff-file")).text() : undefined }); break;
+    case "pause": case "close": case "resume": result = await call(command, { key, note: opt("note") }); break;
+    case "reopen": case "recover": result = await call(command, { key, text, operationId, threadId: opt("thread-id"), newSession: Boolean(values["new-session"]), handoff: opt("handoff-file") ? await Bun.file(need("handoff-file")).text() : undefined }); break;
     case "status": case "can-launch": result = await call(command, { key }); break;
     case "sync": result = await call(command, { write: Boolean(values.write) }); break;
     case "approval":
       result = key === "list" ? await call("approval-list") : key === "respond" ? await call("approval-respond", { id: flags.positionals[1], response: await Bun.file(need("response-file")).json(), operationId: opt("operation-id"), sourceMessageId: opt("source-message-id") }) : (() => { throw new Error("approval list|respond required"); })(); break;
     case "mail":
       result = key === "list" ? await call("mail-list") :
-        key === "abandon" ? await call("mail-abandon", { id: flags.positionals[1], operationId: need("operation-id"), evidence: need("evidence") }) :
         key === "resolve" ? await call("mail-resolve", { id: flags.positionals[1], box: need("box"), state: need("state"), evidence: need("evidence") }) :
-        (() => { throw new Error("mail list|resolve|abandon required"); })(); break;
+        (() => { throw new Error("mail list|resolve required"); })(); break;
     case "watch": case "freshness": case "dead-panes": case "guard":
       result = await call("status"); break;
     default: throw new Error(`Unknown command ${command}`);

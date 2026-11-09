@@ -12,9 +12,9 @@ import { ompFixture } from "./fixtures/omp.ts";
 import type { Runner } from "../src/run.ts";
 
 const thread = "slack:C-owner/100.000";
-async function fixture(worker = false) {
+async function fixture() {
   const f = ompFixture(); f.transcript([]);
-  if (!worker) { Object.assign(f.identity, { role: "attached-lead", laneKey: "lead" }); Object.assign(f.target, f.identity); }
+  Object.assign(f.identity, { role: "attached-lead", laneKey: "lead" }); Object.assign(f.target, f.identity);
   let dialogs: NativeUserInteraction[] = [], sends = 0, attempts = 0, loseAck = false, unknown = false;
   let leafId: string | null = null;
   const applied = new Map<string, NativeInteractionReceipt>(), results = new Map<string, NativeInteractionResponse>();
@@ -59,23 +59,10 @@ async function fixture(worker = false) {
     hooks: { threadReply: ["fixture-reply", "{thread}", "{text}"] }, runtime: { ...defaults.runtime, kind: "omp", binary: "/fixture/omp", requiredVersion: "18.15.0", rpcTimeoutMs: 200,
       settingsHome: join(f.directory, "profile"), sandbox: "danger-full-access", omp: { registryDir: f.directory, extensionPath: "/fixture/extension.ts", provider: "fixture", approvalMode: "always-ask" } } };
   let service = new DoriService(config, runner);
-  const key = worker ? "worker" : "lead";
-  if (worker) {
-    await service.registry.write({ key, title: "worker", role: "lane", thread, brief: "/fixture/brief", done: "fixture", openedAt: new Date().toISOString(),
-      runtime: { kind: "omp", backend: "herdr-tui", state: "waiting_input", threadId: f.identity.sessionId, hostInstanceId: "worker-host", generation: 1, binaryVersion: "18.15.0",
-        omp: { kind: "omp", target: f.target, attachmentInstanceId: "worker-host", attachmentGeneration: 1, attachedAt: new Date().toISOString(), excludedInboxIds: [] } } });
-  } else {
-    atomicJson(join(f.directory, `${createHash("sha256").update("instance:1").digest("hex")}.json`), { ...f.target, pid: process.pid, startedAt: new Date().toISOString() });
-    await service.handle("lead-activate", { threadId: f.identity.sessionId, sessionFile: f.identity.sessionFile, pane: f.identity.paneId, terminalId: f.identity.terminalId, cwd: f.directory }, { role: "admin" });
-  }
+  const key = "lead";
+  atomicJson(join(f.directory, `${createHash("sha256").update("instance:1").digest("hex")}.json`), { ...f.target, pid: process.pid, startedAt: new Date().toISOString() });
+  await service.handle("lead-activate", { threadId: f.identity.sessionId, sessionFile: f.identity.sessionFile, pane: f.identity.paneId, terminalId: f.identity.terminalId, cwd: f.directory }, { role: "admin" });
   const lane = (await service.registry.read(key))!;
-  if (worker) {
-    const target = { ...f.target, role: "attached-lead" as const, laneKey: "lead", instanceId: "fixture-lead" };
-    await service.registry.write({ ...lane, key: "lead", role: "lead", revision: 0, runtime: {
-      ...lane.runtime!, hostInstanceId: "lead-host", backend: "external-current-session",
-      omp: { kind: "omp", target, attachmentInstanceId: "lead-host", attachmentGeneration: 1, attachedAt: new Date().toISOString(), excludedInboxIds: [] },
-    } });
-  }
   function source(id: string, ownerThread = thread, user = "owner") {
     const operationId = `inbound:owner-slack:${ownerThread}:${id}`;
     service.inbox.put({ id: operationId, target: key, text: "original owner task", source: "owner-slack", sourceMessageId: id, ownerUser: user, metadata: { channel: "C-owner", ts: id },
@@ -143,8 +130,8 @@ test("one source cannot change its answer or independently resolve a second nati
   } finally { h.cleanup(); }
 });
 
-for (const worker of [false, true]) test(`lead mediates native resolver without a new prompt; worker=${worker}`, async () => {
-  const h = await fixture(worker);
+test("lead mediates native resolver without a new prompt", async () => {
+  const h = await fixture();
   try {
     const [row] = await h.publish([h.ask()]);
     await h.answer(row!.token);
@@ -370,7 +357,7 @@ test("unmapped and contradictory source provenance never selects an unrelated th
 });
 
 test("held native requests resume only with a fresh authorized answer", async () => {
-  const h = await fixture(true);
+  const h = await fixture();
   try {
     const [row] = await h.publish([h.ask()]);
     await h.service().registry.update(h.key, l => ({ ...l, status: "paused", dispatchBlocked: true, runtime: { ...l.runtime!, held: true } }));
@@ -383,8 +370,8 @@ test("held native requests resume only with a fresh authorized answer", async ()
   } finally { h.cleanup(); }
 });
 
-test("lead epoch changed during native observation cannot authorize a worker response", async () => {
-  const h = await fixture(true);
+test("lead epoch changed during native observation cannot authorize a response", async () => {
+  const h = await fixture();
   try {
     const [row] = await h.publish([h.ask()]);
     const dispatch = h.server.dispatch.bind(h.server);
@@ -425,29 +412,6 @@ test("unknown native notice delivery is never blindly sent again", async () => {
     await service.nativeInteractions.poll();
     service = new DoriService(h.config, runner); await service.nativeInteractions.poll();
     expect(sends).toBe(1); expect(service.outbox.get(`native-interaction:${token}`)?.state).toBe("unknown");
-  } finally { h.cleanup(); }
-});
-
-for (const binding of ["current", "old-generation", "other-thread", "missing-receipt", "ambiguous-owner"] as const)
-test(`shared ingress worker routing requires exact authenticated lead ownership: ${binding}`, async () => {
-  const h = await fixture(true);
-  try {
-    h.config.ingress[0]!.owners.push("second-owner");
-    const mail = await h.conversation("routing-source", "작업을 진행해 주세요");
-    if (binding === "old-generation") h.service().inbox.mark(mail.id, {
-      ompProvenance: { ...mail.ompProvenance!, attachmentGeneration: 99 },
-    });
-    if (binding === "other-thread") h.service().inbox.mark(mail.id, { thread: "slack:other/200" });
-    if (binding === "missing-receipt") h.service().inbox.mark(mail.id, { receipt: undefined });
-    if (binding === "ambiguous-owner") await h.conversation("other-owner", "별도 요청", { ownerUser: "second-owner" });
-    const rows = await h.publish([h.ask("launch-owned", { sourceEntryId: "launch-entry", sourceOperationHash: payloadHash("launch-operation") })]);
-    if (binding === "current") {
-      expect(rows[0]).toMatchObject({ thread, owner: "owner", source: "owner-slack" });
-      await h.answer(rows[0]!.token);
-      expect(h.results.get("launch-owned")).toEqual(selection);
-    } else {
-      expect(rows).toEqual([]); expect(h.notifications).toEqual([]); expect(h.attempts()).toBe(0);
-    }
   } finally { h.cleanup(); }
 });
 

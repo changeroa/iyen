@@ -32,11 +32,10 @@ export type LeadRestartContinuation = {
 };
 export const leadRestartContinuationId = (operationId: string): string => `lead-restart-continuation:${operationId}`;
 export type OmpExtensionBootstrap = {
-  protocol: 1; registryDir: string; role: "attached-lead" | "managed-lane"; laneKey: string;
+  protocol: 1; registryDir: string; role: "attached-lead"; laneKey: string;
   expectedCwd: string; expectedPaneId: string; expectedTerminalId: string;
   expectedSessionId?: string; expectedSessionFile?: string;
   restart?: LeadRestartBootstrap;
-  service?: { contextFile: string; configFile: string; stateDir: string; cliPath: string; bunBinary: string };
 };
 export type OmpGoal = { status: "active" | "paused"; objective: string; tokenBudget: number | null } | null;
 export type OmpReceipt = { operationId: string; payloadHash: string; sessionId: string; sessionFile: string; entryId: string; receiptId: string };
@@ -51,7 +50,7 @@ export type OmpSnapshot = {
 export type OmpOperation = { status: "absent" }
   | { status: "reserved" | "attempted" | "unknown"; operationId: string; payloadHash: string }
   | { status: "received"; receipt: OmpReceipt };
-export type OmpMethod = "inspect" | "failures" | "input" | "operation" | "hold" | "release" | "stop" | "interactions" | "interaction-respond" | "interaction-response-status"
+export type OmpMethod = "inspect" | "input" | "operation" | "hold" | "release" | "stop" | "interactions" | "interaction-respond" | "interaction-response-status"
   | "restart-prepare" | "restart-inspect" | "restart-commit" | "restart-release" | "restart-stage";
 export type OmpRequest = { protocol: 1; id: string; token: string; target: OmpIdentity; method: OmpMethod; params: Record<string, unknown> };
 export type OmpResponse = { protocol: 1; id: string; identity: OmpIdentity } & (
@@ -61,7 +60,6 @@ export type OmpController = {
   interactions(): Promise<NativeUserInteraction[]>;
   interactionRespond(requestId: string, response: NativeInteractionResponse, operationId: string): Promise<NativeInteractionReceipt>;
   interactionResponseStatus(operationId: string): Promise<NativeInteractionStatus>;
-  failures(after: number, limit?: number): Promise<OmpFailurePage>;
   input(text: string, operationId: string): Promise<{ receipt: OmpReceipt }>;
   operation(operationId: string, text: string): Promise<OmpOperation>;
   hold(origin: "user" | "automatic", operationId: string): Promise<OmpSnapshot>;
@@ -179,7 +177,7 @@ export function validRestartContinuation(value: unknown, target: OmpTarget, inte
 export function parseRequest(value: unknown): OmpRequest {
   if (!object(value) || !exactKeys(value, ["protocol", "id", "token", "target", "method", "params"]) || value.protocol !== 1 ||
     !nonempty(value.id) || !nonempty(value.token) || !validIdentity(value.target) || !object(value.params) ||
-    !["inspect", "failures", "input", "operation", "hold", "release", "stop", "interactions", "interaction-respond", "interaction-response-status",
+    !["inspect", "input", "operation", "hold", "release", "stop", "interactions", "interaction-respond", "interaction-response-status",
       "restart-prepare", "restart-inspect", "restart-commit", "restart-release", "restart-stage"].includes(value.method as string)) throw new OmpError("invalid-request", "Invalid OMP request", false);
   const p = value.params, method = value.method;
   if (method === "restart-stage") {
@@ -192,43 +190,13 @@ export function parseRequest(value: unknown): OmpRequest {
     if (!validRestartIntent(p) || (method === "restart-release" && !p.previousTarget)) throw new OmpError("invalid-params", "Invalid restart intent", false);
     return value as OmpRequest;
   }
-  const fields = method === "inspect" || method === "interactions" ? [] : method === "interaction-respond" ? ["operationId", "requestId", "response"] : method === "interaction-response-status" ? ["operationId"] : method === "failures" ? ["after", "limit"] : method === "input" ? ["operationId", "text", "payloadHash"] : method === "operation" ? ["operationId", "payloadHash"] : method === "stop" ? ["operationId"] : ["operationId", "origin"];
-  if (!exactKeys(p, fields) || (!["inspect", "interactions", "failures"].includes(method as string) && !nonempty(p.operationId)) ||
+  const fields = method === "inspect" || method === "interactions" ? [] : method === "interaction-respond" ? ["operationId", "requestId", "response"] : method === "interaction-response-status" ? ["operationId"] : method === "input" ? ["operationId", "text", "payloadHash"] : method === "operation" ? ["operationId", "payloadHash"] : method === "stop" ? ["operationId"] : ["operationId", "origin"];
+  if (!exactKeys(p, fields) || (!["inspect", "interactions"].includes(method as string) && !nonempty(p.operationId)) ||
     (method === "interaction-respond" && (!nonempty(p.requestId) || !validInteractionResponse(p.response))) ||
-    (method === "failures" && !validFailureRequest(p.after, p.limit)) ||
     ((method === "input" || method === "operation") && !hash(p.payloadHash)) ||
     (method === "input" && (typeof p.text !== "string" || payloadHash(p.text) !== p.payloadHash)) ||
     ((method === "hold" || method === "release") && !["user", "automatic"].includes(p.origin as string))) throw new OmpError("invalid-params", "Invalid OMP parameters", false);
   return value as OmpRequest;
-}
-
-export type OmpFailure = {
-  sequence: number; failureId: string; sourceInstanceId: string; sourceGeneration: number; executionId: string;
-  phase: "model" | "compaction"; category: "authentication" | "usage-limit" | "configuration" | "runtime"; observedAt: string;
-};
-export type OmpFailurePage = {
-  streamId: string; sessionId: string; sessionFile: string; laneKey: string; role: "managed-lane";
-  after: number; through: number; highWatermark: number; hasMore: boolean; records: OmpFailure[];
-};
-const uuid = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value);
-export const validFailureRequest = (after: unknown, limit: unknown): boolean =>
-  Number.isSafeInteger(after) && (after as number) >= 0 && Number.isSafeInteger(limit) && (limit as number) >= 1 && (limit as number) <= 100;
-export function validateFailureRecord(value: unknown, streamId: string, sequence?: number): value is OmpFailure {
-  return uuid(streamId) && object(value) && exactKeys(value, ["sequence", "failureId", "sourceInstanceId", "sourceGeneration", "executionId", "phase", "category", "observedAt"]) &&
-    Number.isSafeInteger(value.sequence) && (value.sequence as number) > 0 && (sequence === undefined || value.sequence === sequence) &&
-    value.failureId === `omp-failure:${streamId}:${value.sequence}` && nonempty(value.sourceInstanceId) && value.sourceInstanceId.length <= 256 &&
-    Number.isSafeInteger(value.sourceGeneration) && (value.sourceGeneration as number) >= 0 && nonempty(value.executionId) && value.executionId.length <= 512 &&
-    ["model", "compaction"].includes(value.phase as string) && ["authentication", "usage-limit", "configuration", "runtime"].includes(value.category as string) &&
-    typeof value.observedAt === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value.observedAt) &&
-    Number.isFinite(Date.parse(value.observedAt)) && new Date(value.observedAt).toISOString() === value.observedAt;
-}
-export function validateFailurePage(value: unknown, target: Pick<OmpIdentity, "sessionId" | "sessionFile" | "laneKey" | "role">, after: number, limit = 100): value is OmpFailurePage {
-  if (!validFailureRequest(after, limit) || !object(value) || !exactKeys(value, ["streamId", "sessionId", "sessionFile", "laneKey", "role", "after", "through", "highWatermark", "hasMore", "records"]) ||
-    !uuid(value.streamId) || target.role !== "managed-lane" || value.role !== target.role || value.sessionId !== target.sessionId || value.sessionFile !== target.sessionFile || value.laneKey !== target.laneKey ||
-    value.after !== after || !Number.isSafeInteger(value.highWatermark) || (value.highWatermark as number) < after || !Array.isArray(value.records) || value.records.length > limit) return false;
-  const count = Math.min(limit, (value.highWatermark as number) - after);
-  return value.records.length === count && value.through === after + count && value.hasMore === ((value.through as number) < (value.highWatermark as number)) &&
-    value.records.every((row, index) => validateFailureRecord(row, value.streamId as string, after + index + 1));
 }
 
 export type NativeUserInteraction = {

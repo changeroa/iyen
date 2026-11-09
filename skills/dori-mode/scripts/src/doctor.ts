@@ -19,17 +19,16 @@ export const doctor = async (config: DoriConfig): Promise<{ ok: boolean; checks:
       checks.push({ name: "registry", ok: st.isDirectory() && !st.isSymbolicLink() && st.uid === process.getuid?.() && (st.mode & 0o077) === 0, detail: "private owner-only controller registry" });
       const targets = await discoverOmpSafe(omp!.registryDir);
       checks.push({ name: "controllers", ok: targets.length > 0, detail: targets.length ? `${targets.length} descriptors; each authenticated below` : "No controller; explicitly load extension in main OMP TUI with IYEN_OMP_REGISTRY_DIR" });
-      for (const target of targets) {
+      for (const target of targets.filter(target => target.role === "attached-lead")) {
         let c;
         try {
           await verifyOmpHerdr(target); c = await connectOmp(target, { timeoutMs: config.runtime.rpcTimeoutMs });
-          const snap = await c.inspect(), managed = target.role === "managed-lane";
-          const selected = config.runtime.roles[managed ? "lane" : "lead"];
+          const snap = await c.inspect();
           checks.push({ name: `${target.laneKey}:identity`, ok: target.runtimeVersion === config.runtime.requiredVersion, detail: "authenticated native session/file/pane/terminal/generation" });
           checks.push({ name: `${target.laneKey}:receipts`, ok: snap.capabilities.durableReceipts && snap.capabilities.input, detail: "durable transcript receipt storage" });
           checks.push({ name: `${target.laneKey}:interactions`, ok: snap.capabilities.interactions === true, detail: "native userInteractions list/respond/responseStatus capability required; local-only SDK is not relay-ready" });
-          checks.push({ name: `${target.laneKey}:model`, ok: !managed || snap.provider === omp!.provider && snap.model === selected.model && snap.effort === selected.effort, detail: `${snap.provider}/${snap.model}; effort ${snap.effort ?? "unavailable"}` });
-          checks.push({ name: `${target.laneKey}:control`, ok: !managed || snap.capabilities.hold && snap.capabilities.release && snap.capabilities.stop, detail: managed ? "managed hold/release/stop capability" : "borrowed lead inspect/input/interactions; detach does not stop TUI" });
+          checks.push({ name: `${target.laneKey}:model`, ok: true, detail: `${snap.provider}/${snap.model}; effort ${snap.effort ?? "unavailable"}` });
+          checks.push({ name: `${target.laneKey}:control`, ok: true, detail: "borrowed lead inspect/input/interactions; detach does not stop TUI" });
         } catch { checks.push({ name: `${target.laneKey}:controller`, ok: false, detail: "Exact live OMP identity/capabilities unavailable" }); }
         finally { c?.close(); }
       }

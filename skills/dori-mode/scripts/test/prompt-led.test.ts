@@ -235,8 +235,8 @@ test("lesson brief injection is bounded while complete durable history remains r
  expect(reference).toContain("Bounded recent reference view"); expect(lessons.list()).toHaveLength(31);
 });
 
-test("service adoption cannot bypass OMP's verified native bootstrap", async () => {
+test("service adoption cannot bypass OMP's Codex-only lane boundary", async () => {
  const config = defaultConfig(), s = new DoriService({ ...config, stateDir: state.dir, runtime: { ...config.runtime, kind: "omp" } }, fakeRunner(newWorld()));
- await expect(s.handle("adopt", { key: lane.key, threadId: "native1", transferConfirmed: true }, { role: "admin" })).rejects.toThrow("OMP adopt is unsupported");
+ await expect(s.handle("adopt", { key: lane.key, threadId: "native1", transferConfirmed: true }, { role: "admin" })).rejects.toThrow("OMP lanes were removed");
  expect(await s.registry.read(lane.key)).toBeNull();
 });

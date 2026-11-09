@@ -10,7 +10,6 @@ import { OMP_MAX_FRAME_BYTES, OmpError, assertIdentity, exactKeys, identityOf, m
   type LeadRestartIntent, type LeadRestartBootstrap, type LeadRestartStatus,
   type NativeUserInteractions, type NativeInteractionResponse, type NativeUserInteraction,
   type OmpGoal, type OmpIdentity, type OmpOperation, type OmpRequest, type OmpSnapshot, type OmpTarget } from "./contract.ts";
-import { FailureJournal, failureCategory } from "./failures.ts";
 import { OperationJournal, ReceiptPending, durableJson, persistedReceipt, privateDirectory, readPrivateJson } from "./receipts.ts";
 
 /** Minimal structural SDK boundary, checked against the pinned native SDK separately. */
@@ -73,10 +72,6 @@ export class OmpControlServer {
   private state: ControlState;
   private sequence = 0;
   private runId?: string;
-  private settledRunId?: string;
-  private compactionId?: string;
-  private failures?: FailureJournal;
-  private failureGap = false;
   private approvals = new Set<string>();
   private inputTools = new Set<string>();
   private tools = new Set<string>();
@@ -104,7 +99,7 @@ export class OmpControlServer {
     const initial = context();
     this.observedSafeSettle = initial.isIdle() && !initial.hasPendingMessages() && !hasAsyncWork(initial.getAsyncJobSnapshot());
     this.journal = new OperationJournal(join(sessionDirectory, "operations.json"), this.identity);
-    if (this.target.role === "managed-lane") this.failures = new FailureJournal(join(sessionDirectory, "failures.json"), this.identity);
+    if (this.target.role !== "attached-lead") throw new OmpError("role-forbidden", "OMP lanes were removed; only attached leads are supported", false);
     this.controlFile = join(sessionDirectory, "control.json");
     this.state = { held: !!options.startHeld };
     try {
@@ -112,12 +107,6 @@ export class OmpControlServer {
       if (!object(saved) || typeof saved.held !== "boolean" || (saved.origin !== undefined && saved.origin !== "user" && saved.origin !== "automatic") ||
         (saved.pausedGoal !== undefined && saved.pausedGoal !== null && (!object(saved.pausedGoal) || !["active", "paused"].includes(saved.pausedGoal.status as string) || typeof saved.pausedGoal.objective !== "string"))) throw new Error("Invalid control state");
       this.state = { ...(saved as ControlState), held: !!options.startHeld || saved.held };
-      // Stop intent belongs to the native execution epoch, not the saved chat.
-      // A managed resume is published only after its parent proves old-process
-      // exit. Require a fresh open native barrier too: reloading an extension in
-      // the still-held stopping process must never make that process releasable.
-      if (this.state.stopping && target.role === "managed-lane" && options.startHeld &&
-        saved.controllerInstanceId !== target.instanceId && this.core(initial)?.getState().status === "open") delete this.state.stopping;
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new OmpError("invalid-control-state", "OMP saved hold state cannot be verified"); }
     this.save();
     try {
@@ -394,38 +383,29 @@ export class OmpControlServer {
     let durable = true;
     try { persistedReceipt(this.identity, ctx.sessionManager.getLeafId(), "", "capability-probe"); }
     catch { durable = false; }
-    const managed = this.target.role === "managed-lane", modes = ctx.sessionModes, core = this.core(ctx), barrier = !!core;
+    const modes = ctx.sessionModes, core = this.core(ctx);
     const launchMetadata = this.currentLaunchMetadata();
     let interactionReady = false;
     let dialogs: NativeUserInteraction[] = [];
     try { dialogs = this.listInteractions(ctx); interactionReady = true; } catch { /* Never advertise unavailable/malformed native capability. */ }
     const waiting = dialogs.some(r => r.kind === "approval" || r.kind === "plan-review") || this.approvals.size > 0 || !!ctx.getPendingPlanReview();
-    const nativeHeld = (managed || !!this.restart?.hold) && core?.getState().status === "held";
+    const nativeHeld = !!this.restart?.hold && core?.getState().status === "held";
     const pending = (nativeHeld || this.parkedData ? hasActiveAsyncExecution(ctx.getAsyncJobSnapshot()) : ctx.hasPendingMessages() || hasAsyncWork(ctx.getAsyncJobSnapshot())) || this.continuing || this.compacting || this.retrying || this.awaitingErrorSettle;
     const idle = ctx.isIdle() && this.tools.size === 0 && !pending;
-    const failureHealthy = !managed || (!!this.failures?.available && !this.failureGap);
-    const failed = this.modelFailed || this.compactionFailed || !failureHealthy;
-    return { identity: this.identity, state: waiting ? "waiting_approval" : dialogs.length || this.inputTools.size ? "waiting_input" : managed && core?.getState().status === "holding" ? "pausing" : failed ? "failed" : !this.observedSafeSettle || this.retrying || this.awaitingErrorSettle ? "recovering" : idle ? "idle" : this.state.held ? "pausing" : "running",
-      held: this.state.held || (managed && !!core && core.getState().status !== "open"), activeRunId: idle ? undefined : this.runId,
+    const failed = this.modelFailed || this.compactionFailed;
+    return { identity: this.identity, state: waiting ? "waiting_approval" : dialogs.length || this.inputTools.size ? "waiting_input" : failed ? "failed" : !this.observedSafeSettle || this.retrying || this.awaitingErrorSettle ? "recovering" : idle ? "idle" : this.state.held ? "pausing" : "running",
+      held: this.state.held, activeRunId: idle ? undefined : this.runId,
       goal: this.goal(ctx), model: ctx.model?.id ?? "", provider: ctx.model?.provider ?? "", effort: this.api.getThinkingLevel(), eventSequence: this.sequence,
       launchMetadata,
-      capabilities: { inspect: true, interactions: interactionReady, leadRestart: durable && interactionReady && this.restartAvailable(launchMetadata), input: (!this.restart || this.restart.status.phase === "released") && durable && !failed && !this.compacting && !this.retrying && !this.awaitingErrorSettle && this.observedSafeSettle && (!managed || barrier), durableReceipts: durable, durableFailures: managed && failureHealthy, hold: managed && !!modes && barrier, release: managed && !!modes && barrier, stop: managed && !!modes && barrier, goals: !!modes } };
+      capabilities: { inspect: true, interactions: interactionReady, leadRestart: durable && interactionReady && this.restartAvailable(launchMetadata), input: (!this.restart || this.restart.status.phase === "released") && durable && !failed && !this.compacting && !this.retrying && !this.awaitingErrorSettle && this.observedSafeSettle, durableReceipts: durable, durableFailures: false, hold: false, release: false, stop: false, goals: !!modes } };
   }
   get identity(): OmpIdentity { return identityOf(this.target); }
-  private recordFailure(executionId: string | undefined, phase: "model" | "compaction", error: unknown): void {
-    // A hold/stop can race a genuine terminal provider failure. Cancellation is
-    // classified at the native event boundary, never inferred from control state.
-    if (!this.failures) return;
-    if (!executionId) { this.failureGap = true; this.failures.invalidate(); return; }
-    try { this.failures.append(executionId, phase, failureCategory(error)); }
-    catch { this.failureGap = true; }
-  }
   observe(event: { type: string; [key: string]: unknown }): void {
     if (this.closed) return;
     this.sequence++;
     const id = String(event.toolCallId ?? "");
     if (event.type === "agent_start") {
-      this.runId = `${this.target.instanceId}:${this.target.generation}:${this.sequence}`; this.settledRunId = this.runId; this.continuing = false; this.parkedData = false;
+      this.runId = `${this.target.instanceId}:${this.target.generation}:${this.sequence}`; this.continuing = false; this.parkedData = false;
       this.modelFailed = false; this.compactionFailed = false; this.compacting = false;
       this.lastAssistant = undefined; this.awaitingErrorSettle = false; this.retryCancelled = false; this.retryFailed = false;
     }
@@ -442,20 +422,16 @@ export class OmpControlServer {
         const prior = this.lastAssistant;
         const final = prior && (!latest || (typeof prior.timestamp === "number" && typeof latest.timestamp === "number" && prior.timestamp > latest.timestamp)) ? prior : latest ?? prior;
         this.modelFailed = !this.retryCancelled && (assistantFailed(final) || this.retryFailed);
-        if (this.modelFailed) this.recordFailure(this.settledRunId, "model", final?.errorMessage);
         this.retrying = false; this.awaitingErrorSettle = false; this.runId = undefined; this.observedSafeSettle = true;
       }
     }
     if (event.type === "session.compacting" || event.type === "auto_compaction_start") {
-      if (!this.compacting) this.compactionId = `compaction:${this.target.instanceId}:${this.target.generation}:${this.sequence}`;
       this.compacting = true;
     }
     if (event.type === "session_compact") { this.compacting = false; this.compactionFailed = false; }
     if (event.type === "auto_compaction_end") {
-      this.compactionId ??= `compaction:${this.target.instanceId}:${this.target.generation}:${this.sequence}`;
       this.compacting = event.willRetry === true;
       this.compactionFailed = event.aborted !== true && event.skipped !== true && event.willRetry !== true && typeof event.errorMessage === "string" && !!event.errorMessage;
-      if (this.compactionFailed) this.recordFailure(this.compactionId, "compaction", event.errorMessage);
     }
     if (event.type === "auto_retry_start") { this.retrying = true; this.modelFailed = false; this.retryCancelled = false; this.retryFailed = false; }
     if (event.type === "auto_retry_end") {
@@ -464,7 +440,6 @@ export class OmpControlServer {
       this.retryCancelled = event.success === false && event.finalError === "Retry cancelled";
       this.retryFailed = event.success === false && !this.retryCancelled;
       this.modelFailed = this.retryFailed;
-      if (this.retryFailed) this.recordFailure(this.settledRunId, "model", event.finalError);
       if (event.success === false) this.continuing = false;
       if (event.success === true || this.retryCancelled) this.awaitingErrorSettle = false;
     }
@@ -473,7 +448,6 @@ export class OmpControlServer {
     if (event.type === "tool_execution_start") { this.tools.add(id); if (event.toolName === "ask") this.inputTools.add(id); }
     if (event.type === "tool_execution_end") { this.tools.delete(id); this.inputTools.delete(id); }
   }
-  toolBlocked(): boolean { return this.closed || this.state.held; }
   private mutation<T>(run: () => T | Promise<T>): Promise<T> {
     const result = this.queue.then(run); this.queue = result.catch(() => {}); return result;
   }
@@ -525,10 +499,6 @@ export class OmpControlServer {
         throw new OmpError("invalid-interaction-receipt", "Native response outcome unknown", true);
       return result;
     }
-    if (request.method === "failures") {
-      if (!this.failures) throw new OmpError("role-forbidden", "Borrowed OMP lead does not expose failures", false);
-      return this.failures.page(p.after as number, p.limit as number);
-    }
     if (request.method === "operation") return this.reconcile(id, digest);
     if (request.method === "input") {
       await this.mutation(() => {
@@ -551,70 +521,9 @@ export class OmpControlServer {
       } while (Date.now() < deadline);
       this.journal.unknown(id, digest); throw new OmpError("receipt-unknown", "OMP persisted input receipt unknown", true);
     }
-    if (this.target.role !== "managed-lane") throw new OmpError("role-forbidden", "Borrowed OMP lead does not permit process control", false);
-    if (request.method === "hold") return this.hold(p.origin as "user" | "automatic");
-    if (request.method === "release") return this.release(p.origin as "user" | "automatic");
-    await this.hold("automatic"); this.live(); this.state.stopping = true; this.save();
-    // Intent only. Parent host must verify this exact process exits.
-    setTimeout(() => { if (!this.closed) this.live().shutdown(); }, 10);
-    return { stopping: true };
-  }
-  private async hold(origin: "user" | "automatic"): Promise<OmpSnapshot> {
-    let nativeHold!: Promise<OmpExecutionHoldState>;
-    await this.mutation(() => {
-      const ctx = this.live();
-      if (!ctx.sessionModes) throw new OmpError("modes-unavailable", "Native OMP mode controls unavailable", false);
-      const core = this.core(ctx);
-      if (!core) throw new OmpError("execution-barrier-unavailable", "Native OMP execution barrier unavailable", false);
-      const goal = this.goal(ctx);
-      if (goal?.status === "active" && !this.state.pausedGoal) this.state.pausedGoal = goal;
-      this.state.origin = this.state.origin === "user" ? "user" : origin;
-      this.state.held = true; this.save();
-      // Native hold installs its latch synchronously; default ctx.abort() would alter the goal.
-      nativeHold = core.hold();
-    });
-    const held = await nativeHold; this.live();
-    if (held.status !== "held" || held.sessionId !== this.target.sessionId || !Number.isSafeInteger(held.generation) || this.core(this.live())?.getState().generation !== held.generation) throw new OmpError("hold-unconfirmed", "Native OMP execution hold unconfirmed", true);
-    this.state.coreHold = held; this.save(); this.continuing = false; this.runId = undefined;
-    // The native barrier proves compaction/retry execution has settled, unlike isIdle alone.
-    this.compacting = false; this.retrying = false; this.awaitingErrorSettle = false;
-    const deadline = Date.now() + (this.options.timeoutMs ?? 15000);
-    do {
-      const ctx = this.live();
-      if (ctx.isIdle() && !this.tools.size && !hasActiveAsyncExecution(ctx.getAsyncJobSnapshot()) && !this.continuing && !this.compacting && this.core(ctx)?.getState().status === "held") {
-        if (this.goal(ctx)?.status === "active") {
-          const result = await ctx.sessionModes!.set({ mode: "goal", action: "pause" });
-          if (!result.ok) { await new Promise(resolve => setTimeout(resolve, 20)); continue; }
-        }
-        this.observedSafeSettle = true;
-        const snap = this.snapshot();
-        if (["idle", "failed"].includes(snap.state) && snap.goal?.status !== "active") return snap;
-      }
-      await new Promise(resolve => setTimeout(resolve, 20));
-    } while (Date.now() < deadline);
-    throw new OmpError("hold-unconfirmed", "OMP hold unconfirmed; dispatch remains blocked", true);
-  }
-  private release(origin: "user" | "automatic"): Promise<OmpSnapshot> {
-    return this.mutation(async () => {
-      const ctx = this.live(), before = this.snapshot();
-      if (this.state.stopping) throw new OmpError("stopping", "OMP shutdown intent cannot be released", false);
-      if (!this.state.held) { if (before.held) throw new OmpError("unowned-hold", "Native OMP hold is not owned by this controller", false); return before; }
-      if (this.state.origin === "user" && origin === "automatic") throw new OmpError("owner-held", "Automatic release cannot clear an owner hold", false);
-      const core = this.core(ctx), expectedHold = this.state.coreHold;
-      if (!["idle", "failed"].includes(before.state) || hasActiveAsyncExecution(ctx.getAsyncJobSnapshot()) || !ctx.isIdle() || this.tools.size || this.compacting || this.continuing || !ctx.sessionModes || !core || !expectedHold || core.getState().status !== "held" || core.getState().generation !== expectedHold.generation) throw new OmpError("release-blocked", "OMP release requires confirmed idle native state and exact execution hold", false);
-      if (this.state.pausedGoal) {
-        const expected = this.state.pausedGoal, goal = this.goal(ctx);
-        if (!goal || goal.status !== "paused" || goal.objective !== expected.objective || goal.tokenBudget !== expected.tokenBudget) throw new OmpError("goal-changed", "OMP paused goal changed; explicit reconciliation required", false);
-        const result = await ctx.sessionModes.set({ mode: "goal", action: "resume" }); this.live();
-        if (!result.ok || this.goal(ctx)?.status !== "active") throw new OmpError("resume-unconfirmed", "OMP native goal resume unconfirmed", true);
-      } else if (before.goal?.status === "active") throw new OmpError("unexpected-goal", "Unexpected active OMP goal while held", false);
-      const released = await core.release({ sessionId: expectedHold.sessionId, generation: expectedHold.generation }); this.live();
-      if (released.status !== "open" || released.sessionId !== expectedHold.sessionId || released.generation !== expectedHold.generation || core.getState().status !== "open") throw new OmpError("release-unconfirmed", "Native OMP execution barrier release unconfirmed", true);
-      this.state = { held: false }; this.parkedData = true; this.save(); return this.snapshot();
-    });
+    throw new OmpError("role-forbidden", "Borrowed OMP lead does not permit process control", false);
   }
   async listen(): Promise<void> {
-    if (this.state.held && this.target.role === "managed-lane" && this.core(this.live())) await this.hold(this.state.origin ?? "automatic");
     if (this.options.restart) {
       await this.latchRestart();
       if (this.restart?.status.phase !== "held") throw new OmpError("restart-startup-unheld", "Restart startup must be latched before publication", false);

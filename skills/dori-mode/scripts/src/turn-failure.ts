@@ -1,10 +1,3 @@
-/** Persist categories and fixed guidance, never upstream messages, tool output or credentials. */
-export const ompFailureGuidance = (category: "authentication" | "usage-limit" | "configuration" | "runtime"): string => ({
-  authentication: "Check authentication in the configured OMP profile, then explicitly continue after checking completed actions.",
-  "usage-limit": "Check usage limits or quota, then explicitly continue after checking completed actions.",
-  configuration: "Check model and runtime configuration, then explicitly continue after checking completed actions.",
-  runtime: "Inspect runtime status and completed actions before explicitly continuing.",
-})[category];
 export const turnFailure = (error: any): { category: string; guidance: string } => {
   const info = error?.codexErrorInfo;
   const code = typeof info === "string" ? info : info && typeof info === "object" ? Object.keys(info)[0] ?? "" : "";

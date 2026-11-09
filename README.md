@@ -4,7 +4,7 @@
 
 Iyen mode turns the current Codex conversation into the messenger lead. Ask “이연 모드 시작” with the `iyen` skill installed: the same session receives owner messages and delegates work into independent worker sessions. No separate lead session is created.
 
-OMP (oh-my-pi) is also available through an [opt-in, isolated runtime profile](skills/dori-mode/references/setup.md#opt-in-omp-profile-alongside-codex). Codex remains the default. OMP supports attaching an explicitly prepared native conversation and launching managed workers; managed pause and recovery require the linked OMP fork with `executionHold` support.
+OMP (oh-my-pi) is also available through an [opt-in, isolated runtime profile](skills/dori-mode/references/setup.md#opt-in-omp-profile-alongside-codex). Codex remains the default. OMP supports attaching an explicitly prepared native lead conversation. Worker lanes use Codex; OMP lanes have been removed.
 
 Activation requires the current Herdr session to be loaded in the running local Codex shared daemon; an unobservable standalone session is refused. The lead uses that existing session and daemon. Each worker lane runs a **real interactive Codex TUI in Herdr** connected to its own app-server endpoint. `dori serve` owns monitors and durable state; Codex owns reasoning, tools, turns and native goals; Herdr owns TUI start/resume, prompts, controls and exit. A read-only observer verifies exact persisted operation markers and turn/goal state; idle status is never a delivery receipt. Workers call a scoped stdio MCP tool. The existing lead uses a generation-scoped command bridge without changing its sandbox or loading a new MCP server. OMO is not required.
 

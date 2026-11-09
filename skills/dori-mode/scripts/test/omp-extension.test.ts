@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
-import { readdirSync } from "node:fs";
+import { readdirSync, watch } from "node:fs";
 import { join } from "node:path";
-import { registerOmpExtension, parseBootstrap, type OmpExtensionOptions } from "../src/runtime/omp/extension.ts";
+import { registerOmpExtension, type OmpExtensionOptions } from "../src/runtime/omp/extension.ts";
 import { discoverOmp, prepareOmpLaunch, parseOmpVersion } from "../src/runtime/omp/launcher.ts";
 import { connectOmp } from "../src/runtime/omp/client.ts";
 import type { OmpContext } from "../src/runtime/omp/server.ts";
@@ -23,17 +23,25 @@ function extensionFixture() {
   const event = (name: string) => handlers.get(name)?.({ type: name }, ctx);
   return { ...f, ctx, api, options, actualPane, handlers, tools, event,
     cleanup: () => { event("session_shutdown"); f.cleanup(); },
-    async ready() { for (let attempt = 0; attempt < 100; attempt++) { if (readdirSync(f.directory).some(name => /^[a-f0-9]{64}\.json$/.test(name))) return; await Bun.sleep(5); } throw new Error("Controller descriptor not published"); },
+    ready() {
+      return new Promise<void>((resolve, reject) => {
+        const published = () => readdirSync(f.directory).some(name => /^[a-f0-9]{64}\.json$/.test(name));
+        const listener = watch(f.directory, () => { if (published()) { clearTimeout(timer); listener.close(); resolve(); } });
+        const timer = setTimeout(() => { listener.close(); reject(new Error("Controller descriptor not published")); }, 1000);
+        if (published()) { clearTimeout(timer); listener.close(); resolve(); }
+      });
+    },
   };
 }
 test("extension waits for exact Herdr path association without blocking SessionStart, then authenticates inspect", async () => {
-  const f = extensionFixture(); let associated = false;
-  f.options.herdrPane = async () => associated ? f.actualPane : { ...f.actualPane, agent_session: undefined };
+  const f = extensionFixture();
+  const queried = Promise.withResolvers<void>(), associated = Promise.withResolvers<void>();
+  f.options.herdrPane = async () => { queried.resolve(); await associated.promise; return f.actualPane; };
   try {
     await registerOmpExtension(f.api, f.options);
-    expect(f.event("session_start")).toBeUndefined(); await Bun.sleep(15);
+    expect(f.event("session_start")).toBeUndefined(); await queried.promise;
     expect(readdirSync(f.directory).some(name => /^[a-f0-9]{64}\.json$/.test(name))).toBe(false);
-    associated = true; await f.ready();
+    associated.resolve(); await f.ready();
     const [target] = await discoverOmp(f.directory); expect(target?.sessionFile).toBe(f.identity.sessionFile);
     const client = await connectOmp(target!);
     try { const snapshot = await client.inspect(); expect(snapshot.capabilities.input).toBe(true); expect(snapshot.identity.terminalId).toBe(f.identity.terminalId);
@@ -43,7 +51,7 @@ test("extension waits for exact Herdr path association without blocking SessionS
 });
 test("extension does not register borrowed service tools or publish subagent controllers", async () => {
   const f = extensionFixture(); f.ctx.agent.kind = "sub";
-  try { await registerOmpExtension(f.api, f.options); f.event("session_start"); await Bun.sleep(10);
+  try { await registerOmpExtension(f.api, f.options); await f.event("session_start");
     expect(f.tools).toHaveLength(0); expect(await discoverOmp(f.directory)).toEqual([]);
   } finally { f.cleanup(); }
 });
@@ -54,20 +62,6 @@ test("extension switch immediately revokes old socket and descriptor", async () 
     const [target] = await discoverOmp(f.directory), client = await connectOmp(target!);
     try { f.event("session_before_switch"); await expect(client.inspect()).rejects.toThrow("unknown"); expect(await discoverOmp(f.directory)).toEqual([]); }
     finally { client.close(); }
-  } finally { f.cleanup(); }
-});
-test("managed bootstrap requires scoped service paths and blocks all native subagent spawning", async () => {
-  const f = extensionFixture();
-  const bootstrap = { protocol: 1, registryDir: f.directory, role: "managed-lane", laneKey: "worker", expectedCwd: f.directory, expectedPaneId: f.identity.paneId, expectedTerminalId: f.identity.terminalId };
-  try {
-    expect(() => parseBootstrap(bootstrap)).toThrow("scoped service paths");
-    const service = { contextFile: "/context", configFile: "/config", stateDir: "/state", cliPath: "/cli", bunBinary: "/bun" };
-    const file = join(f.directory, "bootstrap.json"); durableJson(file, { ...bootstrap, service });
-    f.options.env = { IYEN_OMP_BOOTSTRAP: file, HERDR_PANE_ID: f.identity.paneId };
-    await registerOmpExtension(f.api, f.options);
-    expect(f.event("before_subagent_spawn")).toEqual({ block: true, reason: "Managed Iyen lanes cannot spawn native subagents" });
-    expect(f.tools.map(tool => tool.name)).toEqual(["iyen_control"]);
-    expect(f.event("tool_call")).toEqual({ block: true, reason: "Iyen managed runtime is held or unavailable" });
   } finally { f.cleanup(); }
 });
 test("OMP launch specification uses supported explicit flags and exact file resume, never restore", () => {
@@ -82,11 +76,11 @@ test("OMP launch specification uses supported explicit flags and exact file resu
   expect(() => prepareOmpLaunch({ ...options, resumeSessionFile: "latest" })).toThrow("absolute paths");
   expect(parseOmpVersion("18.15.0\n")).toBe("18.15.0"); expect(() => parseOmpVersion("prefix 18.15.0 trailing")).toThrow("Expected OMP");
 });
-test("fresh managed OMP launch explicitly selects its per-bootstrap session directory", () => {
-  const base = { binary: "/bin/omp", registryDir: "/registry", bootstrapFile: "/lanes/a/bootstrap.json", extensionPath: "/extension.ts", cwd: "/workspace", provider: "fixture", model: "test", effort: "medium", approvalMode: "always-ask" as const };
-  const fresh = prepareOmpLaunch(base), other = prepareOmpLaunch({ ...base, bootstrapFile: "/lanes/b/bootstrap.json" });
-  expect(fresh.argv.slice(-2)).toEqual(["--session-dir", "/lanes/a/bootstrap.json.sessions"]);
-  expect(other.argv.slice(-2)).toEqual(["--session-dir", "/lanes/b/bootstrap.json.sessions"]);
+test("fresh native OMP lead launch explicitly selects its per-bootstrap session directory", () => {
+  const base = { binary: "/bin/omp", registryDir: "/registry", bootstrapFile: "/lead/a/bootstrap.json", extensionPath: "/extension.ts", cwd: "/workspace", provider: "fixture", model: "test", effort: "medium", approvalMode: "always-ask" as const };
+  const fresh = prepareOmpLaunch(base), other = prepareOmpLaunch({ ...base, bootstrapFile: "/lead/b/bootstrap.json" });
+  expect(fresh.argv.slice(-2)).toEqual(["--session-dir", "/lead/a/bootstrap.json.sessions"]);
+  expect(other.argv.slice(-2)).toEqual(["--session-dir", "/lead/b/bootstrap.json.sessions"]);
   expect(fresh.argv).not.toContain("--resume"); expect(fresh.argv).not.toContain("--continue"); expect(fresh.argv).not.toContain("--restore");
 });
 

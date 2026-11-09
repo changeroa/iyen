@@ -7,7 +7,6 @@ import type { DoriConfig } from "../config.ts";
 import { atomicJson, SerialQueue } from "../journal.ts";
 import { hostSocket, ipc, readJson, serviceSocket, socketDir } from "../ipc.ts";
 import { run } from "../run.ts";
-import { runOmpSessionHost, preserveOmpSocketOwner } from "./omp-integration.ts";
 import { safeEnvironment } from "./codex.ts";
 import { HerdrSession } from "./herdr.ts";
 import { quoteForPane } from "../launch.ts";
@@ -56,7 +55,7 @@ export const prepareBackend = (stateDir: string, boot: Bootstrap): { home: strin
 export const startSessionHost = (stateDir: string, key: string): void => {
   const boot = readJson<Bootstrap>(bootstrapPath(stateDir, key));
   if (key === "lead" || boot.role === "lead") throw new Error("Iyen lead must attach to the current session; use lead-attach");
-  if (boot.config.runtime.kind === "omp") preserveOmpSocketOwner(stateDir, key);
+  if (boot.config.runtime.kind !== "codex") throw new Error(`Lane ${key}: OMP lanes were removed. Use close ${key} and launch a new Codex lane.`);
   const child = spawn(process.execPath, [resolve(import.meta.dir, "../cli.ts"), "session-host", "--state-dir", stateDir, "--key", key],
     { detached: true, stdio: "ignore", cwd: boot.cwd, env: { ...safeEnvironment(process.env), ...(process.env.HERDR_SOCKET_PATH ? { HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH } : {}) } });
   if (!child.pid) throw new Error("Could not start runtime host");
@@ -65,7 +64,7 @@ export const startSessionHost = (stateDir: string, key: string): void => {
 export const runSessionHost = async (stateDir: string, key: string): Promise<void> => {
   const boot = readJson<Bootstrap>(bootstrapPath(stateDir, key)), config = boot.config;
   if (key === "lead" || boot.role === "lead") throw new Error("Iyen lead must attach to the current session; use lead-attach");
-  if (config.runtime.kind === "omp") return runOmpSessionHost(stateDir, boot);
+  if (config.runtime.kind !== "codex") throw new Error(`Lane ${key}: OMP lanes were removed. Use close ${key} and launch a new Codex lane.`);
   const socket = hostSocket(stateDir, key), endpoint = backendSocket(stateDir, key);
   if (existsSync(socket)) {
     try { await ipc(socket, boot.hostToken, "inspect", {}, 1000); throw new Error("An existing session-host still owns this thread"); }

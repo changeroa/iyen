@@ -12,8 +12,7 @@
     "settingsHome": "/absolute/isolated-omp/agent",
     "sandbox": "danger-full-access",
     "roles": {
-      "lead": { "model": null, "effort": null },
-      "lane": { "model": "EXPLICIT_MODEL_ID", "effort": "medium" }
+      "lead": { "model": null, "effort": null }
     },
     "omp": {
       "registryDir": "/absolute/isolated-omp/controllers",

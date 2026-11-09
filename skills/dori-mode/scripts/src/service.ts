@@ -2,15 +2,12 @@ import { chmodSync, existsSync, mkdirSync, unlinkSync, openSync, closeSync, read
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { workspaceForRole, type DoriConfig } from "./config.ts";
+import { type DoriConfig } from "./config.ts";
 import { atomicJson, SerialQueue } from "./journal.ts";
 import { ipc, serviceSocket, hostSocket, readJson } from "./ipc.ts";
-import { Registry, statusOf, withStatus, type Lane, LANE_KEY } from "./registry.ts";
+import { Registry, assertLaneRuntime, isRemovedOmpLane, statusOf, withStatus, type Lane, LANE_KEY } from "./registry.ts";
 import { claimDone, closeLane, objectDone, watchTick, type FlowDeps } from "./done-flow.ts";
-import { abandonManagedInput } from "./mail-abandon.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
-import { resumeUncertain } from "./resume-uncertain.ts";
-import { retireManagedLane } from "./retire.ts";
 import { launchLane, quoteForPane, validateLaunch, LaunchError, type LaunchInput } from "./launch.ts";
 import { freshnessTick } from "./freshness.ts";
 import { deadPaneTick } from "./dead-panes.ts";
@@ -28,7 +25,7 @@ import { Checkpoints } from "./checkpoints.ts";
 import { Lessons, lessonRepository } from "./lessons.ts";
 import { recordReport } from "./reports.ts";
 import { supervisionTick } from "./supervision.ts";
-import { turnFailure, ompFailureGuidance } from "./turn-failure.ts";
+import { turnFailure } from "./turn-failure.ts";
 import { DeliveryDeferred, Mailbox, postHook, type Mail } from "./mailbox.ts";
 import { ExternalCurrentSession, ExternalSessionError, discoverExternal, observeExternal, sharedDaemon, THREAD_UUID, type Attachment as CodexAttachment } from "./runtime/external-current-session.ts";
 import { connectObserver, receiptInTurns } from "./runtime/observer.ts";
@@ -39,7 +36,7 @@ import type { Turn } from "./runtime/generated/v2/Turn.ts";
 
 import { callOmp, findOmpTarget, verifyOmpHerdr, sameOmpTarget } from "./runtime/omp-integration.ts";
 import { connectOmp } from "./runtime/omp/client.ts";
-import { sameIdentity, validReceipt, payloadHash, object, exactKeys, validateFailureRecord, validLaunchMetadata, type OmpLaunchMetadata, type OmpTarget } from "./runtime/omp/contract.ts";
+import { sameIdentity, validReceipt, payloadHash, object, exactKeys, validLaunchMetadata, type OmpLaunchMetadata, type OmpTarget } from "./runtime/omp/contract.ts";
 import { NativeInteractionRelay } from "./runtime/omp/interactions.ts";
 import { LeadRestartCoordinator, restartAuthorization, type RestartRecord } from "./lead-restart-coordinator.ts";
 import { pinRestartProcess, restartProcessExited, discoverRestartTarget, validateRestartProfile } from "./lead-restart-launcher.ts";
@@ -98,17 +95,12 @@ export class DoriService {
     } catch (error) { this.phase = "failed"; this.writeHealth(); throw error; }
     const call = async <T>(key: string, action: string, args: any = {}): Promise<T> => {
       const lane = await this.registry.read(key);
+      if (lane) assertLaneRuntime(lane);
       if (!lane?.runtime?.threadId) throw new Error("Runtime is not registered");
       if (lane.runtime.backend === "external-current-session") return this.externalCall(lane, action, args) as Promise<T>;
-      if (lane.runtime.kind === "omp" && action === "release" && this.inbox.list().some(row => row.target === key && ["unknown", "sending"].includes(row.state))) throw new Error("OMP unresolved operation fence; reconcile exact receipts before release");
       if (action === "stop" && lane.runtime.state === "stopped") return undefined as T;
       const boot = readJson<Bootstrap>(bootstrapPath(config.stateDir, key));
       const result = await ipc<T>(hostSocket(config.stateDir, key), boot.hostToken, action, args, config.runtime.rpcTimeoutMs * 3);
-      if (lane.runtime.kind === "omp") {
-        const current = await this.lane(key);
-        if (current.runtime?.hostInstanceId !== lane.runtime.hostInstanceId || current.runtime.generation !== lane.runtime.generation) throw new Error("OMP host generation changed during control; outcome unknown");
-        if (action === "input" && (!lane.runtime.omp || !validReceipt((result as any)?.receipt, lane.runtime.omp.target, args.operationId, payloadHash(args.text)))) throw new Error("OMP exact receipt missing");
-      }
       if (action === "stop") await this.registry.update(key, l => ({ ...l, runtime: l.runtime && { ...l.runtime, state: "stopped", activeTurnId: undefined } }));
       return result;
     };
@@ -116,13 +108,10 @@ export class DoriService {
       inspect: async key => (await this.registry.read(key))?.runtime?.kind === "omp" ? call(key, "inspect") : this.dispatchQueue.run(key, () => call(key, "inspect")),
       input: (key, text, operationId) => this.withIntake(() => this.dispatchQueue.run(key, async () => {
         const lane = await this.registry.read(key);
+        if (lane) assertLaneRuntime(lane);
         if (key === "lead" && this.leadRestarts.hasActive()) throw new DeliveryDeferred("Lead restart fences native input");
         if (!lane || lane.dispatchBlocked || statusOf(lane) === "closed") throw new Error("Lane dispatch is blocked");
         const mail = this.putInbox({ id: operationId, target: key, text, thread: lane.thread, state: "queued", at: new Date().toISOString() });
-        if (lane.runtime?.kind === "omp" && lane.runtime.backend === "herdr-tui") {
-          const snapshot = await call<RuntimeSnapshot>(key, "inspect");
-          if (snapshot.state !== "idle" || snapshot.held || snapshot.activeTurnId) throw new DeliveryDeferred("Managed OMP control input waits for idle native admission");
-        }
         if (lane.runtime?.backend === "external-current-session") {
           if (mail.attachmentInstance && mail.attachmentInstance !== lane.runtime.hostInstanceId) throw new DeliveryDeferred("Mail belongs to a previous lead attachment");
           if (this.attachment(lane).excludedInboxIds.includes(mail.id)) throw new DeliveryDeferred("Historical mail is held for explicit reconciliation");
@@ -146,7 +135,6 @@ export class DoriService {
           catch (error) {
             if (lane.runtime?.kind === "omp" && !(error instanceof DeliveryDeferred)) {
               await this.registry.update(key, current => current.runtime?.hostInstanceId !== lane.runtime!.hostInstanceId ? current : { ...current, dispatchBlocked: true, holdReason: current.holdReason ?? "recovery", runtime: { ...current.runtime, held: true, state: "recovering" } });
-              if (lane.runtime.backend !== "external-current-session") void call(key, "hold", { origin: "automatic" }).catch(() => {});
             }
             throw error;
           }
@@ -161,6 +149,7 @@ export class DoriService {
     this.deps = { config, registry: this.registry, clock: realClock, run: runner, runtime, post: (id, hook, values) => postHook(this.outbox, runner, id, hook, values),
       queueInput: (key, text, operationId) => this.withIntake(async () => {
         const lane = await this.lane(key);
+        assertLaneRuntime(lane);
         this.putInbox({ id: operationId, target: key, text, thread: lane.thread, state: "queued", at: new Date().toISOString(), attachmentInstance: this.intakeInstance(lane) });
       }) };
     this.nativeInteractions = new NativeInteractionRelay({
@@ -865,7 +854,7 @@ export class DoriService {
     const lane = await this.lane(key), runtime = lane.runtime;
     const assertCurrent = (current: Lane) => {
       if (!runtime?.omp || current.runtime?.kind !== "omp" || current.runtime.backend !== runtime.backend ||
-        (key === "lead" ? runtime.backend !== "external-current-session" : runtime.backend !== "herdr-tui" || runtime.omp.target.role !== "managed-lane" || runtime.omp.target.laneKey !== key) ||
+        (key !== "lead" || runtime.backend !== "external-current-session") ||
         current.runtime.hostInstanceId !== instance || current.runtime.hostInstanceId !== runtime.hostInstanceId || current.runtime.generation !== runtime.generation ||
         current.runtime.state === "stopped" || current.runtime.external?.detachedAt || current.runtime.omp?.detachedAt || !current.runtime.omp ||
         !sameOmpTarget(current.runtime.omp.target, runtime.omp.target) || current.cleanupFence || this.pendingHandoff()) throw new Error("OMP receipt attachment changed or unavailable");
@@ -1095,11 +1084,6 @@ export class DoriService {
       try { process.kill(pid, 0); throw new Error("Prior backend process still exists; refuse second writer"); }
       catch (e) { if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e; }
     }
-    if (lane.runtime?.kind === "omp" && lane.runtime.omp) {
-      const target = lane.runtime.omp.target;
-      try { await verifyOmpHerdr(target, this.runner); const c = await connectOmp(target); try { await c.inspect(); } finally { c.close(); } return; }
-      catch { /* existing controller unavailable; require absence checks below */ }
-    }
     if (isHcTerminal(lane.pane)) {
       const held = await this.runner(["herdr", "agent", "get", lane.pane]);
       if (held.code === 0 && JSON.parse(held.out).result.agent?.agent) throw new Error("A live TUI already owns this pane or thread");
@@ -1110,6 +1094,8 @@ export class DoriService {
     if (agents.some(a => a.pane_id === lane.pane || (lane.runtime?.threadId && a.agent_session?.value === lane.runtime.threadId))) throw new Error("A live TUI already owns this pane or thread");
   }
   async boot(lane: Lane): Promise<void> {
+    assertLaneRuntime(lane);
+    if (this.config.runtime.kind !== "codex") throw new Error(`Lane ${lane.key}: OMP lanes were removed. Configure a Codex runtime to launch lanes.`);
     if (lane.key === "lead" || lane.role === "lead") throw new Error("Iyen lead must attach to the current session; use lead-attach");
     if (lane.runtime?.backend === "external-current-session") throw new Error("External current-session boot is unsupported; use lead-attach");
     if (lane.runtime?.threadId && lane.runtime.kind !== this.config.runtime.kind) throw new Error("Runtime kind conversion is prohibited; use an isolated OMP profile");
@@ -1127,12 +1113,6 @@ export class DoriService {
     }
     const instance = crypto.randomUUID();
     const boot: Bootstrap = { key: lane.key, role: lane.role ?? "lane", pane, instance, generation: (lane.runtime?.generation ?? 0) + 1, hostToken: crypto.randomUUID(), laneToken: crypto.randomUUID(), cwd: lane.cwd ?? this.config.defaultCwd, threadId: lane.runtime?.threadId, model: lane.model ?? lane.runtime?.model, effort: lane.effort ?? lane.runtime?.effort, blocked: Boolean(lane.dispatchBlocked), config: this.config };
-    if (this.config.runtime.kind === "omp" && lane.runtime?.omp && existsSync(path)) {
-      const old = readJson<Bootstrap>(path);
-      // The existing native extension's MCP helper already loaded this scoped
-      // lane token. Keep it only when reconnecting the exact same controller.
-      try { await verifyOmpHerdr(lane.runtime.omp.target, this.runner); if (old.threadId === boot.threadId || lane.runtime.threadId === boot.threadId) boot.laneToken = old.laneToken; } catch { /* stopped controller: fresh lane credential */ }
-    }
     atomicJson(path, boot);
     const clientDir = join(this.config.stateDir, "clients", lane.key);
     mkdirSync(clientDir, { recursive: true, mode: 0o700 });
@@ -1240,6 +1220,7 @@ export class DoriService {
     if (action.startsWith("host-")) {
       if (caller.role !== "host" || caller.key !== args.key) throw new Error("Forbidden host identity");
       const lane = await this.lane(args.key);
+      assertLaneRuntime(lane);
       if (lane.runtime?.backend === "external-current-session") throw new Error("External current-session cannot register a managed host");
       if (!lane.runtime || lane.runtime.hostInstanceId !== args.instance || args.runtime?.hostInstanceId !== args.instance || args.runtime?.generation !== lane.runtime.generation) throw new Error("Stale host generation");
       if (lane.retirement) return { accepted: false, retired: true };
@@ -1255,29 +1236,7 @@ export class DoriService {
       }
       if (lane.runtime.threadId && lane.runtime.threadId !== args.runtime.threadId) throw new Error("Thread identity mismatch");
       if (!args.runtime.threadId || args.runtime.kind !== lane.runtime.kind || args.runtime.kind !== this.config.runtime.kind) throw new Error("Invalid runtime identity");
-      if (args.runtime.kind === "omp") {
-        const native = args.runtime.omp?.target as OmpTarget | undefined;
-        if (!native || native.sessionId !== args.runtime.threadId || native.paneId !== lane.pane || native.cwd !== realpathSync(lane.cwd!) || native.role !== "managed-lane" || native.laneKey !== lane.key || native.runtimeVersion !== this.config.runtime.requiredVersion || args.runtime.omp.attachmentInstanceId !== args.instance || args.runtime.omp.attachmentGeneration !== lane.runtime.generation) throw new Error("Invalid OMP host/native attachment identity");
-        if (lane.runtime.omp && !sameIdentity(lane.runtime.omp.target, native)) throw new Error("OMP native controller changed within host generation");
-        await verifyOmpHerdr(native, this.runner);
-      }
       if (action === "host-register") atomicJson(join(this.config.stateDir, "hosts", `${lane.key}.pid.json`), { pid: args.pid, instance: args.instance });
-      if (action === "host-event" && args.event?.method === "runtime/failure") {
-        const params = args.event.params, native = args.runtime.omp?.target as OmpTarget | undefined;
-        if (args.runtime.kind !== "omp" || !native || lane.role === "lead" || !object(args.event) || !exactKeys(args.event, ["method", "params"]) ||
-          !object(params) || !exactKeys(params, ["runtime", "streamId", "sessionId", "sessionFile", "laneKey", "failure"]) || params.runtime !== "omp" ||
-          params.sessionId !== native.sessionId || params.sessionFile !== native.sessionFile || params.laneKey !== lane.key || typeof params.streamId !== "string" ||
-          !validateFailureRecord(params.failure, params.streamId)) throw new Error("Invalid OMP terminal failure identity");
-        const failure = params.failure;
-        // Keep raw native errors out of every service store. A digest detects a
-        // changed duplicate without retaining arbitrary upstream metadata.
-        const eventDigest = payloadHash(JSON.stringify([params.sessionId, params.sessionFile, params.laneKey, params.streamId,
-          failure.sequence, failure.failureId, failure.sourceInstanceId, failure.sourceGeneration, failure.executionId, failure.phase, failure.category, failure.observedAt]));
-        this.putFailure({ id: `omp-failure:${lane.key}:${params.streamId}:${failure.sequence}`, target: lane.key,
-          turnId: failure.failureId, source: params.streamId, state: "queued", at: failure.observedAt,
-          text: JSON.stringify({ runtime: "omp", phase: failure.phase, category: failure.category, guidance: ompFailureGuidance(failure.category), eventDigest }) });
-        return { accepted: true };
-      }
       await this.registry.update(lane.key, l => ({ ...l,
         ...(args.runtime.held && !l.dispatchBlocked ? { dispatchBlocked: true, holdReason: "recovery" as const } : {}),
         runtime: { ...args.runtime as RuntimeRef, lastHeartbeatAt: new Date().toISOString() } }));
@@ -1307,8 +1266,12 @@ export class DoriService {
     }
     if (caller.role === "host") throw new Error("Host cannot issue user commands");
     const key = args.key ?? caller.key;
+    if (key && action !== "status" && action !== "close") {
+      const registered = await this.registry.read(key);
+      if (registered) assertLaneRuntime(registered);
+    }
     if (caller.role === "lane" && (!(["report", "claim-done", "status", "checkpoint-record", "checkpoint-list", "lesson-add", "lesson-list"].includes(action)) || key !== caller.key)) throw new Error("Lane capability does not authorize this command");
-    if (key && key !== "lead" && action !== "status" && action !== "retire" && action !== "close" && (await this.registry.read(key))?.retirement)
+    if (key && key !== "lead" && action !== "status" && action !== "close" && (await this.registry.read(key))?.retirement)
       throw new Error("Retired lane cannot accept new work; use a new lane key");
     if (["pause", "resume", "close", "recover", "reopen", "claim-done", "object-done"].includes(action) && (await this.registry.read(key))?.runtime?.backend === "external-current-session") throw new Error(`External current-session ${action} is unsupported; use lead-detach`);
     if (action.startsWith("worklog-")) {
@@ -1387,24 +1350,13 @@ export class DoriService {
       });
     }
     if (action === "adopt") {
-      if (this.config.runtime.kind === "omp") throw new LaunchError("OMP adopt is unsupported; managed lanes require the verified OMP bootstrap");
+      if (this.config.runtime.kind === "omp") throw new LaunchError("OMP lanes were removed; configure a Codex runtime to adopt lanes");
       if (!args.threadId || args.transferConfirmed !== true) throw new Error("adopt requires thread-id and confirmed exclusive ownership transfer");
       await validateLaunch(this.deps, args, false);
       const lane: Lane = { key, title: args.title, thread: args.thread ?? "none", brief: args.brief, done: args.done, pane: args.pane, cwd: args.cwd ?? this.config.defaultCwd, role: "lane", model: args.model, effort: args.effort, openedAt: new Date().toISOString(), status: "paused", pausedFrom: "working", dispatchBlocked: true, holdReason: "owner-pause", runtime: { kind: "codex", threadId: args.threadId, hostInstanceId: "", generation: 0, state: "stopped", binaryVersion: this.config.runtime.requiredVersion } };
       await this.registry.write(lane); await this.boot((await this.lane(key))); return this.lane(key);
     }
     if (action === "pause") return pauseLane(this.deps, await this.lane(key), args.note ?? "Owner requested pause");
-    if (action === "resume" && args.allowUnknown) {
-      if (caller.role !== "lead" || caller.key !== "lead" || !caller.instance) throw new Error("Uncertain resume requires the current scoped lead");
-      return this.dispatchQueue.run(key, () => resumeUncertain(this.deps, this.inbox, this.operations, {
-        key, operationId: args.operationId, evidence: args.evidence, expectedInstance: args.expectedInstance, expectedGeneration: args.expectedGeneration,
-      }, async intent => {
-        const boot = readJson<Bootstrap>(bootstrapPath(this.config.stateDir, key));
-        if (boot.instance !== intent.instance || boot.generation !== intent.generation) throw new Error("Uncertain resume host bootstrap changed");
-        await verifyOmpHerdr(intent.target, this.runner);
-        return ipc<RuntimeSnapshot>(hostSocket(this.config.stateDir, key), boot.hostToken, "release", { origin: "user", operationId: `${intent.operationId}:release` }, this.config.runtime.rpcTimeoutMs * 3);
-      }));
-    }
     if (action === "resume") return resumeLane(this.deps, await this.lane(key), args.note ?? "Owner requested resume");
     if (action === "claim-done") {
       if (!args.evidence?.trim()) throw new Error("Evidence required");
@@ -1415,21 +1367,6 @@ export class DoriService {
       return objectDone(this.deps, await this.lane(key), args.reasons);
     }
     if (action === "close") return closeLane(this.deps, await this.lane(key), args.note ?? "Closed by lead");
-    if (action === "retire") {
-      if (caller.role !== "admin" && !(caller.role === "lead" && caller.key === "lead" && caller.instance))
-        throw new Error("Retirement requires the current attached lead or operator");
-      if (!exactKeys(args, ["key", "operationId", "evidence", "expectedInstance", "expectedGeneration"]))
-        throw new Error("Exact bounded retirement arguments required");
-      const scope = this.attachment(await this.lane("lead"));
-      const assertAuthority = async () => {
-        this.assertNoPendingLeadMutation();
-        const lead = await this.lane("lead"), current = this.attachment(lead);
-        if (current.instance !== scope.instance || current.generation !== scope.generation ||
-          caller.instance && caller.instance !== current.instance || lead.dispatchBlocked || lead.runtime?.held)
-          throw new Error("Lead retirement authority changed or held");
-      };
-      return this.launchQueue.run(key, () => this.dispatchQueue.run(key, () => retireManagedLane(this.deps, args, assertAuthority)));
-    }
     if (action === "input") {
       if (!args.text || !args.operationId) throw new Error("text and operationId required");
       const lane = await this.lane(key);
@@ -1485,31 +1422,13 @@ export class DoriService {
       return ipc(hostSocket(this.config.stateDir, selected.key), boot.hostToken, "approval", { id: selected.requestId, response: args.response });
     }
     if (action === "mail-list") return { inbox: this.inbox.list(), outbox: this.outbox.list(), operations: this.operations.list(), failures: this.failures.list(), nativeResponses: this.nativeInteractions.responseHistory() };
-    if (action === "mail-abandon") {
-      if (caller.role !== "admin" && !(caller.role === "lead" && caller.key === "lead" && caller.instance)) throw new Error("Input abandonment requires current attached lead or operator");
-      const leadScope = this.attachment(await this.lane("lead"));
-      const assertScope = async (): Promise<void> => {
-        this.assertNoPendingLeadMutation();
-        const lead = await this.lane("lead"), current = this.attachment(lead);
-        if (current.instance !== leadScope.instance || current.generation !== leadScope.generation ||
-          caller.instance && caller.instance !== current.instance || lead.runtime?.external?.detachedAt ||
-          lead.runtime?.state === "stopped" || lead.dispatchBlocked || lead.runtime?.held) throw new Error("Lead scope changed or held during input abandonment");
-      };
-      await assertScope();
-      const row = this.inbox.get(args.id);
-      if (!row) throw new Error("Unknown mail");
-      return this.launchQueue.run(row.target, () => this.dispatchQueue.run(row.target, () =>
-        abandonManagedInput({ ...this.deps, inbox: this.inbox, assertScope }, args)));
-    }
     if (action === "mail-resolve") {
-      const scopedLead = caller.role === "lead" && caller.key === "lead" && !!caller.instance && args.box === "inbox" && args.state === "sent";
-      if ((caller.role !== "admin" && !scopedLead) || !["sent", "queued"].includes(args.state) || !args.evidence) throw new Error("Explicit reconciliation evidence required");
-      const leadScope = scopedLead ? this.attachment(await this.lane("lead")) : undefined;
+      if (caller.role !== "admin" || !["sent", "queued"].includes(args.state) || !args.evidence) throw new Error("Explicit reconciliation evidence required");
       const box = args.box === "inbox" ? this.inbox : args.box === "outbox" ? this.outbox : undefined;
       if (!box || box.get(args.id)?.state !== "unknown") throw new Error("Only unknown mail can be reconciled");
       const row = box.get(args.id)!;
       const lane = await this.registry.read(row.target);
-      if (scopedLead && (lane?.runtime?.kind !== "omp" || lane.runtime.backend !== "herdr-tui" || lane.key === "lead" || lane.role === "lead")) throw new Error("Scoped reconciliation requires a managed OMP worker");
+      if (lane) assertLaneRuntime(lane);
       if (box === this.inbox && (row.ompProvenance || lane?.runtime?.kind === "omp" || this.config.runtime.kind === "omp")) {
         if (lane?.runtime?.kind !== "omp") throw new Error("OMP current native attachment missing; delivery remains unknown");
         const epoch = lane.runtime.hostInstanceId, generation = lane.runtime.generation;
@@ -1521,7 +1440,7 @@ export class DoriService {
           const runtime = current.runtime;
           if (runtime?.kind !== "omp" || runtime.hostInstanceId !== epoch || runtime.generation !== generation || runtime.state === "stopped" || runtime.external?.detachedAt || runtime.omp?.detachedAt || statusOf(current) === "closed" || !runtime.omp || !sameOmpTarget(runtime.omp.target, target) || current.cleanupFence || current.key === "lead" && this.pendingHandoff()) throw new Error("OMP attachment detached, pending or changed during reconciliation");
           if (runtime.backend === "external-current-session" && (provenance.attachmentInstanceId !== epoch || provenance.attachmentGeneration !== generation)) throw new Error("OMP borrowed receipt belongs to a previous attachment");
-          if (target.laneKey !== current.key || target.role !== (runtime.backend === "external-current-session" ? "attached-lead" : "managed-lane")) throw new Error("OMP provenance lane mismatch");
+          if (target.laneKey !== current.key || target.role !== "attached-lead") throw new Error("OMP provenance lane mismatch");
         };
         assertCurrent(lane);
         const capturedRow = JSON.stringify(row);
@@ -1530,10 +1449,6 @@ export class DoriService {
         const op = await callOmp(target, "operation", { operationId: row.id, text: row.text }, this.config, this.runner);
         if (op.status !== "received" || !validReceipt(op.receipt, target, row.id, payloadHash(row.text))) throw new Error("OMP exact durable receipt unavailable; delivery remains unknown");
         return withBindingFence(this.config.stateDir, async () => {
-          if (leadScope) {
-            const currentScope = this.attachment(await this.lane("lead"));
-            if (currentScope.instance !== leadScope.instance || currentScope.generation !== leadScope.generation || this.pendingHandoff()) throw new Error("Lead attachment changed during reconciliation");
-          }
           const current = await this.lane(row.target);
           assertCurrent(current);
           const latest = box.get(row.id);
@@ -1549,35 +1464,6 @@ export class DoriService {
         let lane = await this.lane(key);
         if (action === "reopen" && statusOf(lane) !== "closed") throw new Error("Lane is not closed");
         if (action === "recover" && statusOf(lane) === "closed") throw new Error("Use reopen for closed lanes");
-        if (args.stopCurrent) {
-          const runtime = lane.runtime;
-          if (action !== "recover" || args.newSession || runtime?.kind !== "omp" || runtime.backend !== "herdr-tui" ||
-            !runtime.omp || runtime.omp.target.role !== "managed-lane" || !args.operationId) throw new Error("Explicit same-session managed OMP recovery required");
-          if (this.inbox.list().some(row => row.target === key && (["unknown", "sending"].includes(row.state) || row.abandonment?.outcome === "pending"))) throw new Error("Retire or reconcile uncertain worker input before recovery stop");
-          const scope = this.attachment(await this.lane("lead"));
-          await withBindingFence(this.config.stateDir, async () => {
-            const assertCurrent = async () => {
-              this.assertNoPendingLeadMutation();
-              const lead = await this.lane("lead"), currentScope = this.attachment(lead), current = (await this.lane(key)).runtime;
-              if (scope.instance !== currentScope.instance || scope.generation !== currentScope.generation ||
-                lead.dispatchBlocked || lead.runtime?.held || lead.runtime?.external?.detachedAt ||
-                current?.hostInstanceId !== runtime.hostInstanceId || current.generation !== runtime.generation ||
-                !current.omp || !sameOmpTarget(current.omp.target, runtime.omp!.target)) throw new Error("Recovery stop scope or worker epoch changed");
-            };
-            await assertCurrent();
-            const id = `recovery-stop:${key}:${args.operationId}`;
-            this.operations.put({ id, target: key, source: "managed-recovery-stop", state: "queued", at: new Date().toISOString(),
-              text: JSON.stringify({ instance: runtime.hostInstanceId, generation: runtime.generation, target: runtime.omp!.target, scope: [scope.instance, scope.generation], text: args.text ?? null }) });
-            await this.operations.deliver(id, async () => {
-              await assertCurrent();
-              await this.deps.runtime.stop(key);
-              await assertCurrent();
-              if ((await this.lane(key)).runtime?.state !== "stopped") throw new Error("Managed native exit not durably confirmed");
-              return {};
-            });
-          });
-          lane = await this.lane(key);
-        }
         await this.assertHostStopped(lane);
         if (args.newSession) {
           if (caller.role !== "admin" || typeof args.handoff !== "string" || !args.handoff.trim() || !lane.runtime?.threadId) throw new Error("New-session migration requires operator, known old thread and explicit handoff");
@@ -1604,29 +1490,8 @@ export class DoriService {
           if ((await this.runner(argv)).code !== 0) throw new Error("Cannot restore owned worktree; inspect repository");
         }
         if (action === "reopen") lane = await this.registry.update(key, l => withStatus(l, "working", "Reopened", new Date().toISOString(), { cycle: (l.cycle ?? 1) + 1, closedAt: undefined, claim: undefined, objection: undefined, cleanupFence: undefined, dispatchBlocked: false, holdReason: undefined }));
-        let reconnectOmp = false;
-        if (!args.newSession && lane.runtime?.kind === "omp" && lane.runtime.omp) {
-          const native = lane.runtime.omp.target;
-          if (native.paneId !== lane.pane || native.cwd !== realpathSync(lane.cwd!)) throw new Error("OMP recovery native pane/cwd mismatch");
-          try {
-            await verifyOmpHerdr(native, this.runner);
-            const controller = await connectOmp(native, { timeoutMs: this.config.runtime.rpcTimeoutMs });
-            try { await controller.inspect(); reconnectOmp = true; } finally { controller.close(); }
-          } catch { /* boot must prove prior process exit before any session resume */ }
-        }
-        if (!reconnectOmp) {
-          if (this.config.runtime.kind === "omp") {
-            // The OMP extension binds to a Herdr pane identity, so existing OMP lanes recover in Herdr.
-            const workspace = workspaceForRole(this.config, lane.role);
-            const created = await this.runner(["herdr", "tab", "create", ...(workspace ? ["--workspace", workspace] : []), "--cwd", lane.cwd ?? this.config.defaultCwd, "--label", key, "--no-focus"]);
-            if (created.code !== 0) throw new Error("Cannot create recovery tab");
-            const made = JSON.parse(created.out).result;
-            lane = await this.registry.update(key, l => ({ ...l, pane: made.root_pane.pane_id, tab: made.tab_id ?? made.root_pane.tab_id }));
-          } else {
-            const terminal = await createLaneTerminal(this.runner, key, lane.cwd ?? this.config.defaultCwd);
-            lane = await this.registry.update(key, l => ({ ...l, pane: terminal, tab: undefined, hcTerminal: terminal }));
-          }
-        }
+        const terminal = await createLaneTerminal(this.runner, key, lane.cwd ?? this.config.defaultCwd);
+        lane = await this.registry.update(key, l => ({ ...l, pane: terminal, tab: undefined, hcTerminal: terminal }));
         await this.boot(lane);
         const text = args.text ?? (!lane.runtime?.threadId ? await Bun.file(lane.brief).text() : undefined);
         if (text) this.putInbox({ id: args.operationId ?? `handoff:${key}:${lane.cycle ?? 1}`, target: key, text, state: "queued", at: new Date().toISOString() });
@@ -1747,7 +1612,7 @@ export class DoriService {
       once("supervision", () => supervisionTick(this.deps, mail => this.putInbox(mail))),
       once("runtime-health", async () => {
         for (const lane of await this.registry.open()) {
-          if (!lane.runtime || lane.runtime.state === "stopped" || lane.cleanupFence) continue;
+          if (isRemovedOmpLane(lane) || !lane.runtime || lane.runtime.state === "stopped" || lane.cleanupFence) continue;
           if (lane.runtime.backend === "external-current-session") continue;
           const age = Date.now() - Date.parse(lane.runtime.lastHeartbeatAt ?? lane.openedAt);
           const timeout = lane.runtime.state === "starting" ? Math.max(this.config.runtime.heartbeatTimeoutMs, this.config.runtime.startupTimeoutMs + 10_000) : this.config.runtime.heartbeatTimeoutMs;
