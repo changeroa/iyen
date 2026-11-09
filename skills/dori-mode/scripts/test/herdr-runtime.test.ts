@@ -8,13 +8,16 @@ import { prepareBackend, resolveCodexBinary, retireBackend, type Bootstrap } fro
 import { socketDir } from "../src/ipc.ts";
 import { RpcError } from "../src/runtime/protocol.ts";
 import { withState } from "./fakes.ts";
-const harness = () => {
+const harness = (startupBlocked = false) => {
+ let startupReads=0;
  const calls:string[][]=[],reads:string[]=[];
  let turns:any[]=[],goal:any=null,status:any={type:"idle"},agentThread="t1",failGoal=false,failStatus=false,accept=true;
  const clock={at:0,now:()=>clock.at,sleep:async(ms:number)=>{clock.at+=ms;}};
  const observer:Observer={close(){},async read(method){reads.push(method);if(method==="thread/goal/get"){if(failGoal)throw new Error("goal unknown");return {goal} as any;}if(method==="thread/read"){if(failStatus)throw new Error("status failed");return {thread:{id:"t1",status}} as any;}if(method==="thread/turns/list")return {data:turns,nextCursor:null} as any;throw new Error(method);}};
  const run=async(argv:readonly string[])=>{
   calls.push([...argv]);const [,group,action]=argv;
+  if(startupBlocked&&group==="agent"&&action==="start")return {code:1,err:JSON.stringify({error:{code:"agent_not_ready"}}),out:""};
+  const ready=!startupBlocked||++startupReads>3;
   if(group==="agent"&&action==="prompt"){
    const text=argv[4]!;
    if(text==="/goal pause")goal={...goal,status:"paused"};
@@ -22,7 +25,7 @@ const harness = () => {
    else if(accept)turns=[{id:"receipt-turn",status:"completed",items:[{type:"userMessage",content:[{type:"text",text}]}]}];
   }
   if(group==="agent"&&action==="send-keys"&&argv[4]==="esc"){turns=turns.map(t=>({...t,status:"interrupted"}));status={type:"idle"};}
-  return {code:0,err:"",out:JSON.stringify({result:{agent:{agent:"codex",pane_id:"p1",name:"test-agent",agent_status:"idle",agent_session:{agent:"codex",kind:"id",value:agentThread}}}})};
+  return {code:0,err:"",out:JSON.stringify({result:{agent:{agent:"codex",pane_id:"p1",name:"test-agent",terminal_id:"terminal-1",interactive_ready:ready,launch_pending:!ready,agent_status:ready?"idle":"blocked",agent_session:{agent:"codex",kind:"id",value:agentThread}}}})};
  };
  const session=new HerdrSession(observer,run,{...defaultConfig().runtime,rpcTimeoutMs:200},"p1","test-agent",clock);session.threadId="t1";
  return {session,observer,calls,reads,setTurns:(v:any[])=>turns=v,setGoal:(v:any)=>goal=v,setStatus:(v:any)=>status=v,drift:()=>agentThread="other",failGoal:()=>failGoal=true,failStatus:()=>failStatus=true,noReceipt:()=>accept=false,run};
@@ -90,9 +93,9 @@ test("stop receipt waits for owned backend exit, and a timeout remains unconfirm
  await expect(retireBackend({kill(){},exited:new Promise(()=>{})},5)).rejects.toThrow("exit unconfirmed");
 });
 
-test("first-launch identity may precede materialization; startup retries observation without replaying handshake",async()=>{
+for (const blocked of [false,true]) test(`first-launch identity and startup input (${blocked}) wait without replaying handshake`,async()=>{
  const state=withState();try{
-  const h=harness(),read=h.observer.read;let first=true,polls=0,metadataTransient=true,mcpTransient=true;
+  const h=harness(blocked),read=h.observer.read;let first=true,polls=0,metadataTransient=true,mcpTransient=true;
   const rollout=join(state.dir,"rollout.jsonl");writeFileSync(rollout,JSON.stringify({type:"session_meta",payload:{id:"t1"}})+"\n"+JSON.stringify({type:"turn_context",payload:{turn_id:"receipt-turn",approval_policy:"on-request",sandbox_policy:{type:"workspace-write"}}})+"\n");
   h.session.threadId="";
   h.observer.read=async(method,params)=>{
@@ -106,6 +109,7 @@ test("first-launch identity may precede materialization; startup retries observa
    return read(method,params);
   };
   await h.session.open(state.dir,{model:"test",effort:"medium"},"unix:///test.sock","instance1");
+  expect(h.calls.filter(a=>a[2]==="start")).toHaveLength(1);expect(h.calls.some(a=>a[2]==="send-keys")).toBe(false);
   expect(polls).toBeGreaterThanOrEqual(4);expect(h.session.threadId).toBe("t1");expect(h.calls.filter(a=>a[2]==="prompt")).toHaveLength(1);expect(h.calls.find(a=>a[2]==="prompt")?.[4]).toContain("Do not execute a task");
  }finally{state.done();}
 });
@@ -118,4 +122,27 @@ test("effective handshake policy gate rejects a widened sandbox and wrong rollou
   write("other","read-only");await expect(verifyTurnPolicy(file,"thread","turn",config)).rejects.toThrow("identity mismatch");
   write("thread","read-only");await verifyTurnPolicy(file,"thread","turn",config);
  }finally{state.done();}
+});
+
+for (const failure of ["timeout", "terminal", "occupant", "thread", "lease"]) test(`startup wait fails closed on ${failure} without sending input`, async () => {
+ const h=harness(); let n=0, now=0;
+ const run=async(argv:readonly string[])=>{
+  const result=await h.run(argv);const body=JSON.parse(result.out),agent=body.result.agent;n++;
+  agent.interactive_ready=false;agent.launch_pending=true;
+  if(n>1&&failure==="terminal")agent.terminal_id="replacement";
+  if(n>1&&failure==="occupant")agent.name="replacement";
+  if(n>1&&failure==="thread")agent.agent_session.value="other";
+  return {...result,out:JSON.stringify(body)};
+ };
+ const session=new HerdrSession(h.observer,run,defaultConfig().runtime,"p1","test-agent",{now:()=>now,sleep:async()=>{now+=600_000;}});
+ await expect(session.waitForStartupInput("t1",async()=>{if(failure==="lease")throw new Error("lease revoked");})).rejects.toThrow();
+ expect(h.calls.every(a=>a[1]==="agent"&&a[2]==="get")).toBe(true);
+});
+
+test("unknown start failure is never treated as a trust prompt or retried", async () => {
+ const h=harness();h.observer.read=async()=>({data:[{model:"test",supportedReasoningEfforts:[{reasoningEffort:"medium"}]}],nextCursor:null}) as any;
+ const calls:string[][]=[];
+ const session=new HerdrSession(h.observer,async argv=>{calls.push([...argv]);return {code:1,out:"",err:JSON.stringify({error:{code:"transport_failure"}})};},defaultConfig().runtime,"p1","test-agent");
+ await expect(session.open("/tmp",{model:"test",effort:"medium"},"unix:///test.sock","instance")).rejects.toThrow("transport_failure");
+ expect(calls).toHaveLength(1);expect(calls[0]?.[2]).toBe("start");
 });

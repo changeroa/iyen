@@ -431,3 +431,16 @@ test("natural routing does not retroactively replay a source rejected by the pre
  await s.receive("test",{...event,text:"2"});
  expect(s.inbox.get(original.id)).toEqual(original);
 });
+
+test("startup liveness preserves holds and cannot register a thread or revive a generation",async()=>{
+ const starting={...lane,pane:"p1",dispatchBlocked:true,holdReason:"owner-pause" as const,runtime:{...lane.runtime!,backend:"herdr-tui" as const,threadId:undefined,state:"starting" as const,lastHeartbeatAt:"2000-01-01"}};
+ await s.registry.write(starting);
+ const args={key:lane.key,instance:"host1",pane:"p1",runtime:starting.runtime},caller={role:"host" as const,key:lane.key};
+ expect(await s.handle("host-starting",args,caller)).toEqual({accepted:true});
+ const updated=await s.registry.read(lane.key);expect(updated?.runtime?.lastHeartbeatAt).not.toBe("2000-01-01");
+ expect(updated).toMatchObject({dispatchBlocked:true,holdReason:"owner-pause",runtime:{state:"starting"}});expect(updated?.runtime?.threadId).toBeUndefined();
+ for(const bad of [{...args,instance:"old"},{...args,pane:"other"},{...args,runtime:{...args.runtime,threadId:"invented"}},{...args,runtime:{...args.runtime,state:"idle"}}])
+  await expect(s.handle("host-starting",bad,caller)).rejects.toThrow();
+ await s.registry.update(lane.key,current=>({...current,runtime:{...current.runtime!,state:"recovering"}}));
+ await expect(s.handle("host-starting",args,caller)).rejects.toThrow("Invalid startup identity");
+});

@@ -1232,6 +1232,16 @@ export class DoriService {
       if (lane.runtime?.backend === "external-current-session") throw new Error("External current-session cannot register a managed host");
       if (!lane.runtime || lane.runtime.hostInstanceId !== args.instance || args.runtime?.hostInstanceId !== args.instance || args.runtime?.generation !== lane.runtime.generation) throw new Error("Stale host generation");
       if (lane.retirement) return { accepted: false, retired: true };
+      if (action === "host-starting") {
+        // A startup liveness pulse is not thread registration or permission to
+        // dispatch. It may only refresh the exact generation's startup lease.
+        if (lane.role === "lead" || lane.runtime.kind !== "codex" || lane.runtime.backend !== "herdr-tui" ||
+          lane.runtime.state !== "starting" || args.runtime.kind !== "codex" || args.runtime.backend !== "herdr-tui" ||
+          args.runtime.state !== "starting" || args.runtime.threadId !== lane.runtime.threadId || args.pane !== lane.pane)
+          throw new Error("Invalid startup identity");
+        await this.registry.update(lane.key, current => ({ ...current, runtime: { ...current.runtime!, lastHeartbeatAt: new Date().toISOString() } }));
+        return { accepted: true };
+      }
       if (lane.runtime.threadId && lane.runtime.threadId !== args.runtime.threadId) throw new Error("Thread identity mismatch");
       if (!args.runtime.threadId || args.runtime.kind !== lane.runtime.kind || args.runtime.kind !== this.config.runtime.kind) throw new Error("Invalid runtime identity");
       if (args.runtime.kind === "omp") {
@@ -1699,7 +1709,8 @@ export class DoriService {
           if (!lane.runtime || lane.runtime.state === "stopped" || lane.cleanupFence) continue;
           if (lane.runtime.backend === "external-current-session") continue;
           const age = Date.now() - Date.parse(lane.runtime.lastHeartbeatAt ?? lane.openedAt);
-          if (age <= this.config.runtime.heartbeatTimeoutMs || lane.holdReason === "recovery") continue;
+          const timeout = lane.runtime.state === "starting" ? Math.max(this.config.runtime.heartbeatTimeoutMs, this.config.runtime.startupTimeoutMs + 10_000) : this.config.runtime.heartbeatTimeoutMs;
+          if (age <= timeout || lane.holdReason === "recovery") continue;
           await this.registry.update(lane.key, l => ({ ...l, dispatchBlocked: true, holdReason: l.holdReason ?? "recovery", runtime: l.runtime && { ...l.runtime, state: "recovering" } }));
           if (lane.role !== "lead") this.putInbox({ id: `host-unreachable:${lane.key}:${lane.runtime.hostInstanceId}`, target: "lead", text: `Host unreachable for ${lane.key}; dispatch held. Reconcile before recovery.`, state: "queued", at: new Date().toISOString() });
         }
