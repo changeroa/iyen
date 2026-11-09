@@ -30,6 +30,14 @@ export const withHcPanes = (run: Runner): Runner => async (argv, opts) => {
   };
   // Codex reports idle over OSC 7501 only once its composer is up; sign-in and dialogs report nothing.
   const ready = (d: { t: any; kind?: string }) => Boolean(d.kind) && d.t.reported === true && statusWord(d.t.status) === "idle";
+  // Input sent before a fresh login shell draws its prompt can be lost.
+  const shellPainted = async () => {
+    for (const deadline = Date.now() + 15_000; Date.now() < deadline; await Bun.sleep(50)) {
+      const screen = await hc("read", target, "--lines", "0");
+      if (screen.code === 0 && screen.out.trim()) return true;
+    }
+    return false;
+  };
   const key = `${group} ${action}`;
   switch (key) {
     case "pane get": case "agent get": {
@@ -40,7 +48,8 @@ export const withHcPanes = (run: Runner): Runner => async (argv, opts) => {
       const session = d.t.labels?.["dori.agent-session"];
       return ok({ agent: { ...base, name: d.t.labels?.["dori.agent-name"], interactive_ready: ready(d), launch_pending: !ready(d), agent_status: statusWord(d.t.status) ?? "idle", ...(session ? { agent_session: { agent: d.kind, kind: "id", value: session } } : {}) } });
     }
-    case "pane run": case "agent prompt": return hc("send", target, "--", rest[1]!);
+    case "pane run": { if (!(await shellPainted())) return { code: 1, out: "", err: JSON.stringify({ error: { code: "shell_not_ready" } }) }; return hc("send", target, "--", rest[1]!); }
+    case "agent prompt": return hc("send", target, "--", rest[1]!);
     case "agent send-keys": return hc("keys", target, ...rest.slice(1));
     case "agent read": { const r = await hc("read", target, "--lines", flag("--lines") ?? "20"); return r.code === 0 ? { ...r, out: r.out } : r; }
     case "pane report-agent-session": { const r = await hc("label", target, `dori.agent-session=${flag("--agent-session-id")}`); return r.code === 0 ? ok({}) : r; }

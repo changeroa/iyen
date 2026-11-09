@@ -98,7 +98,7 @@ test("agent start types a quoted command and returns once Codex reports idle", a
 test("pane run forwards text and closing an already removed terminal succeeds", async () => {
   const calls: string[][] = [], run = fakeHc(codex, calls);
   await run(["herdr", "pane", "run", "t3", "-x"]);
-  expect(calls[0]).toEqual(["herdr-core", "send", "t3", "--", "-x"]);
+  expect(calls.find(c => c[1] === "send")).toEqual(["herdr-core", "send", "t3", "--", "-x"]);
   expect((await run(["herdr", "pane", "close", "t3"])).code).toBe(0);
 });
 test("object-shaped hc status is compared by its state word", () => {
