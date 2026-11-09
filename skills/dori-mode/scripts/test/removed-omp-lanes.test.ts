@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { defaultConfig } from "../src/config.ts";
+import { Checkpoints } from "../src/checkpoints.ts";
 import { atomicJson } from "../src/journal.ts";
 import { serviceSocket } from "../src/ipc.ts";
 import { Registry, type Lane } from "../src/registry.ts";
@@ -48,8 +49,28 @@ test("startup retains registered OMP lanes in individual and aggregate status af
   } finally { f.state.done(); }
 });
 
+test("checkpoint-list remains read-only for removed OMP lanes before and after close", async () => {
+  const f = await fixture();
+  try {
+    const checkpoint = new Checkpoints(f.state.dir, f.service.deps.clock).record(f.lane, {
+      eventId: "prior-observation", stage: "blocked", evidence: "Existing native work",
+      nextAction: "Reconcile manually without replay",
+    });
+    for (const closed of [false, true]) {
+      if (closed) await f.service.handle("close", { key: f.lane.key }, { role: "admin" });
+      const before = await f.service.registry.read(f.lane.key);
+      for (const caller of [{ role: "admin" as const }, { role: "lane" as const, key: f.lane.key }]) {
+        expect(await f.service.handle("checkpoint-list", { key: f.lane.key }, caller)).toEqual([checkpoint]);
+      }
+      expect(await f.service.registry.read(f.lane.key)).toEqual(before);
+      expect(f.service.inbox.list()).toEqual([]);
+      expect(f.world.calls).toEqual([]);
+    }
+  } finally { f.state.done(); }
+});
+
 for (const action of ["input", "input-status", "pause", "resume", "recover", "reopen",
-  "adopt", "launch", "claim-done", "object-done", "report", "retire"]) {
+  "adopt", "launch", "claim-done", "object-done", "report"]) {
   test(`registered OMP lane ${action} fails with actionable removal error before mutation`, async () => {
     const f = await fixture();
     try {
@@ -101,6 +122,7 @@ test("queued and unknown OMP mail survives startup ticks failed dispatch and rec
     const original = f.service.inbox.list();
     const restarted = new DoriService(f.config, fakeRunner(f.world));
     await restarted.tick();
+    expect(restarted.inbox.list().filter(row => row.target === "lead")).toEqual([]);
     await expect(restarted.handle("input", {
       key: f.lane.key, operationId: "queued", text: "original queued",
     }, { role: "admin" })).rejects.toThrow("OMP lanes were removed");
@@ -108,8 +130,7 @@ test("queued and unknown OMP mail survives startup ticks failed dispatch and rec
       box: "inbox", id: "unknown", state: "sent", evidence: "operator",
     }, { role: "admin" })).rejects.toThrow(/Lane old-omp: OMP lanes were removed/);
     expect(await restarted.handle("close", { key: f.lane.key }, { role: "admin" })).toMatchObject({ closed: true });
-    expect(new DoriService(f.config, fakeRunner(f.world)).inbox.list()
-      .filter(row => row.target === f.lane.key)).toEqual(original);
+    expect(new DoriService(f.config, fakeRunner(f.world)).inbox.list()).toEqual(original);
     expect(f.world.calls).toEqual([]);
   } finally { f.state.done(); }
 });

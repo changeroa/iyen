@@ -1098,7 +1098,7 @@ export class DoriService {
     if (this.config.runtime.kind !== "codex") throw new Error(`Lane ${lane.key}: OMP lanes were removed. Configure a Codex runtime to launch lanes.`);
     if (lane.key === "lead" || lane.role === "lead") throw new Error("Iyen lead must attach to the current session; use lead-attach");
     if (lane.runtime?.backend === "external-current-session") throw new Error("External current-session boot is unsupported; use lead-attach");
-    if (lane.runtime?.threadId && lane.runtime.kind !== this.config.runtime.kind) throw new Error("Runtime kind conversion is prohibited; use an isolated OMP profile");
+    if (lane.runtime?.threadId && lane.runtime.kind !== this.config.runtime.kind) throw new Error("Runtime kind conversion is prohibited");
     if (!lane.pane) throw new Error("A Herdr pane is required");
     const pane = lane.pane;
     await this.assertHostStopped(lane);
@@ -1266,7 +1266,7 @@ export class DoriService {
     }
     if (caller.role === "host") throw new Error("Host cannot issue user commands");
     const key = args.key ?? caller.key;
-    if (key && action !== "status" && action !== "close") {
+    if (key && action !== "status" && action !== "checkpoint-list" && action !== "close") {
       const registered = await this.registry.read(key);
       if (registered) assertLaneRuntime(registered);
     }

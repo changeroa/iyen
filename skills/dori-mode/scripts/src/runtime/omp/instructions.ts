@@ -42,7 +42,7 @@ All lane lifecycle, status, reports and recovery use the activated scoped bridge
 - Report: ${argv("report", "example-lane", "--kind", "milestone", "--text-file", "/absolute/report.txt", "--event-id", "stable-report-id")}
 - Claim: ${argv("claim-done", "example-lane", "--evidence", "Verified evidence")}
 - Recover only after reconciliation and within authorization: ${argv("recover", "example-lane", "--text-file", "/absolute/recovery.txt", "--operation-id", "stable-recovery-id")}
-Use existing bridge command arguments for other authorized lifecycle operations. Preserve stable operation/event IDs and exact payloads across reconciliation; do not blindly retry unknown mutations. Do not use machine-wide dori, administrative CLI/config/context-file reads, direct native subagents or unregistered Herdr agents for lane operations. Workers receive their own scoped iyen_control tool, never this lead bridge.
+Use existing bridge command arguments for other authorized lifecycle operations. Preserve stable operation/event IDs and exact payloads across reconciliation; do not blindly retry unknown mutations. Do not use machine-wide dori, administrative CLI/config/context-file reads, direct native subagents or unregistered Herdr agents for lane operations. Never share this lead bridge with workers.
 
 Activation acceptance must separately confirm that this exact lead read the configured context and can use the scoped bridge. Artifact generation, personaDir configuration and native model identity alone do not establish operating readiness, provider authentication or successful inference.
 `;

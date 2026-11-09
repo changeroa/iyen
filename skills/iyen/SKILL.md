@@ -261,11 +261,8 @@ revokes its bridge; it never aborts or closes the borrowed OMP TUI or its goal.
 OMP has no Codex OS sandbox. Its profile must explicitly select
 `danger-full-access` and an OMP approval mode; requesting `read-only` or
 `workspace-write` fails. Scoped service controls and tool approval remain
-required and do not provide OS isolation. Managed workers expose `iyen_control`
-through the lane-scoped MCP context and cannot spawn native subagents. Managed
-hold/release requires the Iyen OMP fork’s `executionHold` capability; upstream
-18.15.0 alone is insufficient. A verified execution barrier is mandatory; unsupported
-capabilities block readiness. Reply receipts use exact durable OMP user entries,
+required and do not provide OS isolation. OMP supports attached leads only;
+worker lanes use Codex. Reply receipts use exact durable OMP user entries,
 never Codex turn IDs. Unknown delivery stays fenced and is never replayed.
 
 Implementation validation uses isolated local fixture profiles. No production
