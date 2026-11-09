@@ -1,10 +1,12 @@
-import type { Registry } from "./registry.ts";
+import { statusOf, type Registry } from "./registry.ts";
 
 export type LaneEvent = { lane: string; terminal: string; kind: "created" | "status" | "lost" | "restarted" | "finished" | "removed"; status?: string | null; reason?: string | null };
 export type LaneEventSink = (event: LaneEvent) => void | Promise<void>;
-export type LaneEventSource = { readonly live: boolean; start(sink: LaneEventSink): Promise<void>; stop(): void };
+export type LaneEventSource = { readonly live: boolean; tracks(terminal: string): boolean; start(sink: LaneEventSink): Promise<void>; stop(): void };
 export type HcTransport = { lines: AsyncIterable<string>; write(line: string): void; close(): void };
 type Terminal = { address: string; labels?: Record<string, string>; state: string; status?: string | null; reason?: string | null };
+/** hc reports the root status as an object carrying its state word. */
+const statusWord = (value: unknown): string | null => (value && typeof value === "object" ? (value as { state?: string }).state ?? null : (value as string | null | undefined) ?? null);
 type Known = { lane: string; finished: boolean; status: string | null };
 
 export const LANE_LABEL = "dori.lane";
@@ -13,6 +15,7 @@ export const MANAGED_LABEL = "dori.managed";
 /** Turns hc's snapshot + event stream into at-most-once lifecycle events per terminal transition. */
 export class LaneEventTracker {
   private known = new Map<string, Known>();
+  tracks(terminal: string): boolean { const k = this.known.get(terminal); return Boolean(k && !k.finished); }
   private seq = -1;
   /** seq restarts with each core process, and a snapshot supersedes everything before it. */
   reconcile(terminals: Terminal[], seq: number): LaneEvent[] {
@@ -22,10 +25,10 @@ export class LaneEventTracker {
       const lane = t.labels?.[LANE_LABEL];
       if (!lane) continue;
       seen.add(t.address);
-      const prev = this.known.get(t.address), finished = t.state === "finished", status = t.status ?? null;
-      if (!prev) out.push({ lane, terminal: t.address, kind: "created" });
+      const prev = this.known.get(t.address), finished = t.state === "finished", status = statusWord(t.status);
+      if (!prev && !finished) out.push({ lane, terminal: t.address, kind: "created" });
       if (finished && !prev?.finished) out.push({ lane, terminal: t.address, kind: "finished", reason: t.reason ?? null });
-      else if (!finished && prev && prev.status !== status) out.push({ lane, terminal: t.address, kind: "status", status });
+      else if (!finished && (prev ? prev.status !== status : status !== null)) out.push({ lane, terminal: t.address, kind: "status", status });
       this.known.set(t.address, { lane, finished, status });
     }
     for (const [terminal, k] of this.known) if (!seen.has(terminal)) { this.known.delete(terminal); out.push({ lane: k.lane, terminal, kind: "removed" }); }
@@ -40,14 +43,14 @@ export class LaneEventTracker {
     if (p.type === "created" || p.type === "restarted") {
       const lane = p.data?.labels?.[LANE_LABEL];
       if (!lane) return [];
-      this.known.set(terminal, { lane, finished: false, status: p.data.status ?? null });
+      this.known.set(terminal, { lane, finished: false, status: statusWord(p.data.status) });
       return [{ lane, terminal, kind: p.type }];
     }
     const k = this.known.get(terminal);
     if (!k) return [];
     const base = { lane: k.lane, terminal };
     switch (p.type) {
-      case "status": { const status = p.data?.status ?? null; if (status === k.status) return []; k.status = status; return [{ ...base, kind: "status", status }]; }
+      case "status": { const status = statusWord(p.data?.status); if (status === k.status) return []; k.status = status; return [{ ...base, kind: "status", status }]; }
       case "lost": return [{ ...base, kind: "lost", reason: p.data?.reason ?? null }];
       case "finished": if (k.finished) return []; k.finished = true; return [{ ...base, kind: "finished", reason: p.data?.reason ?? null }];
       case "removed": this.known.delete(terminal); return [{ ...base, kind: "removed" }];
@@ -77,6 +80,7 @@ export class HcLaneEvents implements LaneEventSource {
       })();
     });
   }
+  tracks(terminal: string): boolean { return this.live && this.tracker.tracks(terminal); }
   stop(): void { this.stopped = true; this.live = false; this.transport?.close(); }
   private async session(sink: LaneEventSink, ready: () => void): Promise<void> {
     const transport = this.transport = await this.connect();
@@ -113,16 +117,25 @@ export const spawnHcTransport = (binary = "herdr-core"): HcTransport => {
   return { lines: lines(), write: line => { child.stdin.write(line); child.stdin.flush(); }, close: () => child.kill() };
 };
 
+/** A death is reported only while the lane is open and still bound to that terminal, then the binding clears: one report across finished+removed, reconnects and service restarts. */
+export const laneEventSink = (registry: Registry, log: (line: string) => void): LaneEventSink => async e => {
+  const lane = await registry.read(e.lane);
+  if (!lane || statusOf(lane) === "closed" || lane.retirement) return;
+  if (e.kind === "created" || e.kind === "restarted") await registry.update(e.lane, l => ({ ...l, hcTerminal: e.terminal }));
+  else if (e.kind === "lost") log(`LANE_LOST ${e.lane} ${e.terminal}`);
+  else if (e.kind === "finished" || e.kind === "removed") {
+    if (lane.hcTerminal !== e.terminal) return;
+    await registry.update(e.lane, l => ({ ...l, hcTerminal: undefined }));
+    log(`DEAD_PANE ${e.lane} ${e.terminal}`);
+  } else if (e.status === "blocked" || e.status === "error") log(`LANE_STATUS ${e.lane} ${e.status}`);
+};
+
 /** hc is opt-in. Without it, or when it is unreachable, the existing pane polling remains authoritative. */
 export const startLaneEvents = async (registry: Registry, enabled: boolean, connect: () => HcTransport | Promise<HcTransport> = () => spawnHcTransport(), log: (line: string) => void = console.log): Promise<LaneEventSource | null> => {
   if (!enabled) return null;
   const source = new HcLaneEvents(connect);
   try {
-    await source.start(async e => {
-      if (e.kind === "created" || e.kind === "restarted") { if (await registry.read(e.lane)) await registry.update(e.lane, l => ({ ...l, hcTerminal: e.terminal })); }
-      else if (e.kind === "lost" || e.kind === "finished" || e.kind === "removed") log(`DEAD_PANE ${e.lane} ${e.terminal}`);
-      else if (e.status === "blocked" || e.status === "error") log(`LANE_STATUS ${e.lane} ${e.status}`);
-    });
+    await source.start(laneEventSink(registry, log));
     return source;
   } catch { log("LANE_EVENTS_FALLBACK polling: herdr-core unavailable"); return null; }
 };

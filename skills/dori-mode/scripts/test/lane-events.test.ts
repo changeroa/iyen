@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { HcLaneEvents, LaneEventTracker, startLaneEvents, type HcTransport, type LaneEvent } from "../src/lane-events.ts";
+import { HcLaneEvents, LaneEventTracker, laneEventSink, startLaneEvents, type HcTransport, type LaneEvent } from "../src/lane-events.ts";
 import { deadPaneTick } from "../src/dead-panes.ts";
 
 const t = (address: string, state = "live", status: string | null = null) => ({ address, state, status, labels: { "dori.lane": "a" } });
@@ -48,7 +48,7 @@ test("a core restart resets seq without replaying finished lanes", async () => {
   const started = s.start(e => { got.push(e); if (e.terminal === "t2") second(); });
   a.push(reply(30, [t("t1", "finished")])); await started;
   a.close(); await reconnected;
-  expect(got.map(e => [e.terminal, e.kind])).toEqual([["t1", "created"], ["t1", "finished"], ["t2", "created"]]); s.stop();
+  expect(got.map(e => [e.terminal, e.kind])).toEqual([["t1", "finished"], ["t2", "created"]]); s.stop();
 });
 test("heartbeat silence forces a reconnect", async () => {
   const a = new Fake(), b = new Fake(); const q = [a, b]; let again!: () => void; const reconnected = new Promise<void>(r => { again = r; });
@@ -66,6 +66,34 @@ test("pane polling yields to hc only for bound lanes while hc is live", async ()
   const run = async () => ({ code: 0, out: JSON.stringify({ result: { panes: [] } }), err: "" });
   const lanes = [{ key: "bound", pane: "p1", hcTerminal: "t1", openedAt: new Date().toISOString() }, { key: "plain", pane: "p2", openedAt: new Date().toISOString() }];
   const reg = { open: async () => lanes } as never, cfg = { runtime: { heartbeatTimeoutMs: 1 } } as never;
-  expect(await deadPaneTick(run as never, cfg, reg, Date.now(), true)).toEqual(["DEAD_PANE plain p2"]);
-  expect(await deadPaneTick(run as never, cfg, reg, Date.now(), false)).toEqual(["DEAD_PANE bound p1", "DEAD_PANE plain p2"]);
+  expect(await deadPaneTick(run as never, cfg, reg, Date.now(), x => x === "t1")).toEqual(["DEAD_PANE plain p2"]);
+  expect(await deadPaneTick(run as never, cfg, reg, Date.now(), () => false)).toEqual(["DEAD_PANE bound p1", "DEAD_PANE plain p2"]);
+});
+test("object-shaped hc status is compared by its state word", () => {
+  const k = new LaneEventTracker(); k.reconcile([t("t1")], 1);
+  const ev = (seq: number) => ({ seq, type: "status", terminal: "t1", data: { status: { state: "blocked", ms: seq } } });
+  expect(k.apply(ev(2)).map(e => e.status)).toEqual(["blocked"]);
+  expect(k.apply(ev(3))).toEqual([]);
+});
+test("sink reports one death, clears the binding, and ignores closed lanes", async () => {
+  let lane: any = { key: "a", openedAt: "x" }; const lines: string[] = [];
+  const reg = { read: async () => lane, update: async (_: string, f: (l: any) => any) => (lane = f(lane)) } as never, sink = laneEventSink(reg, l => lines.push(l));
+  await sink({ lane: "a", terminal: "t1", kind: "created" });
+  expect(lane.hcTerminal).toBe("t1");
+  await sink({ lane: "a", terminal: "t1", kind: "lost" });
+  await sink({ lane: "a", terminal: "t1", kind: "finished" });
+  await sink({ lane: "a", terminal: "t1", kind: "removed" });
+  expect(lines).toEqual(["LANE_LOST a t1", "DEAD_PANE a t1"]);
+  expect(lane.hcTerminal).toBeUndefined();
+  lane = { key: "a", openedAt: "x", closedAt: "y", hcTerminal: "t1" };
+  await sink({ lane: "a", terminal: "t1", kind: "finished" });
+  expect(lines.length).toBe(2);
+});
+test("a live source stops vouching for a terminal after its connection drops", async () => {
+  const a = new Fake(); let gone!: () => void; const dropped = new Promise<void>(r => { gone = r; });
+  const s = new HcLaneEvents(() => { if (s.live === false && a.sent.length) gone(); return a; }, { retryMs: 0 });
+  const started = s.start(() => {}); a.push(reply(0, [t("t1")])); await started;
+  expect(s.tracks("t1")).toBe(true);
+  a.close(); await dropped;
+  expect(s.tracks("t1")).toBe(false); s.stop();
 });

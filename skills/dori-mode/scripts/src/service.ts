@@ -1805,11 +1805,11 @@ const serveService = async (config: DoriConfig): Promise<void> => {
   let stopping = false;
   const timer = setInterval(() => { void service.tick(); }, 1000);
   let laneEvents: LaneEventSource | null = null;
-  void startLaneEvents(service.registry, process.env.DORI_HC_EVENTS === "1").then(source => { laneEvents = source; });
+  void startLaneEvents(service.registry, process.env.DORI_HC_EVENTS === "1").then(source => { laneEvents = source; if (stopping) source?.stop(); });
   const guard = { alerting: false }; let guardBusy = false;
   const monitor = setInterval(() => {
     if (guardBusy) return; guardBusy = true;
-    void Promise.all([sampleHost(run).then(s => guardTick(s, config.guard, guard).forEach(console.log)), deadPaneTick(run, config, service.registry, Date.now(), laneEvents?.live ?? false).then(lines => lines.forEach(console.log))]).catch(() => console.error("MONITOR_ERROR host")).finally(() => { guardBusy = false; });
+    void Promise.all([sampleHost(run).then(s => guardTick(s, config.guard, guard).forEach(console.log)), deadPaneTick(run, config, service.registry, Date.now(), terminal => laneEvents?.tracks(terminal) ?? false).then(lines => lines.forEach(console.log))]).catch(() => console.error("MONITOR_ERROR host")).finally(() => { guardBusy = false; });
   }, 60000);
   const children: ReturnType<typeof Bun.spawn>[] = [];
   const readers: Promise<void>[] = [];
