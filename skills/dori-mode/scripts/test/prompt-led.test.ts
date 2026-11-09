@@ -176,6 +176,19 @@ test("one failed supervision append does not starve another lane", async () => {
  expect(inbox.list()).toHaveLength(1); expect(inbox.list()[0]?.text).toContain("other-lane");
 });
 
+test("runtime read crossing the stale threshold keeps observation content and identity consistent", async () => {
+ const { Mailbox } = await import("../src/mailbox.ts");
+ const d = depsFor(newWorld(), clock, state.dir); await d.registry.write(lane);
+ clock.at += d.config.nudgeAfterMin * 60000 - 1;
+ d.runtime.inspect = async () => { clock.at += 2; return { threadId: "native1", state: "waiting_input", goal: null }; };
+ const inbox = new Mailbox(state.dir, "supervision-test");
+ await supervisionTick(d, row => inbox.put(row));
+ await supervisionTick(d, row => inbox.put(row));
+ await supervisionTick(d, row => inbox.put(row));
+ expect(inbox.list()).toHaveLength(2);
+ expect(inbox.list().filter(row => row.text.includes("No recent"))).toHaveLength(1);
+});
+
 test("linked Git worktrees share repository lessons while another repository remains isolated", async () => {
  const { execFileSync } = await import("node:child_process");
  const repo = join(state.dir, "repo"), wt = join(state.dir, "linked"), other = join(state.dir, "other"); mkdirSync(repo); mkdirSync(other);
