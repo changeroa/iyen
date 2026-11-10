@@ -261,8 +261,9 @@ revokes its bridge; it never aborts or closes the borrowed OMP TUI or its goal.
 OMP has no Codex OS sandbox. Its profile must explicitly select
 `danger-full-access` and an OMP approval mode; requesting `read-only` or
 `workspace-write` fails. Scoped service controls and tool approval remain
-required and do not provide OS isolation. OMP supports attached leads only;
-worker lanes use Codex. Reply receipts use exact durable OMP user entries,
+required and do not provide OS isolation. OMP supports attached leads only.
+An OMP-lead service (`runtime.kind` `omp`) cannot launch or adopt lanes; every
+launch is refused. Worker lanes require a separate Codex-runtime service. Reply receipts use exact durable OMP user entries,
 never Codex turn IDs. Unknown delivery stays fenced and is never replayed.
 
 Implementation validation uses isolated local fixture profiles. No production
