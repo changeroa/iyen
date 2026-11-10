@@ -32,6 +32,7 @@ const help = `dori — messenger lead and lanes (Codex default, explicit OMP pro
   claim-done [KEY] --evidence TEXT
   object-done KEY --reason TEXT [--reason TEXT]
   pause KEY | resume KEY | close KEY [--note TEXT]
+  retire KEY --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N [--expected-terminal-id ID|absent]
   recover KEY | reopen KEY [--text-file FILE] [--new-session --handoff-file FILE]
   adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS [--model M --effort E] --transfer-confirmed
   sync [--write] | can-launch | watch | freshness | dead-panes | guard
@@ -61,7 +62,7 @@ const scopedInvocation = ["DORI_CONTEXT", "DORI_LANE_KEY", "DORI_LANE_TOKEN"].so
 const scopedCommands: Record<string, true> = {
   "": true, help: true, status: true, health: true, "can-launch": true, launch: true, adopt: true,
   input: true, "input-status": true, reply: true, report: true, "claim-done": true, "object-done": true,
-  pause: true, resume: true, close: true, reopen: true, recover: true, sync: true,
+  pause: true, resume: true, close: true, retire: true, reopen: true, recover: true, sync: true,
   approval: true, mail: true, work: true, worklog: true, checkpoint: true, lesson: true, "lead-detach": true, "lead-restart": true, "lead-restart-status": true,
   watch: true, freshness: true, "dead-panes": true, guard: true, "mcp-server": true,
 };
@@ -78,6 +79,7 @@ const scopedHelp = `iyen — scoped service commands
   report KEY --kind milestone|blocker|question|halted|done --text-file FILE --event-id ID
   claim-done KEY --evidence TEXT | object-done KEY --reason TEXT
   pause KEY | resume KEY | close KEY [--note TEXT]
+  retire KEY --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N [--expected-terminal-id ID|absent]
   recover KEY | reopen KEY [--text-file FILE]
   adopt KEY --thread-id ID --pane ID --title T --brief FILE --done SIGNALS [--model M --effort E] --transfer-confirmed
   sync [--write] | approval list | mail list
@@ -94,7 +96,7 @@ const scopedHelp = `iyen — scoped service commands
 Service authorization applies to every operation. Attached lead lifecycle uses lead-detach.
 Unknown deliveries are never automatically replayed.`;
 const flags = parseArgs({ args: rest, allowPositionals: true, strict: true, options: Object.fromEntries([
-  ...["title", "brief", "done", "thread", "model", "effort", "repository", "request-id", "request", "source", "next-action", "notes", "outcome", "stage", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "from-thread-id", "session-file", "terminal-id", "response-file", "source-message-id", "state-dir", "handoff-file", "key", "box", "state"].map(k => [k, { type: "string" }]),
+  ...["title", "brief", "done", "thread", "model", "effort", "repository", "request-id", "request", "source", "next-action", "notes", "outcome", "stage", "cwd", "pane", "evidence", "note", "loop", "to", "text", "edit", "text-file", "operation-id", "event-id", "kind", "thread-id", "from-thread-id", "session-file", "terminal-id", "response-file", "source-message-id", "state-dir", "handoff-file", "key", "box", "state", "expected-instance", "expected-generation", "expected-terminal-id"].map(k => [k, { type: "string" }]),
   ...["write", "worktree", "transfer-confirmed", "dry-run", "apply", "help", "new-session", "no-mail", "json"].map(k => [k, { type: "boolean" }]),
   ["mail-id", { type: "string", multiple: true }],
   ["reason", { type: "string", multiple: true }],
@@ -183,6 +185,7 @@ try {
     case "object-done": result = await call(command, { key, reasons: values.reason }); break;
     case "pause": case "close": case "resume": result = await call(command, { key, note: opt("note") }); break;
     case "reopen": case "recover": result = await call(command, { key, text, operationId, threadId: opt("thread-id"), newSession: Boolean(values["new-session"]), handoff: opt("handoff-file") ? await Bun.file(need("handoff-file")).text() : undefined }); break;
+    case "retire": result = await call(command, { key, operationId: need("operation-id"), evidence: need("evidence"), expectedInstance: need("expected-instance"), expectedGeneration: Number(need("expected-generation")), ...(opt("expected-terminal-id") ? { expectedTerminalId: opt("expected-terminal-id") } : {}) }); break;
     case "status": case "can-launch": result = await call(command, { key }); break;
     case "sync": result = await call(command, { write: Boolean(values.write) }); break;
     case "approval":

@@ -20,6 +20,7 @@ export type Retirement = {
   readonly operationId: string; readonly evidence: string; readonly payloadHash: string; readonly scopeHash: string;
   readonly requestedAt: string; readonly closedAt?: string; readonly phase: "requested" | "stop-attempted" | "closed";
   readonly runtimeStop: "confirmed" | "unknown" | "not-addressable";
+  readonly paneClose?: { readonly terminalId: string; readonly attempted: boolean; readonly confirmed: boolean };
 };
 
 export type Lane = {

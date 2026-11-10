@@ -8,6 +8,7 @@ import { ipc, serviceSocket, hostSocket, readJson } from "./ipc.ts";
 import { Registry, assertLaneRuntime, isRemovedOmpLane, statusOf, withStatus, type Lane, LANE_KEY } from "./registry.ts";
 import { claimDone, closeLane, objectDone, watchTick, type FlowDeps } from "./done-flow.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
+import { retireFailedCodex } from "./retire-codex.ts";
 import { launchLane, quoteForPane, validateLaunch, LaunchError, type LaunchInput } from "./launch.ts";
 import { freshnessTick } from "./freshness.ts";
 import { deadPaneTick } from "./dead-panes.ts";
@@ -1271,7 +1272,7 @@ export class DoriService {
       if (registered) assertLaneRuntime(registered);
     }
     if (caller.role === "lane" && (!(["report", "claim-done", "status", "checkpoint-record", "checkpoint-list", "lesson-add", "lesson-list"].includes(action)) || key !== caller.key)) throw new Error("Lane capability does not authorize this command");
-    if (key && key !== "lead" && action !== "status" && action !== "close" && (await this.registry.read(key))?.retirement)
+    if (key && key !== "lead" && action !== "status" && action !== "retire" && action !== "close" && (await this.registry.read(key))?.retirement)
       throw new Error("Retired lane cannot accept new work; use a new lane key");
     if (["pause", "resume", "close", "recover", "reopen", "claim-done", "object-done"].includes(action) && (await this.registry.read(key))?.runtime?.backend === "external-current-session") throw new Error(`External current-session ${action} is unsupported; use lead-detach`);
     if (action.startsWith("worklog-")) {
@@ -1367,6 +1368,24 @@ export class DoriService {
       return objectDone(this.deps, await this.lane(key), args.reasons);
     }
     if (action === "close") return closeLane(this.deps, await this.lane(key), args.note ?? "Closed by lead");
+    if (action === "retire") {
+      if (caller.role !== "admin" && !(caller.role === "lead" && caller.key === "lead" && caller.instance))
+        throw new Error("Retirement requires the current attached lead or operator");
+      if (!exactKeys(args, ["key", "operationId", "evidence", "expectedInstance", "expectedGeneration"], ["expectedTerminalId"]))
+        throw new Error("Exact bounded retirement arguments required");
+      const scope = this.attachment(await this.lane("lead"));
+      const assertAuthority = async () => {
+        this.assertNoPendingLeadMutation();
+        const lead = await this.lane("lead"), current = this.attachment(lead);
+        if (current.instance !== scope.instance || current.generation !== scope.generation ||
+          caller.instance && caller.instance !== current.instance || lead.dispatchBlocked || lead.runtime?.held)
+          throw new Error("Lead retirement authority changed or held");
+      };
+      return this.launchQueue.run(key, () => this.dispatchQueue.run(key, async () => {
+        if ((await this.lane(key)).runtime?.kind !== "codex") throw new Error("Retirement applies only to managed Codex lanes");
+        return retireFailedCodex(this.deps, args, assertAuthority);
+      }));
+    }
     if (action === "input") {
       if (!args.text || !args.operationId) throw new Error("text and operationId required");
       const lane = await this.lane(key);

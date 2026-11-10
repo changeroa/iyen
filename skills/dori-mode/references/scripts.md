@@ -174,3 +174,10 @@ Untrusted working directories retain Codex’s real folder-trust UI. Startup rep
 ## Prompt-led commitments and recovery
 
 See [prompt-led.md](prompt-led.md) for worklog, checkpoint and repository lesson operations, stable event IDs, observation, migration and the explicit owner-response loop. These records never schedule work.
+
+
+### Failed managed Codex startup cleanup
+
+`retire KEY --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N --expected-terminal-id TERMINAL` is available to the current scoped lead for recovery-held managed Codex lanes without a registered or saved native thread. Both recorded host and private backend PIDs must be absent; missing process evidence or reused/live PIDs block cleanup. It validates the pane, tab, cwd, managed agent name and exact terminal before closing only that pane. Use `--expected-terminal-id absent` to retire an already absent pane without closing any present occupant.
+
+Retirement preserves files and all inbox/launch receipts, including unknown outcomes. It is not Done, recovery, or permission to replay. A persisted close attempt is never blindly repeated: retry the same exact operation only to reconcile observed absence. Failed observations are not absence. The result distinguishes host/backend exit and pane absence from proof of every descendant process exiting. The lead separately verifies worktree preservation and active users before removing it.
