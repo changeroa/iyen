@@ -13,7 +13,7 @@ beforeEach(()=>{state=withState();s=new DoriService({...defaultConfig(),stateDir
 const lane:Lane={key:"service-lane",title:"test",thread:"chat:1",brief:"/b",done:"closed a/b#1",openedAt:new Date().toISOString(),runtime:{kind:"codex",threadId:"t1",state:"idle",hostInstanceId:"host1",generation:1,binaryVersion:"0.163.0"}};
 test("lane capabilities cannot launch, approve or control other lanes",async()=>{
  await s.registry.write(lane);
- for(const action of ["launch","pause","approval-respond","mail-resolve","mail-abandon"])await expect(s.handle(action,{key:lane.key},{role:"lane",key:lane.key})).rejects.toThrow("capability");
+ for(const action of ["launch","pause","approval-respond","mail-resolve"])await expect(s.handle(action,{key:lane.key},{role:"lane",key:lane.key})).rejects.toThrow("capability");
  await expect(s.handle("report",{key:"other",text:"x",kind:"done",eventId:"r1"},{role:"lane",key:lane.key})).rejects.toThrow("capability");
 });
 test("host registration rejects stale generations and identity changes",async()=>{

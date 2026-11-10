@@ -44,12 +44,12 @@ export class NativeInteractionRelay {
   private operation(row: ResponseOperation): void { this.save({ ...this.state, responses: { ...this.state.responses, [row.id]: row } }); }
   private matches(row: Binding, lane: Lane): boolean {
     const runtime = lane.runtime;
-    return runtime?.kind === "omp" && !!runtime.omp && !runtime.external?.detachedAt && !runtime.omp.detachedAt && runtime.state !== "stopped" &&
+    return runtime?.kind === "omp" && runtime.backend === "external-current-session" && !!runtime.omp && !runtime.external?.detachedAt && !runtime.omp.detachedAt && runtime.state !== "stopped" &&
       !["closed", "done-claimed", "verified-done"].includes(statusOf(lane)) && !lane.cleanupFence &&
       runtime.hostInstanceId === row.attachment && runtime.generation === row.generation && runtime.threadId === row.target.sessionId &&
       runtime.omp.attachmentInstanceId === row.attachment && runtime.omp.attachmentGeneration === row.generation && sameIdentity(runtime.omp.target, row.target);
   }
-  private owner(lane: Lane, request: NativeUserInteraction, lanes: Lane[]): { thread: string; source: string; owner: string; sourceMessageId?: string } | undefined {
+  private owner(lane: Lane, request: NativeUserInteraction): { thread: string; source: string; owner: string; sourceMessageId?: string } | undefined {
     const epoch = lane.runtime!;
     const receipts = this.deps.inbox.list().filter(mail => mail.target === lane.key && mail.state === "sent" && mail.thread && mail.thread !== "none" &&
       mail.attachmentInstance === epoch.hostInstanceId && mail.ownerUser && mail.source && this.deps.ingress.some(i => i.id === mail.source && i.owners.includes(mail.ownerUser!)) &&
@@ -65,26 +65,7 @@ export class NativeInteractionRelay {
       const mail = owners.values().next().value!;
       return { thread: mail.thread!, source: mail.source!, owner: mail.ownerUser!, sourceMessageId: mail.sourceMessageId };
     }
-    // Multiple current owner threads are never a fallback for an unmapped lead source.
-    if (lane.key === "lead" || lane.role === "lead" || owners.size > 1 || lane.thread === "none") return undefined;
-    // Shared messenger ingress may configure several owner identities. The
-    // registered report thread needs its own current authenticated receipt.
-    const lead = lanes.find(candidate => candidate.key === "lead" && candidate.runtime?.kind === "omp" && candidate.runtime.omp &&
-      candidate.runtime.omp.attachmentInstanceId === candidate.runtime.hostInstanceId &&
-      candidate.runtime.omp.attachmentGeneration === candidate.runtime.generation &&
-      !candidate.runtime.external?.detachedAt && candidate.runtime.state !== "stopped" && !candidate.cleanupFence);
-    const originOwners = new Map(this.deps.inbox.list().filter(mail => lead && mail.target === "lead" && mail.state === "sent" &&
-      mail.thread === lane.thread && mail.attachmentInstance === lead.runtime!.hostInstanceId && mail.ownerUser && mail.source &&
-      mail.ompProvenance?.attachmentInstanceId === lead.runtime!.hostInstanceId &&
-      validReceipt(mail.receipt, lead.runtime!.omp!.target, mail.id, payloadHash(mail.text)) &&
-      mail.ompProvenance.attachmentGeneration === lead.runtime!.generation && sameIdentity(mail.ompProvenance.target, lead.runtime!.omp!.target) &&
-      this.deps.ingress.some(i => i.id === mail.source && i.owners.includes(mail.ownerUser!)))
-      .map(mail => [JSON.stringify([mail.source, mail.ownerUser]), { thread: lane.thread, source: mail.source!, owner: mail.ownerUser! }]));
-    if (originOwners.size === 1) return originOwners.values().next().value;
-    if (originOwners.size > 1) return undefined;
-    // Managed lanes may use their registered report thread, but only one ingress/owner can own it.
-    const registered = this.deps.ingress.flatMap(i => i.owners.map(owner => ({ thread: lane.thread, source: i.id, owner })));
-    return registered.length === 1 ? registered[0] : undefined;
+    return undefined;
   }
   private render(row: RelayedInteraction): string {
     const r = row.request, lines = [`[${row.key}] 응답이 필요합니다 (${r.kind})`, r.title];
@@ -134,7 +115,7 @@ export class NativeInteractionRelay {
     }
     for (const lane of lanes) {
       const runtime = lane.runtime;
-      if (runtime?.kind !== "omp" || !runtime.omp || runtime.state === "stopped" || runtime.external?.detachedAt ||
+      if (runtime?.kind !== "omp" || runtime.backend !== "external-current-session" || !runtime.omp || runtime.state === "stopped" || runtime.external?.detachedAt ||
         ["closed", "done-claimed", "verified-done"].includes(statusOf(lane)) || lane.cleanupFence) continue;
       let requests: NativeUserInteraction[];
       try {
@@ -155,7 +136,7 @@ export class NativeInteractionRelay {
           if (prior.state === "open") this.request({ ...prior, state: "stale" });
           continue;
         }
-        const owner = this.owner(lane, request, lanes);
+        const owner = this.owner(lane, request);
         if (!owner) {
           blocked.push({ key: lane.key, request, reason: "authenticated-owner-thread-unresolved" });
           if (prior?.state === "open") this.request({ ...prior, state: "stale" });
@@ -217,7 +198,7 @@ export class NativeInteractionRelay {
       const lane = lanes.find(l => l.key === row.key);
       if (!lane || !this.matches(row, lane)) { this.request({ ...row, state: "stale" }); throw new Error("Native request epoch expired"); }
       if (lane.dispatchBlocked || lane.runtime?.held || statusOf(lane) === "paused") throw new Error("Native response held until lane reconciliation or resume");
-      const owner = this.owner(lane, row.request, lanes);
+      const owner = this.owner(lane, row.request);
       if (!owner || owner.thread !== row.thread || owner.source !== row.source || owner.owner !== row.owner) {
         this.request({ ...row, state: "stale" }); throw new Error("Native request owner/thread binding changed");
       }
@@ -236,7 +217,7 @@ export class NativeInteractionRelay {
         !currentLead || !this.matches({ key: lead.key, target: runtime.omp.target, attachment: runtime.hostInstanceId, generation: runtime.generation }, currentLead) ||
         currentLead.dispatchBlocked || currentLead.runtime?.held || statusOf(currentLead) === "paused" ||
         !isDeepStrictEqual(this.deps.inbox.get(mail.id), sourceSnapshot)) throw new Error("Native response binding changed during observation");
-      const currentOwner = this.owner(currentLane, row.request, latest);
+      const currentOwner = this.owner(currentLane, row.request);
       if (!currentOwner || currentOwner.thread !== row.thread || currentOwner.source !== row.source || currentOwner.owner !== row.owner) {
         throw new Error("Native request owner/thread binding changed");
       }

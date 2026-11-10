@@ -5,7 +5,7 @@ import { retireFailedCodex, assertFailedCodexProcessesExited } from "../src/reti
 import { atomicJson } from "../src/journal.ts";
 import { type Lane, Registry } from "../src/registry.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
-import type { RetireArgs } from "../src/retire.ts";
+import type { RetireArgs } from "../src/retire-codex.ts";
 import { DoriService } from "../src/service.ts";
 
 const cleanups: (() => void)[] = [];

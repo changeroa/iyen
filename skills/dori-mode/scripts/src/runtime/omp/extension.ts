@@ -7,7 +7,6 @@ import { OmpError, assertIdentity, exactKeys, nonempty, object, payloadHash, val
 import { parseOmpVersion } from "./launcher.ts";
 import { durableJson, privateDirectory, readPrivateJson } from "./receipts.ts";
 import { OmpControlServer, type OmpContext, type OmpNativeApi } from "./server.ts";
-import { connectServiceTool, type OmpServiceTool } from "./service-tool.ts";
 
 type Event = { type: string; [key: string]: unknown };
 export type OmpExtensionApi = OmpNativeApi & {
@@ -19,15 +18,11 @@ export type OmpExtensionOptions = {
   herdrPane?: (paneId: string) => Promise<{ pane_id: string; terminal_id: string; cwd: string; agent?: string; agent_session?: { kind: string; value: string; agent: string; source: string } }>;
 };
 export function parseBootstrap(value: unknown): OmpExtensionBootstrap {
-  if (!object(value) || !exactKeys(value, ["protocol", "registryDir", "role", "laneKey", "expectedCwd", "expectedPaneId", "expectedTerminalId"], ["expectedSessionId", "expectedSessionFile", "service", "restart"]) || value.protocol !== 1 ||
-    !["attached-lead", "managed-lane"].includes(value.role as string) || !["registryDir", "laneKey", "expectedCwd", "expectedPaneId", "expectedTerminalId"].every(key => nonempty(value[key])) ||
+  if (!object(value) || !exactKeys(value, ["protocol", "registryDir", "role", "laneKey", "expectedCwd", "expectedPaneId", "expectedTerminalId"], ["expectedSessionId", "expectedSessionFile", "restart"]) || value.protocol !== 1 ||
+    value.role !== "attached-lead" || !["registryDir", "laneKey", "expectedCwd", "expectedPaneId", "expectedTerminalId"].every(key => nonempty(value[key])) ||
     !isAbsolute(value.registryDir as string) || !isAbsolute(value.expectedCwd as string) ||
     (value.expectedSessionId !== undefined && !nonempty(value.expectedSessionId)) || (value.expectedSessionFile !== undefined && (!nonempty(value.expectedSessionFile) || !isAbsolute(value.expectedSessionFile))) ||
-    (value.role === "attached-lead" && (value.laneKey !== "lead" || value.service !== undefined))) throw new OmpError("invalid-bootstrap", "Invalid OMP extension bootstrap", false);
-  if (value.role === "managed-lane") {
-    const s = value.service;
-    if (!object(s) || !exactKeys(s, ["contextFile", "configFile", "stateDir", "cliPath", "bunBinary"]) || !Object.values(s).every(path => nonempty(path) && isAbsolute(path))) throw new OmpError("invalid-bootstrap", "Managed OMP requires explicit scoped service paths", false);
-  }
+    value.laneKey !== "lead") throw new OmpError("invalid-bootstrap", "Invalid OMP extension bootstrap", false);
   if (value.restart !== undefined && (!validRestartIntent(value.restart) || !value.restart.previousTarget ||
     value.role !== "attached-lead" || value.expectedSessionId !== value.restart.previousTarget.sessionId ||
     value.expectedSessionFile !== value.restart.previousTarget.sessionFile ||
@@ -58,10 +53,10 @@ export async function registerOmpExtension(native: unknown, options: OmpExtensio
   });
   const instanceId = randomUUID(), startedAt = new Date().toISOString(); let generation = 0;
   let controller: OmpControlServer | undefined, descriptor: string | undefined, tokenFile: string | undefined;
-  let service: OmpServiceTool | undefined, current: OmpContext | undefined, lifecycle = Promise.resolve();
+  let current: OmpContext | undefined, lifecycle = Promise.resolve();
   let epoch = 0;
   const cleanup = () => {
-    epoch++; controller?.close(); controller = undefined; service?.close(); service = undefined;
+    epoch++; controller?.close(); controller = undefined;
     for (const path of [descriptor, tokenFile]) if (path) { try { unlinkSync(path); } catch { /* Only this generation's random paths. */ } }
     descriptor = undefined; tokenFile = undefined;
   };
@@ -102,12 +97,11 @@ export async function registerOmpExtension(native: unknown, options: OmpExtensio
       try { await verifyAssociation(); break; }
       catch (error) { if (Date.now() >= associationDeadline) throw error; await new Promise(resolve => setTimeout(resolve, 50)); }
     }
-    if (bootstrap?.service) service = await connectServiceTool(bootstrap.service, { env, timeoutMs: options.timeoutMs });
-    if (startupEpoch !== epoch) { service?.close(); return; }
+    if (startupEpoch !== epoch) return;
     const sessionsRoot = join(registryDir, "sessions"); privateDirectory(sessionsRoot);
     const sessionDirectory = join(sessionsRoot, payloadHash([sessionId, sessionFile, target.role, target.laneKey].join("\0")));
     const ownedController = new OmpControlServer(target, token, sessionDirectory, () => current!, api, { timeoutMs: options.timeoutMs,
-      startHeld: !!bootstrap?.expectedSessionId && (bootstrap.role === "managed-lane" || !!bootstrap.restart),
+      startHeld: !!bootstrap?.expectedSessionId && !!bootstrap.restart,
       restart: bootstrap?.restart,
       verifyAssociation,
     });
@@ -146,18 +140,6 @@ export async function registerOmpExtension(native: unknown, options: OmpExtensio
   api.on("session_shutdown", () => { cleanup(); });
   for (const event of ["user_interaction_requested", "user_interaction_resolved", "agent_start", "agent_end", "turn_start", "turn_end", "message_end", "tool_execution_start", "tool_execution_end", "tool_approval_requested", "tool_approval_resolved", "plan_review_requested", "plan_review_resolved", "mode_changed", "session_compact", "session.compacting", "auto_compaction_start", "auto_compaction_end", "auto_retry_start", "auto_retry_end"]) {
     api.on(event, (value, ctx) => { if (ctx.agent.kind === "main") { current = ctx; controller?.observe(value); } });
-  }
-  if (bootstrap?.role === "managed-lane") {
-    api.on("before_subagent_spawn", () => ({ block: true, reason: "Managed Iyen lanes cannot spawn native subagents" }));
-    api.on("tool_call", (_event, ctx) => ctx.agent.kind !== "main" || !controller || controller.toolBlocked() ? { block: true, reason: "Iyen managed runtime is held or unavailable" } : undefined);
-    const kind = Symbol.for("TypeBox.Kind");
-    api.registerTool({ name: "iyen_control", label: "Iyen control", description: "Report or inspect your own Iyen lane through its scoped service capability.", mcpServerName: "dori_runtime", mcpToolName: "control", approval: "read",
-      parameters: { [kind]: "Object", type: "object", properties: { action: { [kind]: "String", type: "string" }, args: { [kind]: "Object", type: "object", properties: {}, additionalProperties: true } }, required: ["action", "args"], additionalProperties: false },
-      execute: async (_callId: string, params: unknown, signal: AbortSignal | undefined, _onUpdate: unknown, ctx: OmpContext) => {
-        if (ctx.agent.kind !== "main" || !service || !controller || controller.toolBlocked() || !object(params) || !exactKeys(params, ["action", "args"]) || !nonempty(params.action) || !object(params.args)) throw new OmpError("service-tool-blocked", "Scoped Iyen tool is unavailable", false);
-        return service.call(params.action, params.args, signal);
-      },
-    });
   }
 }
 export default async function extension(api: unknown): Promise<void> { await registerOmpExtension(api); }

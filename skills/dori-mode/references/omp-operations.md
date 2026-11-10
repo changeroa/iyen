@@ -2,12 +2,6 @@
 
 Use the explicit isolated OMP profile and attachment procedure in [setup](setup.md). This reference adds lead operating context; it does not install a shim, change credentials, activate a session or authorize a production cutover. Codex remains the default runtime.
 
-## Managed workers
-
-`launchLane` appends an OMP-specific contract to the saved brief before submitting it to the native session. OMP workers call the registered `iyen_control` tool with `{action,args}`. `status`, `report` and `claim-done` require their own lane key. Reports carry `kind`, `text` and a stable `eventId`; claims carry `evidence`. The extension forwards these calls to the existing scoped service boundary. Workers cannot use this to launch lanes, control another lane or reply directly to messenger users.
-
-Workers must not follow old `dori report` examples, inspect context/bootstrap/registry files or tokens, reuse the lead bridge, or spawn unregistered agents. Unknown tool outcomes require reconciliation, not blind mutation retries. A claim is followed by evidence review and the quiet window; it is not immediate closure. Codex keeps its existing footer and developer instructions.
-
 ## Deterministic lead compatibility bootstrap
 
 `scripts/src/runtime/omp/instructions.ts` exports `ompLeadBootstrap(context)`. It returns Markdown from explicit non-secret context only, without reading/copying source files, starting processes, changing settings or sending messages. The operator supplies:
@@ -50,7 +44,7 @@ For an OpenAI subscription deployment, use OMP's native `openai-codex` provider.
 Authenticate with `PI_CODING_AGENT_DIR=/EXACT/ISOLATED/agent /EXACT/omp login openai-codex`
 or `/login` in that same profile, then list available routes with
 `omp models openai-codex --json` under the same environment. Set `runtime.omp.provider`
-to `openai-codex` and choose an actually available model ID in `runtime.roles.lane`.
+to `openai-codex` and choose an actually available model ID in the native lead session.
 OAuth in the isolated native store works without an `OPENAI_API_KEY` environment
 variable. Never infer successful authentication from a model listing alone.
 
@@ -61,22 +55,15 @@ variable. Never infer successful authentication from a model listing alone.
 | Authorized non-secret authentication metadata from a provider-supported interface for that isolated profile | Only the authentication facts actually returned | Actual inference, quotas and tool behavior |
 | Separately authorized real inference and scoped-tool smoke | The exercised provider/model/tool path worked at that time | Untested recovery, other providers or production parity |
 
-OMP doctor checks native identity, selected managed-lane model/effort and control capabilities. Its aggregate `ok` is not an authentication or inference readiness verdict. Borrowed-lead model selection is user-owned; its observed model is not proof it matches the managed-lane configuration. Record auth metadata as **unverified** and inference as **untested** when no supported evidence was collected. Missing auth evidence must not be reported as operational-ready.
+OMP doctor checks native lead identity, durable receipts and interaction capabilities. Its aggregate `ok` is not an authentication or inference readiness verdict. Borrowed-lead model selection is user-owned; its observed model is not an authentication verdict. Record auth metadata as **unverified** and inference as **untested** when no supported evidence was collected. Missing auth evidence must not be reported as operational-ready.
 
-The old OMO route `anthropic-subscription/claude-opus-5-5` is historical configuration, not proof that the installed OMP supports that provider or has its credentials. The managed process environment currently preserves `OPENAI_API_KEY`; other auth may work through explicitly configured isolated settings or a supported provider wrapper. Neither fact proves all non-OpenAI authentication broken or working. This change does not copy auth stores, broaden environment inheritance, rewrite providers or inspect credential contents. If the chosen provider needs a different environment contract, verify that actual contract and both process boundaries in a separate authorized change.
+The old OMO route `anthropic-subscription/claude-opus-5-5` is historical configuration, not proof that the installed OMP supports that provider or has its credentials. The isolated profile preflight environment preserves `OPENAI_API_KEY`; other auth may work through explicitly configured isolated settings or a supported provider wrapper. Neither fact proves all non-OpenAI authentication broken or working. This change does not copy auth stores, broaden environment inheritance, rewrite providers or inspect credential contents. If the chosen provider needs a different environment contract, verify that actual contract and both process boundaries in a separate authorized change.
 
-Record implementation tests, authenticated model/tool smoke and deployment as separate outcomes. Fixture-only tests make no model calls and send no messenger messages. Long worker failure/recovery, adapter restart and a verified merged/deployed SHA remain separate release acceptance checks.
+Record implementation tests, authenticated model/tool smoke and deployment as separate outcomes. Fixture-only tests make no model calls and send no messenger messages. Adapter restart and a verified merged/deployed SHA remain separate release acceptance checks.
 
-## Durable worker failure notices
+## Removed OMP lanes
 
-Managed controllers expose a paginated, session-bound terminal-failure journal.
-The host forwards sanitized model/compaction categories to the service and saves
-its cursor only after durable acceptance. Restart replay uses the same failure ID,
-so it neither duplicates a notice nor reassigns it to a newer lead attachment.
-Transient retries and explicit cancellation do not produce terminal notices;
-a genuine terminal error racing a hold remains reportable. No task is automatically
-retried. Journal/cursor corruption or a missing durable-failure capability blocks
-managed readiness instead of silently losing failures. Preserve these private
-files during recovery; retention/garbage collection is not automatic. A native
-process crash before its failure callback was durably recorded cannot be
-reconstructed by this channel and still requires ordinary disconnected recovery.
+Worker lanes use Codex. Previously registered OMP lanes remain visible in status
+and keep their queued and unknown mail. Lifecycle and dispatch operations refuse
+with the lane key and recovery guidance. `close KEY` closes only the record; it
+does not stop a native process, close a pane, delete files or discard mail.

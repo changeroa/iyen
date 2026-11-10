@@ -80,6 +80,12 @@ export type Lane = {
 
 export const statusOf = (lane: Lane): LaneStatus => (lane.closedAt ? "closed" : (lane.status ?? "working"));
 
+/** Retained records are readable after upgrade, but their runtime is no longer supported. */
+export const isRemovedOmpLane = (lane: Lane): boolean => lane.runtime?.kind === "omp" && lane.runtime.backend === "herdr-tui";
+export const assertLaneRuntime = (lane: Lane): void => {
+  if (isRemovedOmpLane(lane)) throw new Error(`Lane ${lane.key}: OMP lanes were removed. Use close ${lane.key} to retire the record; launch a new Codex lane. Queued mail is preserved.`);
+};
+
 export const withStatus = (lane: Lane, status: LaneStatus, note: string, at: string, patch: Partial<Lane> = {}): Lane => ({
   ...lane,
   ...patch,

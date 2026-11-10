@@ -84,14 +84,13 @@ Native UI relay requires `ExtensionContext.userInteractions`
 (`list`, `respond`, `responseStatus`). Older SDKs advertise interaction capability
 as unavailable; doctor reports that the UI relay is not ready. Existing borrowed
 lead ordinary durable messaging remains available during a staged service upgrade.
-New managed startup requires the native interaction capability. Updating service
+Updating service
 code does not upgrade an already-running native session: native reload/restart and
 any new attachment activation require explicit owner authorization.
 The extension observes `user_interaction_requested` and
 `user_interaction_resolved`; polling also discovers dialogs already open at
 reconnect. The exact-target control channel supports `interactions`,
-`interaction-respond` and `interaction-response-status` for both borrowed leads
-and managed lanes. These methods never inject a user message or abort an ask.
+`interaction-respond` and `interaction-response-status` for borrowed leads. These methods never inject a user message or abort an ask.
 
 Configure the existing owner-filtered `ingress` and `hooks.threadReply`; no
 additional account, daemon or notification hook is used. Native requests are
@@ -99,14 +98,7 @@ correlated using their initiating entry ID/operation hash and durable inbox
 receipt. Source message IDs, owner IDs and metadata are retained. A lead whose
 request omits source provenance is relayed only when its current attachment has
 one unambiguous authenticated owner thread. Explicit unmatched or contradictory
-lead provenance is withheld. A worker's unmapped launch source may use its
-registered report thread only when one configured ingress/owner can be identified;
-contradictory known provenance cannot use that fallback.
-A shared Slack/Discord ingress may configure multiple owner identities. A worker
-may bind its exact registered report thread to one authenticated owner proved by
-a durable receipt in the current lead attachment; owner, controller and generation
-must all match. Other threads, old epochs, missing receipts or multiple owners in
-that thread do not qualify. Historical records without owner identity are not
+lead provenance is withheld. Historical records without owner identity are not
 backfilled by guessing: a fresh authenticated owner message supplies the binding.
 
 Slack notices retain the actual native question, plan, labels, descriptions and
@@ -142,8 +134,8 @@ local-only. Native response intent is durable before submission; repeated source
 reconcile the original operation rather than resubmitting uncertain answers.
 Previously recorded notice text and unknown outbound outcomes remain immutable
 across a wording cutover; new notices use natural reply guidance.
-OMP lanes are not automatically nudged for periodic progress merely because they
-are idle or old. Explicit reports still follow the configured durable report path.
+Attached OMP leads are not automatically nudged for periodic progress merely
+because they are idle or old.
 The existing Codex freshness policy is unchanged.
 
 `approval list` includes real native payloads instead of an OMP TUI placeholder.
@@ -170,14 +162,6 @@ read-only per inspection, with exact payload, controller and attachment fences.
 Only a real durable native receipt marks it sent; absence remains held. This clears
 lost-ACK delivery barriers without resubmitting owner input or report messages.
 
-The current scoped lead can also use `input-status KEY --operation-id ID`
-for a managed OMP lane. The query derives the immutable payload from its inbox;
-optional `--text-file FILE` must match it exactly. Only the originally recorded
-native controller and attachment epoch can supply the receipt. A real matching
-receipt marks the row sent, but does not release execution or clear dispatch
-holds. Missing evidence remains unknown. The query never submits input, retries
-an operation, changes native execution, or overrides pending abandonment.
-
 Integration must run the behavioral suite, including
 `test/native-interactions.test.ts`, against the merged implementation, then
 verify a real owner Slack/native roundtrip. Native SDK deployment, extension
@@ -190,84 +174,6 @@ thread to an `applied` outcome in the original native request epoch; the actual
 ask tool's returned selection; and a meaningful sent reply in the original
 owner thread. A question notification, source ACK, or native tool return alone
 is not an end-to-end acceptance result. Never synthesize the owner's answer.
-
-## Deliberate retirement of managed OMP input
-
-An authorized current attached lead or operator may retire a historical managed
-worker inbox entry with:
-
-```text
-iyen mail abandon MAIL_ID --operation-id STABLE_ID --evidence "Explicit reason"
-```
-
-This is not a resend or a messenger completion receipt. Never-attempted queued
-input becomes terminal `abandoned` without native submission. Unknown input is
-first reconciled against its originally recorded native controller and payload.
-A real receipt means `sent`; otherwise retirement requires confirmed exit of the
-exact managed native process and its Herdr detach. Hold, idle, or a stop request
-acknowledgment alone are insufficient. Original content, source, provenance and
-delivery uncertainty remain in the durable abandonment audit; `abandoned` does
-not assert that the old input never executed.
-
-The stable operation and evidence must be retained across retries. A pending
-intent fences dispatch even after service restart. Changed lead/worker epochs,
-uncertain process exit or persistence failure leave the intent pending rather
-than replaying input. Completed retirement is immutable. Outbox and borrowed-lead
-input cannot use this command. Retire any misrouted queued input before recovering
-the original managed session; recovery must not silently create a replacement
-native session or requeue retired messages.
-A retry of a pending abandonment queries the original input receipt but does
-not issue another native stop. It can finish from the same epoch's already
-durable `stopped` proof; otherwise uncertainty stays fenced for reconciliation.
-
-Borrowed-lead native `hold`, `release` and `stop` remain forbidden. This managed
-recovery command does not grant attached-lead self-restart. A safe same-session
-lead restart requires a separately authenticated, idle-fenced native shutdown
-and controlled startup/activation primitive; a PID lookup or pane typing is not
-such a primitive.
-
-When a managed OMP host is still alive but its uncertain inputs have already been
-retired or reconciled, `recover KEY --stop-current --operation-id STABLE_ID
---text-file FILE` explicitly requests proven exit before same-session recovery.
-The service pins the lead scope, worker controller and host generation and records
-stop intent before dispatch. Uncertain stop outcomes are not resubmitted; inspect
-and reconcile the original operation instead. This cannot bypass unknown/sending
-inbox input or pending abandonment, target a borrowed lead, or create a new native
-session. Reusing the operation with changed target or continuation is rejected.
-
-Native stop intent is controller-epoch scoped. A parent-verified fresh managed
-resume with an initially open native execution barrier retains the saved owner
-hold but does not inherit the old process's stop intent. A same-process extension
-reload with a still-held barrier must retain that stop intent and refuse release.
-
-## Explicit execution-only recovery with uncertain input
-
-Ordinary resume continues to reject unresolved OMP delivery. After an explicit
-owner decision, the current scoped lead may instead use:
-
-```text
-resume KEY --allow-unknown --operation-id STABLE_ID --evidence OWNER_DECISION \
-  --expected-instance ORIGINAL_HOST_ID --expected-generation ORIGINAL_GENERATION
-```
-
-This is restricted to the original registered managed native session and settled
-execution hold. Every uncertain input must retain its original controller,
-attachment generation and payload. Sending inputs, pending abandonment, a newer
-pause or a changed native scope reject recovery. Borrowed leads remain excluded.
-
-The durable control operation releases execution, not delivery uncertainty:
-original inbox rows stay unchanged and are never submitted again. Existing native
-parked input may be handled as execution continues; the owner's decision must
-cover that consequence. Lost release acknowledgement permits read-only
-observation of the same native process, never a second release request. A new
-uncertain input requires a new owner decision.
-If the exact original native process is already open, this operation repairs
-only its matching dispatch barrier without requesting another native release.
-
-Managed-lane control input is kept unattempted in the durable queue while native
-work is busy. Only idle admission submits it. This avoids turning a normal
-in-flight task's steering delay into another receipt timeout and automatic hold;
-ordinary owner conversation to the attached lead retains its existing routing.
 
 ## Owner-authorized same-session OMP lead restart
 
@@ -344,30 +250,13 @@ known, timestamps, active/uncertain flags and bounded problem category. It never
 returns tokens, bootstrap contents, full owner input or configured credentials.
 Durable coordinator records remain private service persistence.
 
-## Lead-directed retirement
+## Removed OMP lanes and upgrades
 
-When the lead judges a managed OMP lane finished or superseded, use:
-
-```text
-retire KEY --operation-id ID --evidence TEXT --expected-instance ID --expected-generation N
-```
-
-Unlike verified `close`, retirement does not require the worker's Done claim
-and accepts an owner-paused lane. Only the current attached lead or operator
-can request it; the target must remain the exact registered managed OMP scope.
-Borrowed leads are excluded.
-
-Retirement blocks dispatch before attempting the existing graceful managed
-stop. `runtimeStop=confirmed` means that stop path proved native process exit
-and Herdr detachment, not merely an acknowledgment. A missing native identity
-retires only the registration with `runtimeStop=not-addressable`; it never
-guesses a PID or target. A failed or interrupted stop stays `unknown`, and
-repeating the same immutable operation does not send stop again.
-
-The record is closed with explicit retirement evidence, never a synthetic
-verified-Done claim. Uncertain inbox rows, source receipts, runtime history,
-worktrees, uncommitted files and panes are retained. No thread-Done hook runs.
-Retired keys reject new work, reopen/recover and late host registration/events;
-new assignments use new lane keys. An uncertain process may still exist even
-though its registration is retired; status reports this distinction.
-
+OMP remains available for attached leads, native interactions, reconnect and
+owner-authorized lead restart. Managed OMP worker lanes are removed. Existing
+`runtime.kind=omp`, `backend=herdr-tui` records remain in the registry and status
+after startup. Lifecycle and dispatch operations name the lane, state that OMP
+lanes were removed, and direct the operator to close the record and launch a new
+Codex lane. Queued and unknown input stays durable and is never replayed or
+discarded. `close KEY` retires only the registry record, including paused or
+partially retired records, preserving native processes, panes, files and mail.

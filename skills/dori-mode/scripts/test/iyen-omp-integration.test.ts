@@ -4,9 +4,7 @@ import { join } from "node:path";
 import { defaultConfig, parseConfig, type DoriConfig } from "../src/config.ts";
 import { atomicJson } from "../src/journal.ts";
 import { DoriService } from "../src/service.ts";
-import { hostSocket } from "../src/ipc.ts";
-import { bootstrapPath } from "../src/runtime/session-host.ts";
-import { ompManagedEnvironment, ompProfileEnvironment, ompPaneCommand, ompVersionMatches, verifyOmpHerdr, discoverOmpSafe, waitForOmpDetach, stopOmpManagedProcess } from "../src/runtime/omp-integration.ts";
+import { ompProfileEnvironment, ompVersionMatches, verifyOmpHerdr, discoverOmpSafe } from "../src/runtime/omp-integration.ts";
 import { payloadHash, type NativeUserInteraction, type NativeInteractionStatus } from "../src/runtime/omp/contract.ts";
 import { readWatchTarget, DeliveryWatchdog } from "../src/watchdog.ts";
 import { ompFixture } from "./fixtures/omp.ts";
@@ -26,49 +24,6 @@ test("OMP version preflight accepts native CLI version format but rejects anothe
   for (const output of ["18.15.0", "omp 18.15.0", "omp/18.15.0\n"]) expect(ompVersionMatches(output, "18.15.0")).toBe(true);
   for (const output of ["omp/18.15.1", "other/18.15.0", "omp/18.15.0\nunverified", "omp/118.15.0"]) expect(ompVersionMatches(output, "18.15.0")).toBe(false);
 });
-test("OMP stop waits for delayed Herdr detach and does not wait for unrelated sessions", async () => {
-  let attached = true, finished = false, observed!: () => void;
-  const queried = new Promise<void>(resolve => { observed = resolve; });
-  const runner: Runner = async () => {
-    observed();
-    return { code: 0, err: "", out: JSON.stringify({ result: { agents: [
-      { agent: "omp", agent_session: { value: attached ? "/exact.jsonl" : "/unrelated.jsonl" } }
-    ] } }) };
-  };
-  const stopping = waitForOmpDetach("/exact.jsonl", Date.now() + 1000, runner).then(() => { finished = true; });
-  await queried; await Bun.sleep(10); expect(finished).toBe(false);
-  attached = false; await stopping; expect(finished).toBe(true);
-});
-test("OMP stop remains unconfirmed when Herdr still reports the native session or cannot verify it", async () => {
-  const runner: Runner = async () => ({ code: 0, err: "", out: JSON.stringify({ result: { agents: [{ agent: "omp", agent_session: { value: "/exact.jsonl" } }] } }) });
-  await expect(waitForOmpDetach("/exact.jsonl", Date.now() + 60, runner)).rejects.toThrow("still present");
-  await expect(waitForOmpDetach("/exact.jsonl", Date.now() + 1000, async () => ({ code: 1, out: "", err: "unavailable" }))).rejects.toThrow("unverified");
-  for (const agents of [[null], [{}], [{ agent: "omp" }], [{ agent: "omp", agent_session: { value: 42 } }]]) {
-    await expect(waitForOmpDetach("/exact.jsonl", Date.now() + 1000, async () => ({ code: 0, err: "", out: JSON.stringify({ result: { agents } }) }))).rejects.toThrow("unverified");
-  }
-});
-test("OMP stop retry reaps an exited native process without resending to its vanished controller", async () => {
-  const f = ompFixture(), config = profile(f.directory);
-  const child = Bun.spawn([process.execPath, "-e", "setInterval(()=>{},1000)"], { stdout: "ignore", stderr: "ignore" });
-  let stops = 0, detached = false, invalid = true;
-  await f.serve(async request => {
-    if (request.method === "inspect") return { protocol: 1, id: request.id, identity: f.identity, result: f.snapshot };
-    if (request.method !== "stop") throw new Error("Only one stop permitted");
-    stops++; child.kill("SIGTERM"); await child.exited; detached = true;
-    return { protocol: 1, id: request.id, identity: f.identity, result: { stopping: true } };
-  });
-  const runner: Runner = async argv => detached
-    ? { code: 0, err: "", out: JSON.stringify({ result: { agents: invalid ? [{ agent: "omp" }] : [] } }) }
-    : association(f)(argv);
-  try {
-    await expect(stopOmpManagedProcess(f.target, child.pid, config, runner)).rejects.toThrow("unverified");
-    expect(stops).toBe(1);
-    invalid = false;
-    await stopOmpManagedProcess(f.target, child.pid, config, runner);
-    expect(stops).toBe(1);
-    await expect(stopOmpManagedProcess(f.target, undefined, config, runner)).rejects.toThrow("exit cannot be verified");
-  } finally { child.kill(); await child.exited; f.cleanup(); }
-});
 async function setup(handler?: (method: string, params: any) => any) {
   const f = ompFixture(); f.transcript([]);
   Object.assign(f.identity, { role: "attached-lead", laneKey: "lead" }); Object.assign(f.target, f.identity);
@@ -87,13 +42,6 @@ test("OMP profile rejects Codex sandbox/effort, implicit profile and effective p
   try { process.env.DORI_STATE_DIR = defaultConfig().stateDir; expect(() => parseConfig(cfg)).toThrow("isolated stateDir"); }
   finally { if (old === undefined) delete process.env.DORI_STATE_DIR; else process.env.DORI_STATE_DIR = old; }
   expect(defaultConfig().runtime.kind).toBe("codex");
-});
-test("managed OMP clears pane environment, filters messenger/admin credentials, preserves isolated settings", () => {
-  const env = ompManagedEnvironment("/isolated", { pane_id: "w:p", tab_id: "w:t", workspace_id: "w" }, { PATH: "/usr/bin", HOME: "/home/test", OPENAI_API_KEY: "provider", SLACK_BOT_TOKEN: "messenger", DORI_CONTEXT: "/admin", CODEX_HOME: "/real", HERDR_PANE_ID: "wrong", BASH_ENV: "/inject" });
-  expect(env).toMatchObject({ PI_CODING_AGENT_DIR: "/isolated", HERDR_PANE_ID: "w:p", OPENAI_API_KEY: "provider" });
-  for (const key of ["SLACK_BOT_TOKEN", "DORI_CONTEXT", "CODEX_HOME", "BASH_ENV"]) expect(env[key]).toBeUndefined();
-  const cmd = ompPaneCommand({ cwd: "/some path", env, argv: ["/bin/omp", "literal `x` $(x)"] });
-  expect(cmd).toContain("env -i "); expect(cmd).toContain("'literal `x` $(x)'"); expect(cmd).not.toContain("messenger");
 });
 test("OMP version preflight resolves the service Bun ahead of ambient PATH in the exact isolated profile", async () => {
   const f = ompFixture();
@@ -171,79 +119,6 @@ test("scoped receipt lookup reconciles a lost native ACK while busy without subm
     await expect(restarted.handle("input-status", args, caller)).rejects.toThrow();
   } finally { x.f.cleanup(); }
 });
-test("current lead reconciles a held managed lane's real receipt without releasing or resubmitting it", async () => {
-  const x = await setup(), worker = ompFixture();
-  worker.transcript([]);
-  Object.assign(worker.identity, { role: "managed-lane", laneKey: "worker", paneId: "w:worker", terminalId: "term-worker" });
-  Object.assign(worker.target, worker.identity);
-  let received = false, mutations = 0;
-  await worker.serve(async request => {
-    if (request.method !== "inspect" && request.method !== "operation") { mutations++; throw new Error("No execution authorized"); }
-    return { protocol: 1, id: request.id, identity: worker.identity, result: request.method === "inspect" ? worker.snapshot :
-      received ? { status: "received", receipt: receipt(worker, request.params.operationId, "original") } : { status: "absent" } };
-  });
-  try {
-    const attached = await x.s.handle("lead-activate", x.args, { role: "admin" });
-    const runner: Runner = async argv => {
-      const result = await x.runner(argv);
-      const body = JSON.parse(result.out);
-      body.result.agents.push({ agent: "omp", cwd: worker.identity.cwd, pane_id: worker.identity.paneId, terminal_id: worker.identity.terminalId,
-        agent_session: { agent: "omp", kind: "path", source: "herdr:omp", value: worker.identity.sessionFile } });
-      return { ...result, out: JSON.stringify(body) };
-    };
-    const service = new DoriService(x.config, runner), caller = { role: "lead" as const, key: "lead", instance: attached.lead.runtime.hostInstanceId };
-    const lane = { ...attached.lead, key: "worker", revision: 0, role: "lane" as const, pane: worker.identity.paneId, cwd: worker.identity.cwd, dispatchBlocked: true,
-      runtime: { kind: "omp" as const, backend: "herdr-tui" as const, threadId: worker.identity.sessionId, state: "idle" as const, held: true,
-        hostInstanceId: "worker-host", generation: 2, binaryVersion: "18.15.0", omp: { kind: "omp" as const, target: worker.target,
-          attachmentInstanceId: "worker-host", attachmentGeneration: 2, attachedAt: new Date().toISOString(), excludedInboxIds: [] } } };
-    await service.registry.write(lane);
-    const provenance = { target: worker.target, attachmentInstanceId: "worker-host", attachmentGeneration: 2 };
-    service.inbox.put({ id: "managed-lost", target: "worker", text: "original", state: "unknown", at: new Date().toISOString(),
-      attachmentInstance: "worker-host", ompProvenance: provenance });
-    const args = { key: "worker", operationId: "managed-lost" };
-    expect(await service.handle("input-status", args, caller)).toMatchObject({ status: "unknown" });
-    expect(service.inbox.get(args.operationId)?.state).toBe("unknown");
-    received = true;
-    expect(await service.handle("input-status", args, caller)).toMatchObject({ status: "received", receipt: receipt(worker, args.operationId, "original") });
-    expect(service.inbox.get(args.operationId)?.state).toBe("sent");
-    expect((await service.registry.read("worker"))?.runtime?.held).toBe(true);
-    expect((await service.registry.read("worker"))?.dispatchBlocked).toBe(true);
-    service.inbox.put({ id: "stale-managed", target: "worker", text: "original", state: "unknown", at: new Date().toISOString(),
-      attachmentInstance: "worker-host", ompProvenance: provenance });
-    await service.registry.update("worker", current => ({ ...current, runtime: { ...current.runtime!, generation: 3 } }));
-    await expect(service.handle("input-status", { key: "worker", operationId: "stale-managed" }, caller)).rejects.toThrow("provenance");
-    expect(service.inbox.get("stale-managed")?.state).toBe("unknown");
-    expect(mutations).toBe(0);
-  } finally { worker.cleanup(); x.f.cleanup(); }
-});
-test("managed steering stays unattempted while native work is busy and is submitted once after idle", async () => {
-  const f = ompFixture(), config = profile(f.directory), service = new DoriService(config, association(f));
-  let busy = true, inputs = 0;
-  const server = Bun.serve({ unix: hostSocket(config.stateDir, "worker"), async fetch(request) {
-    const { action, args } = await request.json() as { action: string; args: any };
-    if (action === "inspect") return Response.json({ result: { threadId: f.identity.sessionId, state: busy ? "running" : "idle",
-      activeTurnId: busy ? "active" : undefined, held: false, goal: null } });
-    if (action !== "input") throw new Error("Only input or observation expected");
-    inputs++;
-    return Response.json({ result: { turnId: "native-entry", receiptKind: "omp-session-entry", receipt: receipt(f, args.operationId, args.text) } });
-  } });
-  try {
-    atomicJson(bootstrapPath(config.stateDir, "worker"), { key: "worker", hostToken: "fixture-token" });
-    await service.registry.write({ key: "worker", role: "lane", title: "worker", thread: "none", brief: "/brief", done: "file /done", cwd: f.directory, pane: f.identity.paneId,
-      status: "working", openedAt: new Date().toISOString(), runtime: { kind: "omp", backend: "herdr-tui", threadId: f.identity.sessionId, state: "running",
-        hostInstanceId: "host", generation: 1, binaryVersion: "18.15.0", omp: { kind: "omp", target: f.target,
-          attachmentInstanceId: "host", attachmentGeneration: 1, attachedAt: new Date().toISOString(), excludedInboxIds: [] } } });
-    const args = { key: "worker", operationId: "steering", text: "Bounded next instruction" };
-    expect(await service.handle("input", args, { role: "admin" })).toMatchObject({ queued: true });
-    expect(service.inbox.get("steering")?.state).toBe("queued");
-    expect(service.inbox.get("steering")?.ompProvenance).toBeUndefined();
-    expect(inputs).toBe(0);
-    busy = false;
-    expect(await service.handle("input", args, { role: "admin" })).toMatchObject({ receiptKind: "omp-session-entry" });
-    expect(service.inbox.get("steering")?.state).toBe("sent");
-    expect(inputs).toBe(1);
-  } finally { server.stop(true); f.cleanup(); }
-});
 test("scoped queued receipt lookup does not start input and native held or unavailable input is not ready", async () => {
   let mutations = 0;
   const x = await setup(() => { mutations++; throw new Error("No native input permitted"); });
@@ -319,62 +194,6 @@ for (const change of ["generation", "row"] as const) {
     } finally { finish?.(); x.f.cleanup(); }
   });
 }
-test("OMP terminal notices survive host restart and do not rebind or become approval messages", async () => {
-  const f = ompFixture(), config = profile(f.directory), runner = association(f);
-  let service = new DoriService(config, runner);
-  const streamId = crypto.randomUUID();
-  const runtime = (instance: string, generation: number) => ({ kind: "omp" as const, backend: "herdr-tui" as const, threadId: f.identity.sessionId,
-    state: "idle" as const, hostInstanceId: instance, generation, binaryVersion: f.identity.runtimeVersion,
-    omp: { kind: "omp" as const, target: f.target, attachmentInstanceId: instance, attachmentGeneration: generation, attachedAt: new Date().toISOString(), excludedInboxIds: [] } });
-  const event = (sequence: number) => ({ method: "runtime/failure", params: { runtime: "omp", streamId, sessionId: f.identity.sessionId, sessionFile: f.identity.sessionFile, laneKey: "worker",
-    failure: { sequence, failureId: `omp-failure:${streamId}:${sequence}`, sourceInstanceId: f.identity.instanceId, sourceGeneration: 1,
-      executionId: `run:${sequence}`, phase: "model", category: "authentication", observedAt: "2026-11-02T00:00:00.000Z" } } });
-  const send = (sequence: number, instance = "host1", generation = 1, payload = event(sequence)) => service.handle("host-event",
-    { key: "worker", instance, runtime: runtime(instance, generation), event: payload }, { role: "host", key: "worker" });
-  try {
-    await service.registry.write({ key: "worker", role: "lane", title: "Worker", thread: "slack:root", brief: "", done: "", cwd: f.directory, pane: f.identity.paneId,
-      openedAt: new Date().toISOString(), runtime: runtime("host1", 1) });
-    atomicJson(join(config.stateDir, "attachments/lead.json"), { instance: "lead-before" });
-    await send(1); await send(2);
-    expect(service.failures.list()).toHaveLength(2);
-    expect(service.outbox.list()).toHaveLength(0);
-    expect(service.inbox.list()).toHaveLength(0);
-    // Simulate crash after durable service ACK but before the host cursor fsync.
-    service = new DoriService(config, runner);
-    await service.registry.update("worker", lane => ({ ...lane, runtime: runtime("host2", 2) }));
-    atomicJson(join(config.stateDir, "attachments/lead.json"), { instance: "lead-after" });
-    await send(1, "host2", 2); await send(2, "host2", 2); await service.notifyFailures();
-    expect(service.failures.list()).toHaveLength(2); expect(service.inbox.list()).toHaveLength(2);
-    for (const notice of service.inbox.list()) {
-      expect(notice).toMatchObject({ target: "lead", attachmentInstance: "lead-before", thread: "slack:root" });
-      expect(notice.text).toContain("OMP model failed (authentication)");
-      expect(notice.text).not.toContain("Codex");
-    }
-    const changed = event(1); changed.params.failure.category = "runtime";
-    await expect(send(1, "host2", 2, changed)).rejects.toThrow("different content");
-    const crossSession = event(3); crossSession.params.sessionId = crypto.randomUUID();
-    await expect(send(3, "host2", 2, crossSession)).rejects.toThrow("identity");
-    const raw = event(3) as any; raw.params.failure.error = "Authorization: sk-never-store";
-    await expect(send(3, "host2", 2, raw)).rejects.toThrow("identity");
-    expect(JSON.stringify(service.failures.list())).not.toContain("sk-never-store");
-  } finally { f.cleanup(); }
-});
-test("managed service pause is not blocked behind pending input receipt", async () => {
-  const f = ompFixture(), config = profile(f.directory), s = new DoriService(config, association(f));
-  let done!: (v: unknown) => void, started!: () => void, held = false; const inputStarted = new Promise<void>(r => { started = r; }); const instance = "host-instance";
-  await s.registry.write({ key: "worker", title: "worker", thread: "none", brief: "/b", done: "closed a/b#1", cwd: f.directory, pane: f.identity.paneId, openedAt: new Date().toISOString(), runtime: {
-    kind: "omp", backend: "herdr-tui", threadId: f.identity.sessionId, state: "idle", hostInstanceId: instance, generation: 1, binaryVersion: "18.15.0", omp: { kind: "omp", target: f.target, attachmentInstanceId: instance, attachmentGeneration: 1, attachedAt: new Date().toISOString(), excludedInboxIds: [] } } });
-  atomicJson(bootstrapPath(config.stateDir, "worker"), { hostToken: "host", laneToken: "lane", instance, role: "lane" });
-  const server = Bun.serve({ unix: hostSocket(config.stateDir, "worker"), async fetch(req) { const { action } = await req.json() as any;
-    if (action === "input") { started(); return Response.json({ result: await new Promise(r => { done = r; }) }); } if (action === "hold") held = true;
-    return Response.json({ result: { threadId: f.identity.sessionId, state: "idle", goal: null } }); } });
-  try { const sending = s.handle("input", { key: "worker", text: "work", operationId: "pending" }, { role: "admin" }); await inputStarted;
-    const result = await Promise.race([s.handle("pause", { key: "worker" }, { role: "admin" }), Bun.sleep(500).then(() => { throw new Error("Pause blocked behind receipt"); })]);
-    expect(result.code).toBe(0); expect(held).toBe(true); expect(s.inbox.get("pending")?.state).toBe("sending");
-    done({ turnId: receipt(f, "pending", "work").receiptId, receiptKind: "omp-session-entry", receipt: receipt(f, "pending", "work") }); await sending;
-    for (const action of ["launch", "pause", "report"]) await expect(s.handle(action, { key: "other" }, { role: "lane", key: "worker" })).rejects.toThrow("capability");
-  } finally { server.stop(true); f.cleanup(); }
-});
 test("OMP watchdog attempts once after durable unknown and never uses Codex observer", async () => {
   let inputs = 0; const x = await setup(method => { if (method === "operation") return { status: "absent" }; inputs++; throw new Error("unknown"); });
   try { await x.s.handle("lead-activate", x.args, { role: "admin" }); let now = 1000;
@@ -383,50 +202,11 @@ test("OMP watchdog attempts once after durable unknown and never uses Codex obse
   } finally { x.f.cleanup(); }
 });
 
-test("actual MCP CLI subprocess uses OMP lane context and rejects admin/other-lane controls", async () => {
-  const f = ompFixture(), config = profile(f.directory), s = new DoriService(config, association(f));
-  const instance = "mcp-host";
-  await s.registry.write({ key: "worker", role: "lane", title: "worker", thread: "none", brief: "/b", done: "closed a/b#1", openedAt: new Date().toISOString(),
-    runtime: { kind: "omp", backend: "herdr-tui", threadId: f.identity.sessionId, state: "idle", hostInstanceId: instance, generation: 1, binaryVersion: "18.15.0" } });
-  atomicJson(join(config.stateDir, "control.json"), { token: "operator-not-forwarded" });
-  atomicJson(bootstrapPath(config.stateDir, "worker"), { hostToken: "host", laneToken: "lane-scoped", role: "lane", instance });
-  const contextFile = join(f.directory, "context.json"), configFile = join(f.directory, "config.json");
-  atomicJson(contextFile, { token: "lane-scoped", key: "worker", stateDir: config.stateDir }); atomicJson(configFile, config);
-  const { serviceSocket } = await import("../src/ipc.ts");
-  const server = Bun.serve({ unix: serviceSocket(config.stateDir), async fetch(request) {
-    try {
-      const caller = await s.authorize(request.headers.get("authorization")!.replace("Bearer ", ""));
-      const { action, args } = await request.json() as any;
-      return Response.json({ result: await s.handle(action, args, caller) });
-    } catch (e) { return Response.json({ error: (e as Error).message }, { status: 403 }); }
-  } });
-  try {
-    const child = Bun.spawn([process.execPath, join(import.meta.dir, "../src/cli.ts"), "mcp-server"], {
-      stdin: "pipe", stdout: "pipe", stderr: "pipe", env: { PATH: process.env.PATH, HOME: process.env.HOME, DORI_CONTEXT: contextFile, DORI_CONFIG: configFile, DORI_STATE_DIR: config.stateDir } });
-    const messages = [
-      { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } },
-      { jsonrpc: "2.0", method: "notifications/initialized" },
-      { jsonrpc: "2.0", id: 2, method: "tools/list" },
-      ...[{ action: "status", args: { key: "worker" } }, { action: "report", args: { key: "worker", kind: "milestone", text: "scoped", eventId: "mcp" } },
-        { action: "launch", args: { key: "other" } }, { action: "report", args: { key: "other", kind: "milestone", text: "bad", eventId: "bad" } }]
-        .map((arguments_, i) => ({ jsonrpc: "2.0", id: i + 3, method: "tools/call", params: { name: "control", arguments: arguments_ } })),
-    ];
-    child.stdin.write(messages.map(x => JSON.stringify(x)).join("\n") + "\n"); child.stdin.end();
-    const stdout = await new Response(child.stdout).text(); expect(await child.exited).toBe(0);
-    const responses = stdout.trim().split("\n").map(line => JSON.parse(line));
-    const byId = (id: number) => responses.find(x => x.id === id).result;
-    expect(byId(1).protocolVersion).toBe("2024-11-05"); expect(byId(2).tools[0].name).toBe("control");
-    expect(byId(3).isError).toBe(false); expect(byId(4).isError).toBe(false);
-    expect(byId(5).isError).toBe(true); expect(byId(6).isError).toBe(true);
-    expect((await s.registry.read("worker"))?.report?.text).toBe("scoped");
-  } finally { server.stop(true); f.cleanup(); }
-});
-
  test("OMP arbitrary adoption is refused before creating a Codex-shaped runtime", async () => {
   const f = ompFixture(), s = new DoriService(profile(f.directory), association(f));
   try {
     const { adoptLane } = await import("../src/launch.ts");
-    await expect(adoptLane(s.deps, { key: "adopted", title: "outside bootstrap", brief: "/b", done: "closed a/b#1", pane: "w:p", threadId: f.identity.sessionId })).rejects.toThrow("OMP adopt is unsupported");
+    await expect(adoptLane(s.deps, { key: "adopted", title: "outside bootstrap", brief: "/b", done: "closed a/b#1", pane: "w:p", threadId: f.identity.sessionId })).rejects.toThrow("OMP lanes were removed");
     expect(await s.registry.read("adopted")).toBeNull();
   } finally { f.cleanup(); }
 });
@@ -456,61 +236,6 @@ test("watchdog routing fence covers asynchronous native input through its bounde
   } finally { finish?.(); x.f.cleanup(); }
 });
 
-test("current scoped lead reconciles a managed lost ACK before releasing the held original native session", async () => {
-  const lead = await setup(), f = ompFixture(), config = lead.config;
-  const runner: Runner = async argv => {
-    const a = await association(lead.f)(argv), b = await association(f)(argv);
-    return { code: 0, err: "", out: JSON.stringify({ result: { agents: [...JSON.parse(a.out).result.agents, ...JSON.parse(b.out).result.agents] } }) };
-  };
-  const s = new DoriService(config, runner);
-  const attached = await s.handle("lead-activate", lead.args, { role: "admin" });
-  const caller = { role: "lead" as const, key: "lead", instance: attached.lead.runtime.hostInstanceId };
-  let inputs = 0, releases = 0, received = false;
-  const receiptGate = Promise.withResolvers<void>(), receiptRequested = Promise.withResolvers<void>();
-  await f.serve(async r => {
-    if (r.method === "operation" && r.params.operationId === "revoked-scope") { receiptRequested.resolve(); await receiptGate.promise; }
-    return { protocol: 1, id: r.id, identity: f.identity, result: r.method === "inspect" ? f.snapshot : received ? { status: "received", receipt: receipt(f, r.params.operationId, "work") } : { status: "absent" } };
-  });
-  const native = { kind: "omp" as const, target: f.target, attachmentInstanceId: "H1", attachmentGeneration: 1, attachedAt: new Date().toISOString(), excludedInboxIds: [] };
-  await s.registry.write({ key: "worker", role: "lane", title: "worker", thread: "none", brief: "/b", done: "closed a/b#1", cwd: f.directory, pane: f.identity.paneId, openedAt: new Date().toISOString(), runtime: {
-    kind: "omp", backend: "herdr-tui", threadId: f.identity.sessionId, state: "idle", hostInstanceId: "H1", generation: 1, binaryVersion: "18.15.0", omp: native } });
-  atomicJson(bootstrapPath(config.stateDir, "worker"), { hostToken: "host", laneToken: "lane", instance: "H1", role: "lane" });
-  const server = Bun.serve({ unix: hostSocket(config.stateDir, "worker"), async fetch(req) {
-    const { action } = await req.json() as any;
-    if (action === "input") { inputs++; return Response.json({ error: "lost receipt" }, { status: 409 }); }
-    if (action === "release") releases++;
-    return Response.json({ result: { threadId: f.identity.sessionId, state: "idle", goal: null } });
-  } });
-  try {
-    await expect(s.handle("input", { key: "worker", text: "work", operationId: "lost-host" }, { role: "admin" })).rejects.toThrow();
-    const original = structuredClone(s.inbox.get("lost-host")!);
-    expect(original).toMatchObject({ state: "unknown", attachmentInstance: "H1", ompProvenance: { target: f.target, attachmentInstanceId: "H1", attachmentGeneration: 1 } });
-    await s.registry.update("worker", lane => ({ ...lane, dispatchBlocked: true, holdReason: "recovery", runtime: { ...lane.runtime!, hostInstanceId: "H2", generation: 2, omp: { ...native, attachmentInstanceId: "H2", attachmentGeneration: 2 } } }));
-    atomicJson(bootstrapPath(config.stateDir, "worker"), { hostToken: "host", laneToken: "lane", instance: "H2", role: "lane" });
-    const restarted = new DoriService(config, runner);
-    await expect(restarted.deps.runtime.release("worker", "user")).rejects.toThrow("unresolved operation fence"); expect(releases).toBe(0);
-    const args = { box: "inbox", id: "lost-host", state: "sent", evidence: "exact native receipt" };
-    await expect(restarted.handle("mail-resolve", { ...args, state: "queued" }, caller)).rejects.toThrow();
-    await expect(restarted.handle("mail-resolve", { ...args, box: "outbox" }, caller)).rejects.toThrow();
-    await expect(restarted.handle("mail-resolve", args, { role: "lane", key: "worker" })).rejects.toThrow("capability");
-    await expect(restarted.handle("mail-resolve", args, caller)).rejects.toThrow("receipt unavailable");
-    expect(restarted.inbox.get("lost-host")).toEqual(original);
-    received = true;
-    const result = await restarted.handle("mail-resolve", args, caller);
-    expect(result).toMatchObject({ state: "sent", attachmentInstance: "H1", ompProvenance: original.ompProvenance });
-    await restarted.deps.runtime.release("worker", "user"); expect(releases).toBe(1); expect(inputs).toBe(1);
-    restarted.inbox.put({ id: "legacy-unknown", target: "worker", text: "no recorded native evidence", state: "unknown", attachmentInstance: "H1", at: new Date().toISOString() });
-    await expect(restarted.deps.runtime.release("worker", "user")).rejects.toThrow("unresolved operation fence");
-    await expect(restarted.handle("mail-resolve", { box: "inbox", id: "legacy-unknown", state: "sent", evidence: "operator" }, caller)).rejects.toThrow("provenance missing");
-    restarted.inbox.put({ ...original, id: "revoked-scope" });
-    const rejected = expect(restarted.handle("mail-resolve", { ...args, id: "revoked-scope" }, caller)).rejects.toThrow();
-    await receiptRequested.promise;
-    await restarted.handle("lead-detach", { threadId: lead.args.threadId }, caller);
-    receiptGate.resolve(); await rejected;
-    expect(restarted.inbox.get("revoked-scope")?.state).toBe("unknown");
-  } finally { receiptGate.resolve(); server.stop(true); f.cleanup(); lead.f.cleanup(); }
-});
-
 for (const change of ["detach", "prepared-handoff", "committed-handoff", "stopped", "native-generation", "row"] as const) {
   test(`delayed OMP receipt reconciliation rejects ${change} before fenced finalization`, async () => {
     let queryStarted!: () => void, finish!: () => void;
@@ -537,138 +262,6 @@ for (const change of ["detach", "prepared-handoff", "committed-handoff", "stoppe
     } finally { finish?.(); x.f.cleanup(); }
   });
 }
-
-test("SIGKILL OMP host recovery removes only its stale socket and reconnects the same native controller", async () => {
-  const { writeFileSync, mkdirSync, existsSync, readFileSync } = await import("node:fs");
-  const { ipc, serviceSocket } = await import("../src/ipc.ts");
-  const f = ompFixture(), config = profile(f.directory), s = new DoriService(config, association(f));
-  config.runtime.rpcTimeoutMs = 1000; config.runtime.heartbeatIntervalMs = 20; config.runtime.heartbeatTimeoutMs = 500;
-  f.transcript([]); f.snapshot.effort = "medium";
-  let inputs = 0;
-  await f.serve(r => {
-    if (r.method === "hold") f.snapshot.held = true;
-    if (r.method === "input") inputs++;
-    return { protocol: 1, id: r.id, identity: f.identity, result: f.snapshot };
-  });
-  atomicJson(join(f.directory, `${createHash("sha256").update("instance:1").digest("hex")}.json`), { ...f.target, pid: process.pid, startedAt: new Date().toISOString() });
-  const checkpoint = join(config.stateDir, "hosts/worker.runtime.json");
-  atomicJson(checkpoint, { threadId: f.identity.sessionId, target: f.target, held: true, pid: process.pid });
-  const fakeBin = join(f.directory, "bin"), log = join(f.directory, "herdr-calls"); mkdirSync(fakeBin);
-  const agents = join(f.directory, "agents.json"), pane = join(f.directory, "pane.json");
-  atomicJson(agents, JSON.parse((await association(f)(["herdr", "agent", "list"])).out));
-  atomicJson(pane, { result: { pane: { pane_id: f.identity.paneId, terminal_id: f.identity.terminalId, tab_id: "w1:t1", workspace_id: "w1", agent: "omp" } } });
-  writeFileSync(join(fakeBin, "herdr"), `#!/bin/sh\necho "$*" >> '${log}'\nif [ "$1 $2" = "agent list" ]; then exec /bin/cat '${agents}'; fi\nif [ "$1 $2" = "pane get" ]; then exec /bin/cat '${pane}'; fi\nexit 79\n`, { mode: 0o700 });
-  config.runtime.binary = join(fakeBin, "omp"); writeFileSync(config.runtime.binary, "#!/bin/sh\necho 18.15.0\n", { mode: 0o700 });
-  const registered = new Map<string, () => void>();
-  const service = Bun.serve({ unix: serviceSocket(config.stateDir), async fetch(request) {
-    try {
-      const { action, args } = await request.json() as any;
-      const result = await s.handle(action, args, { role: "host", key: "worker" });
-      if (action === "host-register") registered.get(args.instance)?.();
-      return Response.json({ result });
-    } catch (error) { return Response.json({ error: (error as Error).message }, { status: 409 }); }
-  } });
-  const spawnHost = async (instance: string, generation: number) => {
-    const token = `host-${instance}`;
-    const runtime = { kind: "omp" as const, backend: "herdr-tui" as const, threadId: f.identity.sessionId, state: "starting" as const, hostInstanceId: instance, generation, binaryVersion: "18.15.0" };
-    const existing = await s.registry.read("worker");
-    if (existing) await s.registry.update("worker", l => ({ ...l, runtime }));
-    else await s.registry.write({ key: "worker", role: "lane", title: "worker", thread: "none", brief: "/b", done: "closed a/b#1", cwd: f.directory, pane: f.identity.paneId, openedAt: new Date().toISOString(), runtime });
-    atomicJson(bootstrapPath(config.stateDir, "worker"), { key: "worker", role: "lane", instance, generation, hostToken: token, laneToken: "lane", cwd: f.directory, pane: f.identity.paneId, threadId: f.identity.sessionId, model: "test", blocked: true, config });
-    const ready = new Promise<void>(resolve => registered.set(instance, resolve));
-    const child = Bun.spawn([process.execPath, join(import.meta.dir, "../src/cli.ts"), "session-host", "--state-dir", config.stateDir, "--key", "worker"], {
-      cwd: f.directory, stdin: "ignore", stdout: "ignore", stderr: "pipe", env: { HOME: process.env.HOME, PATH: `${fakeBin}:${process.env.PATH}` } });
-    try { await Promise.race([ready, child.exited.then(async code => { throw new Error(`Host exited ${code}: ${await new Response(child.stderr).text()}`); }), Bun.sleep(3000).then(() => { throw new Error("Host startup timed out"); })]); }
-    catch (error) { child.kill("SIGKILL"); await child.exited; throw error; }
-    return { child, token };
-  };
-  let second: Awaited<ReturnType<typeof spawnHost>> | undefined;
-  try {
-    const first = await spawnHost("H1", 1);
-    expect(await ipc(hostSocket(config.stateDir, "worker"), first.token, "inspect")).toMatchObject({ threadId: f.identity.sessionId });
-    first.child.kill("SIGKILL"); await first.child.exited;
-    expect(existsSync(hostSocket(config.stateDir, "worker"))).toBe(true);
-    second = await spawnHost("H2", 2);
-    expect(await ipc(hostSocket(config.stateDir, "worker"), second.token, "inspect")).toMatchObject({ threadId: f.identity.sessionId });
-    expect((await s.registry.read("worker"))?.runtime?.omp?.target).toEqual(f.target);
-    expect(readFileSync(log, "utf8")).not.toContain("pane run"); expect(inputs).toBe(0);
-  } finally {
-    if (second) { second.child.kill("SIGTERM"); await second.child.exited; }
-    service.stop(true); f.cleanup();
-  }
-}, 10000);
-
-test("stale-host cleanup refuses a live foreign replacement even with dead old-owner metadata", async () => {
-  const { lstatSync } = await import("node:fs");
-  const { ompHostOwnerPath, prepareOmpHostSocket } = await import("../src/runtime/omp-integration.ts");
-  const f = ompFixture(), config = profile(f.directory), socket = hostSocket(config.stateDir, "worker");
-  const dead = Bun.spawn([process.execPath, "-e", "process.exit(0)"], { stdout: "ignore", stderr: "ignore" }); await dead.exited;
-  const replacement = Bun.serve({ unix: socket, fetch() { return Response.json({ error: "foreign owner" }, { status: 403 }); } });
-  try {
-    const before = lstatSync(socket);
-    atomicJson(ompHostOwnerPath(config.stateDir, "worker"), { pid: dead.pid, instance: "old" });
-    await expect(prepareOmpHostSocket(config.stateDir, { key: "worker", instance: "new", generation: 2 })).rejects.toThrow("existing OMP host");
-    expect(lstatSync(socket).ino).toBe(before.ino);
-    atomicJson(ompHostOwnerPath(config.stateDir, "worker"), { pid: process.pid, instance: "live" });
-    await expect(prepareOmpHostSocket(config.stateDir, { key: "worker", instance: "new", generation: 2 })).rejects.toThrow("prior death unverified");
-    expect(lstatSync(socket).ino).toBe(before.ino);
-  } finally { replacement.stop(true); f.cleanup(); }
-});
-
-test("public host-only recover retains the exact live OMP pane without creating another tab", async () => {
-  const f = ompFixture(), s = new DoriService(profile(f.directory), association(f));
-  await f.serve(r => ({ protocol: 1, id: r.id, identity: f.identity, result: f.snapshot }));
-  const native = { kind: "omp" as const, target: f.target, attachmentInstanceId: "H1", attachmentGeneration: 1, attachedAt: new Date().toISOString(), excludedInboxIds: [] };
-  try {
-    await s.registry.write({ key: "worker", role: "lane", title: "worker", thread: "none", brief: "/b", done: "closed a/b#1", cwd: f.directory, pane: f.identity.paneId, tab: "original-tab", openedAt: new Date().toISOString(), runtime: {
-      kind: "omp", backend: "herdr-tui", threadId: f.identity.sessionId, state: "idle", hostInstanceId: "H1", generation: 1, binaryVersion: "18.15.0", omp: native } });
-    let boots = 0;
-    s.boot = async lane => { boots++; expect(lane.pane).toBe(f.identity.paneId); expect(lane.tab).toBe("original-tab"); expect(lane.runtime?.omp?.target).toEqual(f.target); };
-    expect(await s.handle("recover", { key: "worker" }, { role: "admin" })).toMatchObject({ recovering: true }); expect(boots).toBe(1);
-  } finally { f.cleanup(); }
-});
-
-for (const uncertain of ["unknown", "sending"] as const) test(`explicit recovery stop cannot bypass ${uncertain} input`, async () => {
-  const x = await setup();
-  try {
-    const attached = await x.s.handle("lead-activate", x.args, { role: "admin" });
-    const target = { ...x.f.target, role: "managed-lane" as const, laneKey: "recover-worker" };
-    await x.s.registry.write({ key: "recover-worker", role: "lane", title: "worker", thread: "none", brief: "/fixture", done: "fixture", openedAt: "now",
-      runtime: { kind: "omp", backend: "herdr-tui", threadId: target.sessionId, state: "idle", hostInstanceId: "worker-host", generation: 1, binaryVersion: "18.15.0",
-        omp: { kind: "omp", target, attachmentInstanceId: "worker-host", attachmentGeneration: 1, attachedAt: "now", excludedInboxIds: [] } } });
-    x.s.inbox.put({ id: "uncertain-original", target: "recover-worker", text: "original", state: uncertain, at: "now" });
-    let stops = 0;
-    x.s.deps.runtime.stop = async () => { stops++; };
-    await expect(x.s.handle("recover", { key: "recover-worker", stopCurrent: true, operationId: "recover-1" },
-      { role: "lead", key: "lead", instance: attached.lead.runtime.hostInstanceId })).rejects.toThrow("uncertain worker input");
-    expect(stops).toBe(0);
-    expect(x.s.inbox.get("uncertain-original")?.state).toBe(uncertain);
-    expect(x.s.operations.get("recovery-stop:recover-worker:recover-1")).toBeUndefined();
-  } finally { x.f.cleanup(); }
-});
-
-for (const changedEpoch of [false, true]) test(`recovery stop uncertainty is durable and cannot resend (changed epoch=${changedEpoch})`, async () => {
-  const x = await setup();
-  try {
-    const attached = await x.s.handle("lead-activate", x.args, { role: "admin" });
-    const target = { ...x.f.target, role: "managed-lane" as const, laneKey: "recover-worker" };
-    await x.s.registry.write({ key: "recover-worker", role: "lane", title: "worker", thread: "none", brief: "/fixture", done: "fixture", openedAt: "now",
-      runtime: { kind: "omp", backend: "herdr-tui", threadId: target.sessionId, state: "idle", hostInstanceId: "worker-host", generation: 1, binaryVersion: "18.15.0",
-        omp: { kind: "omp", target, attachmentInstanceId: "worker-host", attachmentGeneration: 1, attachedAt: "now", excludedInboxIds: [] } } });
-    let stops = 0;
-    x.s.deps.runtime.stop = async key => {
-      stops++;
-      if (changedEpoch) await x.s.registry.update(key, lane => ({ ...lane, runtime: { ...lane.runtime!, generation: 2 } }));
-      else throw new Error("Native exit unconfirmed");
-    };
-    const args = { key: "recover-worker", stopCurrent: true, operationId: "recover-1" }, caller = { role: "lead" as const, key: "lead", instance: attached.lead.runtime.hostInstanceId };
-    await expect(x.s.handle("recover", args, caller)).rejects.toThrow(changedEpoch ? "epoch changed" : "exit unconfirmed");
-    expect(x.s.operations.get("recovery-stop:recover-worker:recover-1")?.state).toBe("unknown");
-    await expect(x.s.handle("recover", args, caller)).rejects.toThrow();
-    expect(stops).toBe(1);
-    expect((await x.s.registry.read("recover-worker"))?.runtime?.threadId).toBe(target.sessionId);
-  } finally { x.f.cleanup(); }
-});
 
 test("current lead resolves native ask from a naturally delivered authenticated owner source, never an arbitrary source ID", async () => {
   let request!: NativeUserInteraction, submissions = 0, applied: NativeInteractionStatus | undefined;

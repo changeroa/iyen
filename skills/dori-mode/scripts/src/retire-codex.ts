@@ -2,12 +2,13 @@ import { existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { FlowDeps } from "./done-flow.ts";
-import type { RetireArgs } from "./retire.ts";
 import { type Lane, type Retirement, statusOf, withStatus } from "./registry.ts";
 import { readJson } from "./ipc.ts";
 import { bootstrapPath, type Bootstrap } from "./runtime/session-host.ts";
 import { payloadHash } from "./runtime/omp/contract.ts";
 import { iso } from "./run.ts";
+
+export type RetireArgs = { key: string; operationId: string; evidence: string; expectedInstance: string; expectedGeneration: number; expectedTerminalId?: string };
 
 const scope = (l: Lane) => ({ key: l.key, role: l.role, pane: l.pane, tab: l.tab, cwd: l.cwd,
   kind: l.runtime?.kind, backend: l.runtime?.backend, instance: l.runtime?.hostInstanceId,

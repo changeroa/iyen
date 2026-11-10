@@ -1,11 +1,11 @@
 import type { FlowDeps } from "./done-flow.ts";
 import type { Mail } from "./mailbox.ts";
-import { statusOf } from "./registry.ts";
+import { isRemovedOmpLane, statusOf } from "./registry.ts";
 /** Bounded minute-level observation only. No stale/budget-based input or runtime controls. */
 export const supervisionTick = async (deps: FlowDeps, put: (mail: Mail) => Mail): Promise<void> => {
   let failed = false;
   for (const lane of await deps.registry.open()) {
-    if (lane.role === "lead" || statusOf(lane) !== "working" || lane.dispatchBlocked) continue;
+    if (lane.role === "lead" || isRemovedOmpLane(lane) || statusOf(lane) !== "working" || lane.dispatchBlocked) continue;
     try {
       const heard = Math.max(Date.parse(lane.openedAt), lane.report?.at ?? 0);
     const observedAt = deps.clock.now(), stale = observedAt - heard >= deps.config.nudgeAfterMin * 60000;
