@@ -17,7 +17,7 @@ const waitFor = async<T>(fn:()=>Promise<T>,accept:(value:T)=>boolean):Promise<T>
 test("CLI service and private backends manage visible Herdr agents with exact receipts, pause, close and same-thread reopen",async()=>{
  const state=withState();let daemon:ReturnType<typeof Bun.spawn>|undefined;
  try{
-  const bin=join(state.dir,"bin");mkdirSync(bin);symlinkSync(join(import.meta.dir,"fixtures/herdr.ts"),join(bin,"herdr"));
+  const bin=join(state.dir,"bin");mkdirSync(bin);symlinkSync(join(import.meta.dir,"fixtures/herdr.ts"),join(bin,"herdr"));symlinkSync(join(import.meta.dir,"fixtures/herdr-core.ts"),join(bin,"herdr-core"));
   const config={...defaultConfig(),stateDir:state.dir,defaultCwd:state.dir,leadWorkspace:"lead-space",laneWorkspace:"worker-space",closeAfterMin:0.01,guard:{...defaultConfig().guard,memFreeMinPct:0,diskFreeMinGb:0},runtime:{...defaultConfig().runtime,binary:join(import.meta.dir,"fixtures/codex.ts"),roles:{lead:{model:"test",effort:"medium"},lane:{model:"test",effort:"medium"}},startupTimeoutMs:10000,rpcTimeoutMs:3000,heartbeatIntervalMs:250,heartbeatTimeoutMs:5000}};
   const cfgPath=join(state.dir,"config.json");atomicJson(cfgPath,config);await Bun.write(join(state.dir,"brief.md"),"fixture task");await Bun.write(join(state.dir,"ready.json"),'{"ready":true}');
   const env={PATH:`${bin}:${dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`,HOME:state.dir,DORI_CONFIG:cfgPath,DORI_STATE_DIR:state.dir};
@@ -109,7 +109,7 @@ test("current-session CLI attaches a busy existing lead, scopes controls, delive
  try {
   atomicJson(statePath,{socketPath,thread:{id:threadId,cwd:state.dir,model:"existing-model",reasoningEffort:"high",status:{type:"active",activeFlags:[]}},turns:[{id:"activation-turn",status:"inProgress",items:[]}]});
   atomicJson(join(state.dir,"fixture-panes.json"),[{pane_id:"current:p",tab_id:"current:t",workspace_id:"current",agent:"codex",agent_status:"working",agent_session:{agent:"codex",kind:"id",value:threadId}}]);
-  const bin=join(state.dir,"bin");mkdirSync(bin);symlinkSync(join(import.meta.dir,"fixtures/herdr.ts"),join(bin,"herdr"));
+  const bin=join(state.dir,"bin");mkdirSync(bin);symlinkSync(join(import.meta.dir,"fixtures/herdr.ts"),join(bin,"herdr"));symlinkSync(join(import.meta.dir,"fixtures/herdr-core.ts"),join(bin,"herdr-core"));
   const config={...defaultConfig(),stateDir:state.dir,defaultCwd:state.dir,runtime:{...defaultConfig().runtime,binary:join(import.meta.dir,"fixtures/external-codex.ts"),rpcTimeoutMs:2000}};
   const cfgPath=join(state.dir,"config.json");atomicJson(cfgPath,config);
   const env={PATH:`${bin}:${dirname(process.execPath)}:/usr/bin:/bin`,HOME:state.dir,DORI_STATE_DIR:state.dir,DORI_CONFIG:cfgPath};
@@ -191,7 +191,7 @@ for (const upgradeVersion of ["0.165.0", "0.999.0"]) test(`CLI 163 attachment au
  try {
   atomicJson(statePath, { socketPath, serverVersion: "0.163.0", thread: { id: threadId, cwd: state.dir, status: { type: "active", activeFlags: ["waitingOnApproval"] } }, turns: [{ id: "busy", status: "inProgress", items: [] }] });
   atomicJson(join(state.dir, "fixture-panes.json"), [{ pane_id: "current:p", tab_id: "current:t", workspace_id: "current", agent: "codex", agent_status: "working", agent_session: { agent: "codex", kind: "id", value: threadId } }]);
-  const bin = join(state.dir, "bin"); mkdirSync(bin); symlinkSync(join(import.meta.dir, "fixtures/herdr.ts"), join(bin, "herdr"));
+  const bin = join(state.dir, "bin"); mkdirSync(bin); symlinkSync(join(import.meta.dir, "fixtures/herdr.ts"), join(bin, "herdr"));symlinkSync(join(import.meta.dir,"fixtures/herdr-core.ts"),join(bin,"herdr-core"));
   const binaries: string[] = [];
   for (const version of ["0.163.0", upgradeVersion]) {
    const binary = join(bin, `codex-${version}`);

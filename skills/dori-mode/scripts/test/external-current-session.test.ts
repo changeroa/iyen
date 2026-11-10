@@ -172,7 +172,7 @@ test("restart revalidates borrowed attachment without host heartbeats, boot or m
   expect(await restarted.handle("status", { key: "lead" }, { role: "admin" })).toMatchObject({ readiness: "ready", bridge: first.bridge, identityVerified: true });
   expect(await restarted.authorize(saved.token)).toMatchObject({ role: "lead", instance: saved.instance });
   for (const token of ["stale-host", "stale-lane"]) await expect(restarted.authorize(token)).rejects.toThrow("Forbidden");
-  expect(await deadPaneTick(h.run, h.config, restarted.registry, Date.now() + 999999)).toEqual([]);
+  expect(await deadPaneTick(h.config, restarted.registry, Date.now() + 999999)).toEqual([]);
   expect(existsSync(hostSocket(h.state.dir, "lead"))).toBe(false); expect(queueCalls()).toHaveLength(0);
 });
 

@@ -33,7 +33,7 @@ finally:
 test.each(["normal", "failure", "term", "sibling", "service"])("real PTY %s: two launch fences, native-only input, signal and child lifetime", async mode => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "iyen-terminal-")));
   try {
-    const child = Bun.spawn(["python3", "-c", controller, process.execPath, join(import.meta.dir, "fixtures/launcher-terminal.ts"), mode, dir], { stdout: "pipe", stderr: "pipe" });
+    const child = Bun.spawn(["python3", "-c", controller, process.execPath, join(import.meta.dir, "fixtures/launcher-terminal.ts"), mode, dir], { stdout: "pipe", stderr: "pipe", env: process.env });
     const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
     expect(err).toBe(""); expect(code).toBe(0); const result = JSON.parse(out);
     if (mode === "sibling") { expect(result.text).toContain("another process"); expect(result.text).not.toContain("NATIVE_READY"); }

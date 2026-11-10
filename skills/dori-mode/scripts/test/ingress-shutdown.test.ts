@@ -51,7 +51,7 @@ test("failed service drain rejects authenticated mutation RPC, retains ownership
     };
     serve(${JSON.stringify(config)}).catch(error => console.log("DRAIN_FAILED " + error.message));
   `;
-  const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
+  const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe", env: process.env });
   let output = "";
   const reading = (async () => { for await (const chunk of child.stdout) output += new TextDecoder().decode(chunk); })();
   const waitFor = async (predicate: () => boolean, timeoutMs = 1500) => {

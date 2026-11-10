@@ -1,8 +1,9 @@
+import { withHcPanes } from "./runtime/hc-panes.ts";
 export type Ran = { readonly code: number; readonly out: string; readonly err: string };
 export type RunOptions = { readonly cwd?: string; readonly timeoutMs?: number; readonly signal?: AbortSignal; readonly env?: Record<string, string> };
 export type Runner = (argv: readonly string[], opts?: RunOptions) => Promise<Ran>;
 
-export const run: Runner = async (argv, opts = {}) => {
+const spawnRunner: Runner = async (argv, opts = {}) => {
   if (opts.signal?.aborted) return { code: 124, out: "", err: "cancelled" };
   let p: ReturnType<typeof Bun.spawn>;
   try {
@@ -22,3 +23,5 @@ export type Clock = { readonly now: () => number; readonly sleep: (ms: number) =
 export const realClock: Clock = { now: () => Date.now(), sleep: (ms) => Bun.sleep(ms) };
 
 export const iso = (clock: Clock): string => new Date(clock.now()).toISOString();
+
+export const run: Runner = withHcPanes(spawnRunner);

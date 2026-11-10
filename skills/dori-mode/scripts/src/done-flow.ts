@@ -104,7 +104,10 @@ export const closeLane = async (deps: FlowDeps, lane: Lane, note: string): Promi
     } catch { cleanup.push("thread delivery unknown; inspect outbox"); }
   }
   if (lane.tab || lane.pane) {
+    // Unbind first: this deliberate kill must not surface as DEAD_PANE.
+    if (lane.hcTerminal) await deps.registry.update(lane.key, l => ({ ...l, hcTerminal: undefined }));
     const result = await deps.run(lane.tab ? ["herdr", "tab", "close", lane.tab] : ["herdr", "pane", "close", lane.pane!]);
+    if (result.code !== 0 && lane.hcTerminal) await deps.registry.update(lane.key, l => ({ ...l, hcTerminal: lane.hcTerminal }));
     if (result.code !== 0) return { closed: false, lines: [...lines, `REFUSED ${lane.key}: pane cleanup unconfirmed`] };
   }
   await deps.registry.update(lane.key, current => withStatus(current, "closed", note, iso(deps.clock), { closedAt: iso(deps.clock), receipt: { previous: current.receipt, cleanup } }));

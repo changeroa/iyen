@@ -41,7 +41,7 @@ test("OMP brief examples work through own scoped service and refuse another lane
   } finally { state.done(); }
 });
 
-for (const kind of ["omp", "codex"] as const) test(`launch submits the persisted ${kind} brief with the correct runtime footer`, async () => {
+for (const kind of ["codex"] as ("codex" | "omp")[]) test(`launch submits the persisted ${kind} brief with the correct runtime footer`, async () => {
   const state = withState(), world = newWorld();
   try {
     const config = defaultConfig();
@@ -49,7 +49,7 @@ for (const kind of ["omp", "codex"] as const) test(`launch submits the persisted
     const originalRun = deps.run;
     deps.run = async argv => {
       if (argv[0] === "df") return { code: 0, err: "", out: "disk 1 1 104857600 /" };
-      if (argv[0] === "herdr" && argv[1] === "tab" && argv[2] === "create") return { code: 0, err: "", out: JSON.stringify({ result: { root_pane: { pane_id: "w:p1" }, tab_id: "w:t1" } }) };
+      if (argv[0] === "herdr-core" && argv[1] === "run") return { code: 0, err: "", out: JSON.stringify({ address: "t1" }) };
       return originalRun(argv);
     };
     const brief = join(state.dir, "input.md"); await Bun.write(brief, "Bounded work.\n");
@@ -92,4 +92,14 @@ test("bootstrap requires explicit paths and activated identity; no implicit home
   for (const attachmentGeneration of [-1, 0.5, NaN]) expect(() => ompLeadBootstrap({ ...context, attachmentGeneration })).toThrow("identity");
   expect(() => ompLeadBootstrap({ ...context, attachmentInstanceId: "" })).toThrow("identity");
   expect(() => ompLeadBootstrap({ ...context, sessionId: "" })).toThrow("identity");
+});
+
+test("launch refuses OMP lanes before writing any lane state", async () => {
+  const state = withState(), world = newWorld();
+  try {
+    const config = defaultConfig();
+    const deps = depsFor(world, fakeClock(0), state.dir, { defaultCwd: state.dir, runtime: { ...config.runtime, kind: "omp" } });
+    await expect(launchLane(deps, { key: lane.key, title: lane.title, brief: join(state.dir, "none.md"), done: lane.done, model: "m", effort: "medium" }, async () => {})).rejects.toThrow("OMP lanes are not supported");
+    expect(await deps.registry.read(lane.key)).toBeNull();
+  } finally { state.done(); }
 });

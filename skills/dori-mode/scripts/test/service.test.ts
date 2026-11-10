@@ -150,7 +150,7 @@ test("legacy private-RPC sessions require an explicit preserved new-session hand
 
 test("explicit operator handoff archives legacy control state, preserves old identity and queues new session held",async()=>{
  const world=newWorld(),base=fakeRunner(world);
- s=new DoriService(s.config,async(argv,opts)=>argv[0]==="herdr"&&argv[1]==="tab"&&argv[2]==="create"?{code:0,err:"",out:JSON.stringify({result:{root_pane:{pane_id:"new-pane",tab_id:"new-tab"},tab_id:"new-tab"}})}:base(argv,opts));
+ s=new DoriService(s.config,async(argv,opts)=>argv[0]==="herdr-core"&&argv[1]==="run"?{code:0,err:"",out:JSON.stringify({address:"t9"})}:argv[0]==="herdr"&&argv[1]==="tab"&&argv[2]==="create"?{code:0,err:"",out:JSON.stringify({result:{root_pane:{pane_id:"new-pane",tab_id:"new-tab"},tab_id:"new-tab"}})}:base(argv,opts));
  await s.registry.write({...lane,pane:"old-pane"});atomicJson(bootstrapPath(state.dir,lane.key),{instance:"host1",hostToken:"old-token"});
  s.inbox.put({id:"uncertain",target:lane.key,text:"unknown side effect",state:"unknown",at:new Date().toISOString()});
  await s.handle("recover",{key:lane.key,newSession:true,handoff:"Confirmed A; B remains uncertain",operationId:"migration1"},{role:"admin"});

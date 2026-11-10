@@ -118,6 +118,7 @@ test("resource-held launch survives ticks and restart; only identical explicit r
  const base = fakeRunner(world), config = { ...defaultConfig(), stateDir: state.dir, defaultCwd: state.dir };
  const runner: typeof base = async (argv, opts) => {
   if (argv[0] === "df") return { code: 0, err: "", out: `disk 1 1 ${freeGb * 1048576} /` };
+  if (argv[0] === "herdr-core" && argv[1] === "run") { world.calls.push([...argv]); return { code: 0, err: "", out: JSON.stringify({ address: "t1" }) }; }
   if (argv[0] === "herdr" && argv[1] === "tab" && argv[2] === "create") { world.calls.push([...argv]); return { code: 0, err: "", out: JSON.stringify({ result: { root_pane: { pane_id: "w:p1" }, tab_id: "w:t1" } }) }; }
   return base(argv, opts);
  };

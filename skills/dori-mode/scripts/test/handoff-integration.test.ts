@@ -42,7 +42,7 @@ test("process handoff transfers only explicit queued input, revokes the old brid
       sent: { id: "sent", target: "lead", text: "already delivered", state: "sent", turnId: "prior-receipt", at },
       reconciled: { id: "reconciled", target: "lead", text: "manually reconciled", state: "queued", source: "reconciled: previous attempt", at },
     });
-    const bin = join(state.dir, "bin"); mkdirSync(bin); symlinkSync(join(import.meta.dir, "fixtures/herdr.ts"), join(bin, "herdr"));
+    const bin = join(state.dir, "bin"); mkdirSync(bin); symlinkSync(join(import.meta.dir, "fixtures/herdr.ts"), join(bin, "herdr"));symlinkSync(join(import.meta.dir,"fixtures/herdr-core.ts"),join(bin,"herdr-core"));
     const configPath = join(state.dir, "config.json");
     atomicJson(configPath, { ...defaultConfig(), stateDir: state.dir, defaultCwd: state.dir, runtime: { ...defaultConfig().runtime, binary: join(import.meta.dir, "fixtures/external-codex.ts"), rpcTimeoutMs: 1000 } });
     const env = { PATH: `${bin}:${dirname(process.execPath)}:/usr/bin:/bin`, HOME: state.dir, DORI_STATE_DIR: state.dir, DORI_CONFIG: configPath };
