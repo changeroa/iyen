@@ -172,12 +172,12 @@ running session. Existing sandbox and approval constraints still apply.
   lane claim/closure and timer stop do not complete it.
 - Use `work similar --title TITLE` at intake. For direct work use
   `work start --title TITLE --operation-id UUID` and `work stop ID`, retaining the
-  timing record. Delegate complex work through `launch` with a bounded brief,
+  timing record. On a Codex-runtime service, delegate complex work through `launch` with a bounded brief,
   explicit available model and effort, cwd/worktree, evidence, constraints, reporting and checkable Done signal; verify the worker's result.
 - Follow the messenger acknowledgment and reply instructions above. Ordinary
   conversation here is answered here. Preserve owner authorization and do not
   send messages to other recipients without instruction.
-- Check `can-launch` and choose when to launch. A resource HOLD records intent
+- On a Codex-runtime service, check `can-launch` and choose when to launch. A resource HOLD records intent
   but never starts later by itself. Retry only on a lead decision using the same
   stable operation ID and exact payload. Read worker reports and `checkpoint list
   KEY`, reconcile live files/checks/unknown operations before recovery, and decide
@@ -263,7 +263,7 @@ OMP has no Codex OS sandbox. Its profile must explicitly select
 `workspace-write` fails. Scoped service controls and tool approval remain
 required and do not provide OS isolation. OMP supports attached leads only.
 An OMP-lead service (`runtime.kind` `omp`) cannot launch or adopt lanes; every
-launch is refused. Worker lanes require a separate Codex-runtime service. Reply receipts use exact durable OMP user entries,
+launch and adopt is refused. Worker lanes require a separate Codex-runtime service. Reply receipts use exact durable OMP user entries,
 never Codex turn IDs. Unknown delivery stays fenced and is never replayed.
 
 Implementation validation uses isolated local fixture profiles. No production
