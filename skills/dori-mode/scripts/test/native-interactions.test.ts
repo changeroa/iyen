@@ -196,13 +196,13 @@ test("approval and plan review reject widened, disabled, missing-tier and missin
 });
 
 
-for (const fault of ["guest", "thread", "ingress", "queued", "control", "old-time", "receipt", "provenance", "generation", "attachment", "hash"] as const)
+for (const fault of ["guest", "guest-conversation", "thread", "ingress", "queued", "control", "old-time", "receipt", "provenance", "generation", "attachment", "hash"] as const)
 test(`source provenance rejects ${fault} without native mutation`, async () => {
   const h = await fixture();
   try {
     const [row] = await h.publish([h.ask()]);
     const mail = await h.conversation("source", `> 답변 ${row!.token} 1`);
-    const patch = fault === "guest" ? { ownerUser: "guest" } : fault === "thread" ? { thread: "slack:other/200" } :
+    const patch = fault === "guest" ? { ownerUser: "guest" } : fault === "guest-conversation" ? { ownerUser: undefined } : fault === "thread" ? { thread: "slack:other/200" } :
       fault === "ingress" ? { source: "other" } : fault === "queued" ? { state: "queued" as const } :
       fault === "control" ? { target: "owner-control" } : fault === "old-time" ? { at: "2026-10-31T23:59:59.000Z" } :
       fault === "receipt" ? { receipt: undefined } : fault === "provenance" ? { ompProvenance: undefined } :

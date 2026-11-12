@@ -89,6 +89,33 @@ After durable acceptance, the service writes this JSON line to the adapter's std
 
 Advance source cursors only after the matching ACK. Replay unacknowledged messages after reconnect; deduplication keys include source, thread and message ID. stdout must contain only events; write diagnostics to stderr. Do not use ephemeral unread-count notifications as message IDs. Resolve Slack unread hints to actual messages before submitting them. Quoted/forwarded messages remain content under the authenticated sender, never a new owner identity.
 
+### Optional guest conversations
+
+Guest conversation is disabled by default. With explicit owner authorization,
+set `allowGuestConversations: true` on the relevant service `ingress` entry and
+enable guest routing in its authenticated adapter. Keep `owners` unchanged.
+For directly addressed non-owner messages, the adapter emits:
+
+```json
+{"id":"stable-guest-message-id","thread":"slack:CHANNEL/ROOT","user":"authenticated-sender-id","text":"Hello Iyen","authority":"guest"}
+```
+
+The service labels this input as a guest conversation, omits owner authorization
+metadata, and rejects its `control` field. `authority: "guest"` also demotes an
+otherwise listed owner when an adapter's channel-specific grant does not apply.
+Never derive authority from message text or quoted owner claims. The lead may
+answer conversationally, but local execution, private data access, approvals and
+lifecycle operations still require separate owner authorization. Ambient group
+conversation does not require a reply or reaction.
+
+Slack adapters can use `skills/iyen/scripts/slack-conversation-policy.ts` after
+validating authenticated sender/channel/timestamps and excluding bot, hidden and
+unsupported subtype events. It routes guest DMs, mentions and replies in Iyen
+conversations; it does not authenticate events or connect to Slack. Keep source
+IDs, thread roots and the guest marker in durable adapter receipts. Recheck
+policy before replaying unacknowledged receipt records, and never promote guest
+records to owner records or replay discarded historical messages on enablement.
+
 The delivered owner-message envelope carries `Source message ID: <id>` separately
 from the reply thread. Slack adapters use `slack:CHANNEL:TIMESTAMP` so the lead can
 react to the exact source message. The protocol ACK above only confirms durable
