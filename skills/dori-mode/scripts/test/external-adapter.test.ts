@@ -168,7 +168,7 @@ for (const method of ["thread/loaded/list", "thread/turns/list"] as const) test(
     let reads = 0;
     const observer = observerFor(() => ({ data: [], nextCursor: loop ? (++reads, "cycle") : String(++reads) }));
     await expect(method === "thread/loaded/list" ? readLoadedThreads(observer) : readTurns(observer, threadId)).rejects.toMatchObject({ code: "runtime-incompatible" });
-    expect(reads).toBe(loop ? 2 : 100);
+    expect(reads).toBe(loop ? 2 : method === "thread/turns/list" ? 10000 : 100);
   }
 });
 
@@ -190,6 +190,21 @@ test("valid multiple pages retain full exact receipt evidence", async () => {
   });
   expect(await readLoadedThreads(observer)).toEqual([otherId, threadId]);
   expect(receiptInTurns(await readTurns(observer, threadId), marked)).toBe("older");
+});
+
+test("full turn pagination stays below aggregate frame pressure without losing older receipts", async () => {
+  const marked = operationText("older task", "large-history");
+  let reads = 0;
+  const observer = observerFor((_method, params) => {
+    expect(params.limit).toBe(1);
+    expect(params.itemsView).toBe("full");
+    reads++;
+    return params.cursor === null
+      ? { data: [turn("large-recent", "x".repeat(9 * 1024 * 1024))], nextCursor: "older" }
+      : { data: [turn("older", marked)], nextCursor: null };
+  });
+  expect(receiptInTurns(await readTurns(observer, threadId), marked)).toBe("older");
+  expect(reads).toBe(2);
 });
 
 test("Codex active turns steer while approval/input flags remain dispatch safety gates", async () => {
