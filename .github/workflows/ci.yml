@@ -14,4 +14,4 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: bun install
       - run: bunx tsc --noEmit
-      - run: bun test test/lane-events.test.ts
+      - run: bun test test/lane-events.test.ts test/guest-conversations.test.ts test/native-interactions.test.ts

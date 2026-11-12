@@ -15,7 +15,7 @@ export type RuntimeConfig = {
   approvalPolicy: "untrusted" | "on-request" | "never";
   roles: { lead: RoleConfig; lane: RoleConfig };
 };
-export type IngressConfig = { id: string; command: string[]; owners: string[] };
+export type IngressConfig = { id: string; command: string[]; owners: string[]; allowGuestConversations?: boolean };
 export type DoriConfig = {
   schemaVersion: 2; stateDir: string; personaDir?: string; leadWorkspace?: string; laneWorkspace: string; workspaces: readonly string[];
   ignorePanes: readonly string[]; leadPane: string; defaultCwd: string; runtime: RuntimeConfig;
@@ -71,6 +71,7 @@ export const parseConfig = (raw: Record<string, any>, home = homedir()): DoriCon
   if (typeof cfg.autoPostReports !== "boolean") throw new Error("autoPostReports must be boolean");
   if (!Number.isInteger(cfg.heavySlots)) throw new Error("heavySlots must be an integer");
   if (Object.values(cfg.guard).some(n => !Number.isFinite(n) || n < 0)) throw new Error("Invalid guard threshold");
+  if (cfg.ingress.some(i => i.allowGuestConversations !== undefined && typeof i.allowGuestConversations !== "boolean")) throw new Error("allowGuestConversations must be boolean");
   if (new Set(cfg.ingress.map(i => i.id)).size !== cfg.ingress.length) throw new Error("Ingress IDs must be unique");
   for (const hook of Object.values(cfg.hooks)) if (!Array.isArray(hook) || !hook.length || hook.some(x => typeof x !== "string")) throw new Error("Hooks must be nonempty argv arrays");
   if (!Array.isArray(cfg.ingress) || cfg.ingress.some(i => !i.id || !Array.isArray(i.command) || !i.command.length || !Array.isArray(i.owners) || !i.owners.length)) throw new Error("Ingress needs id, command argv and owners");

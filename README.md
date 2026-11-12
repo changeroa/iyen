@@ -85,7 +85,7 @@ Native `ask` remains available. The native interaction bridge relays the actual 
 
 This path requires native SDK support for listing and answering real pending UI requests. Restarting the Iyen service does not retrofit an already-running older native process. Preserve the same native session when updating it; a changed controller epoch requires explicit activation and verification of the new scoped binding. A version string or configured profile alone does not establish interaction readiness.
 
-The service supervises configured ingress commands. They emit normalized owner messages with stable IDs and advance source cursors only after a durable protocol ACK. The delivered envelope includes the source message ID separately from the reply thread. This internal ACK is not a messenger reply or a read receipt. Raw human-readable messenger watch output is not accepted directly. Thread hooks keep account credentials outside worker environments. See the exact [adapter and approval contracts](skills/dori-mode/references/scripts.md).
+The service supervises configured ingress commands. They emit normalized messages with stable IDs and advance source cursors only after a durable protocol ACK. Owner-authorized guest conversations are opt-in at both the adapter and service: guests receive conversational replies without becoming owners or authorizing execution. The delivered envelope includes the source message ID separately from the reply thread. This internal ACK is not a messenger reply or a read receipt. Raw human-readable messenger watch output is not accepted directly. Thread hooks keep account credentials outside worker environments. See the exact [adapter and approval contracts](skills/dori-mode/references/scripts.md).
 
 ## Migration and recovery
 
