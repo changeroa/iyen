@@ -103,9 +103,15 @@ export const connectObserver = async (socket: string, timeoutMs: number): Promis
 
 const readPages = async <T>(observer: Observer, method: "thread/turns/list" | "thread/loaded/list", params: object, identity: (entry: T) => string): Promise<T[]> => {
   const entries: T[] = [], cursors = new Set<string>(), identities = new Set<string>();
+  // Full turns can contain large tool results. A 100-turn response can exceed
+  // the transport's 16 MiB frame cap even though each individual turn fits.
+  // Keep full receipt evidence and the existing total-entry bound; never use
+  // summaries or raise the transport cap to make an attachment appear ready.
+  const pageSize = method === "thread/turns/list" ? 1 : PAGE_SIZE;
+  const maxPages = MAX_ENTRIES / pageSize;
   let cursor: string | null = null;
-  for (let pageNumber = 0; pageNumber < MAX_PAGES; pageNumber++) {
-    const page: { data: T[]; nextCursor: string | null } = await checkedRead(observer, method, { ...params, cursor, limit: PAGE_SIZE });
+  for (let pageNumber = 0; pageNumber < maxPages; pageNumber++) {
+    const page: { data: T[]; nextCursor: string | null } = await checkedRead(observer, method, { ...params, cursor, limit: pageSize });
     for (const entry of page.data) {
       const id = identity(entry);
       requireShape(!identities.has(id)); identities.add(id); entries.push(entry);
