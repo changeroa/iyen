@@ -201,7 +201,8 @@ class Bridge:
             else:
                 unresolved = True  # Never resend uncertain or service-queued input.
         self.db.commit()
-        if unresolved or any(m.get('target') == 'lead' and m.get('state') in ('unknown','sending') for m in mail):
+        if unresolved or any(m.get('target') == 'lead' and m.get('attachmentInstance') == self.config['instance']
+                             and m.get('state') in ('unknown','sending') for m in mail):
             self.status(delivery='held', reason='Pending/unknown input requires receipt reconciliation')
             return
         if not s.get('inputReady') and (s.get('runtime') or {}).get('state') != 'running':

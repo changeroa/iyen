@@ -532,3 +532,38 @@ test("owner-held attached lead retains queued input without TUI prompt or queue 
   expect(await h.s.registry.read("lead")).toMatchObject({ status: "paused", holdReason: "owner-pause", dispatchBlocked: true, runtime: { held: true } });
   expect(promptCalls()).toHaveLength(0); expect(queueCalls()).toHaveLength(0);
 });
+
+
+test("scoped Codex input-status reconciles exact received unknown mail without resubmission or releasing gates", async () => {
+  const attached = await attach(), instance = attached.lead.runtime.hostInstanceId;
+  const caller = { role: "lead" as const, key: "lead", instance };
+  h.s.inbox.put({ id: "reconcile", target: "lead", text: "exact payload", state: "unknown", attachmentInstance: instance, at: new Date().toISOString() });
+  h.setTurns([{ id: "received-turn", status: "completed", items: [{ type: "userMessage", content: [{ type: "text", text: operationText("exact payload", "reconcile") }] }] }]);
+  await h.s.registry.update("lead", l => ({ ...l, dispatchBlocked: true, holdReason: "owner-pause", runtime: { ...l.runtime!, held: true } }));
+  expect(await h.s.handle("input-status", { key: "lead", operationId: "reconcile", text: "exact payload" }, caller)).toEqual({ status: "received", operationId: "reconcile", turnId: "received-turn" });
+  expect(h.s.inbox.get("reconcile")).toMatchObject({ state: "sent", turnId: "received-turn" });
+  expect(await h.s.registry.read("lead")).toMatchObject({ dispatchBlocked: true, runtime: { held: true } });
+  expect(promptCalls()).toHaveLength(0);
+});
+
+test("Codex receipt lookup refuses mismatched payload/epoch and does not accept assistant echoes", async () => {
+  const attached = await attach(), instance = attached.lead.runtime.hostInstanceId;
+  const caller = { role: "lead" as const, key: "lead", instance };
+  h.s.inbox.put({ id: "reconcile", target: "lead", text: "exact payload", state: "unknown", attachmentInstance: instance, at: new Date().toISOString() });
+  h.setTurns([{ id: "echo", status: "completed", items: [{ type: "agentMessage", text: operationText("exact payload", "reconcile") }] }]);
+  expect(await h.s.handle("input-status", { key: "lead", operationId: "reconcile" }, caller)).toEqual({ status: "unknown", operationId: "reconcile" });
+  await expect(h.s.handle("input-status", { key: "lead", operationId: "reconcile", text: "different" }, caller)).rejects.toThrow("payload or attachment mismatch");
+  h.s.inbox.mark("reconcile", { attachmentInstance: "old" });
+  await expect(h.s.handle("input-status", { key: "lead", operationId: "reconcile" }, caller)).rejects.toThrow("payload or attachment mismatch");
+  expect(h.s.inbox.get("reconcile")?.state).toBe("unknown"); expect(promptCalls()).toHaveLength(0);
+});
+
+
+test("Codex receipt reconciliation rejects identity drift and preserves unknown mail", async () => {
+  const attached = await attach(), instance = attached.lead.runtime.hostInstanceId;
+  h.s.inbox.put({ id: "drift", target: "lead", text: "payload", state: "unknown", attachmentInstance: instance, at: new Date().toISOString() });
+  h.setTurns([{ id: "native", status: "completed", items: [{ type: "userMessage", content: [{ type: "text", text: operationText("payload", "drift") }] }] }]);
+  h.agent.agent_session.value = otherId;
+  await expect(h.s.handle("input-status", { key: "lead", operationId: "drift" }, { role: "lead", key: "lead", instance })).rejects.toThrow("identity mismatch");
+  expect(h.s.inbox.get("drift")?.state).toBe("unknown"); expect(promptCalls()).toHaveLength(0);
+});

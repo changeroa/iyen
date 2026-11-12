@@ -851,6 +851,38 @@ export class DoriService {
       throw error;
     }
   }
+  private async reconcileCodexInput(key: string, text: string | undefined, operationId: string, instance: string): Promise<unknown> {
+    const lane = await this.lane(key), saved = this.attachment(lane);
+    const assertCurrent = (current: Lane) => {
+      if (key !== "lead" || current.runtime?.kind !== "codex" || current.runtime.backend !== "external-current-session" ||
+        current.runtime.hostInstanceId !== instance || instance !== saved.instance || current.runtime.generation !== saved.generation ||
+        current.runtime.threadId !== saved.threadId || current.pane !== saved.pane || current.cwd !== saved.cwd ||
+        current.runtime.state === "stopped" || current.runtime.external?.detachedAt || current.cleanupFence || this.pendingHandoff() || this.leadRestarts.hasActive())
+        throw new Error("Codex receipt attachment changed or unavailable");
+    };
+    assertCurrent(lane);
+    const row = this.inbox.get(operationId);
+    if (!row) return { status: "missing", operationId };
+    if (row.target !== key || text !== undefined && row.text !== text || row.attachmentInstance !== instance || saved.excludedInboxIds.includes(row.id))
+      throw new Error("Input receipt payload or attachment mismatch");
+    if (row.state === "abandoned" || row.abandonment) throw new Error("Input abandonment requires its original lifecycle reconciliation");
+    if (row.state === "queued") return { status: "queued", operationId: row.id };
+    const captured = JSON.stringify(row);
+    let turnId: string | undefined;
+    await this.externalTransport.observe(this.runner, this.config.runtime, { ...saved, binaryVersion: saved.binaryVersion ?? lane.runtime?.binaryVersion }, async observer => {
+      const session = new ExternalCurrentSession(observer, this.runner, this.config.runtime, saved, saved.binary, realClock, async turns => {
+        turnId = receiptInTurns(turns, operationText(row.text, row.id));
+      });
+      await session.inspect(); // Read-only identity and exact native user-message proof. Never resubmit.
+    });
+    return withBindingFence(this.config.stateDir, async () => {
+      assertCurrent(await this.lane(key));
+      if (JSON.stringify(this.inbox.get(row.id)) !== captured) throw new Error("Input receipt changed during reconciliation");
+      if (!turnId) return { status: "unknown", operationId: row.id };
+      this.inbox.mark(row.id, { state: "sent", turnId });
+      return { status: "received", operationId: row.id, turnId };
+    });
+  }
   private async reconcileOmpInput(key: string, text: string | undefined, operationId: string, instance: string): Promise<unknown> {
     const lane = await this.lane(key), runtime = lane.runtime;
     const assertCurrent = (current: Lane) => {
@@ -1321,7 +1353,9 @@ export class DoriService {
       const lane = await this.lane(key);
       const instance = key === "lead" ? caller.instance : lane.runtime?.hostInstanceId;
       if (!instance) throw new Error("Input receipt native attachment missing");
-      return this.dispatchQueue.run(key, () => this.reconcileOmpInput(key, args.text, args.operationId, instance));
+      return this.dispatchQueue.run(key, () => lane.runtime?.kind === "codex"
+        ? this.reconcileCodexInput(key, args.text, args.operationId, instance)
+        : this.reconcileOmpInput(key, args.text, args.operationId, instance));
     }
     if (action === "can-launch") return canLaunch(await sampleHost(this.runner), this.config.guard);
     if (action === "launch") {

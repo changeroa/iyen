@@ -145,4 +145,24 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.b.db.execute('SELECT count(*) FROM messages').fetchone()[0],2)
 
 
-if __name__=='__main__':unittest.main()
+
+    def test_old_epoch_unknown_does_not_block_current_delivery(self):
+        self.seed()
+        def control(*args):
+            if args[0]=='status':return GOOD
+            if args[0]=='mail':return {'inbox':[{'target':'lead','state':'unknown','attachmentInstance':'old'}]}
+            return {'turnId':'current-receipt'}
+        self.b.control=control;self.b.deliver()
+        self.assertEqual(self.row()['state'],'delivered')
+
+    def test_current_epoch_unknown_remains_a_barrier(self):
+        self.seed()
+        def control(*args):
+            if args[0]=='status':return GOOD
+            if args[0]=='mail':return {'inbox':[{'target':'lead','state':'unknown','attachmentInstance':'instance'}]}
+            raise AssertionError('must not dispatch')
+        self.b.control=control;self.b.deliver()
+        self.assertEqual(self.row()['state'],'pending')
+
+if __name__ == '__main__':
+    unittest.main()
